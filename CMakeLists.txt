@@ -11,6 +11,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(STRATUM_ENABLE_TRACY "Enable Tracy profiler" ON)
 option(STRATUM_ENABLE_PYTHON "Enable Python scripting" ON)
 option(STRATUM_BUILD_TESTS "Build tests" OFF)
+option(STRATUM_BUILD_DOCS "Build documentation with Doxygen" OFF)
 
 # ═══════════════════════════════════════════════════════════════════
 # GLOBAL SETTINGS
@@ -146,3 +147,25 @@ target_link_libraries(stratum PRIVATE stratum_lib)
 install(TARGETS stratum RUNTIME DESTINATION bin)
 install(DIRECTORY assets/ DESTINATION share/stratum/assets)
 install(DIRECTORY scripts/ DESTINATION share/stratum/scripts)
+
+# ═══════════════════════════════════════════════════════════════════
+# DOCUMENTATION (Doxygen)
+# ═══════════════════════════════════════════════════════════════════
+if(STRATUM_BUILD_DOCS)
+    find_package(Doxygen REQUIRED)
+    
+    if(DOXYGEN_FOUND)
+        set(DOXYGEN_IN ${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile)
+        
+        add_custom_target(docs
+            COMMAND ${DOXYGEN_EXECUTABLE} ${DOXYGEN_IN}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            COMMENT "Generating API documentation with Doxygen"
+            VERBATIM
+        )
+        
+        message(STATUS "Doxygen found: Documentation target 'docs' available")
+    else()
+        message(WARNING "Doxygen not found: Documentation will not be built")
+    endif()
+endif()

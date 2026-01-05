@@ -72,10 +72,36 @@ NB: Python scripting will *eventually*(tm) be always on
 | `STRATUM_ENABLE_TRACY` | `ON` | Enable Tracy profiler |
 | `STRATUM_ENABLE_PYTHON` | `ON` | Enable Python scripting |
 | `STRATUM_BUILD_TESTS` | `OFF` | Build test suite |
+| `STRATUM_BUILD_DOCS` | `OFF` | Build Doxygen documentation |
 
 ```bash
 cmake -B build -DSTRATUM_ENABLE_TRACY=OFF -DSTRATUM_ENABLE_PYTHON=ON
 ```
+
+### Building Documentation
+
+To generate the API documentation using Doxygen:
+
+```bash
+# Install Doxygen (if not already installed)
+# Arch: sudo pacman -S doxygen graphviz
+# Ubuntu: sudo apt install doxygen graphviz
+
+# Configure with docs enabled
+cmake -B build -DSTRATUM_BUILD_DOCS=ON
+
+# Generate documentation
+cmake --build build --target docs
+
+# Open in browser
+xdg-open docs/generated/html/index.html
+```
+
+The documentation includes:
+- **API Reference**: Full class and function documentation
+- **Architecture Guide**: UML diagrams in `docs/architecture.md`
+- **Call Graphs**: Visual function call relationships
+- **Class Diagrams**: UML class hierarchy
 
 ---
 
