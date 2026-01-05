@@ -1,0 +1,171 @@
+[submodule "submodules/external/SDL"]
+	path = submodules/external/SDL
+	url = https://github.com/libsdl-org/SDL.git
+[submodule "submodules/external/imgui"]
+	path = submodules/external/imgui
+	url = https://github.com/ocornut/imgui.git
+[submodule "submodules/external/libosmium"]
+	path = submodules/external/libosmium
+	url = https://github.com/osmcode/libosmium.git
+[submodule "submodules/external/protozero"]
+	path = submodules/external/protozero
+	url = https://github.com/mapbox/protozero.git
+[submodule "submodules/external/glm"]
+	path = submodules/external/glm
+	url = https://github.com/g-truc/glm.git
+[submodule "submodules/external/Clipper2"]
+	path = submodules/external/Clipper2
+	url = https://github.com/AngusJohnson/Clipper2.git
+[submodule "submodules/external/earcut"]
+	path = submodules/external/earcut
+	url = https://github.com/mapbox/earcut.hpp.git
+[submodule "submodules/external/meshoptimizer"]
+	path = submodules/external/meshoptimizer
+	url = https://github.com/zeux/meshoptimizer.git
+[submodule "submodules/external/draco"]
+	path = submodules/external/draco
+	url = https://github.com/google/draco.git
+[submodule "submodules/external/assimp"]
+	path = submodules/external/assimp
+	url = https://github.com/assimp/assimp.git
+[submodule "submodules/external/MaterialX"]
+	path = submodules/external/MaterialX
+	url = https://github.com/AcademySoftwareFoundation/MaterialX.git
+[submodule "submodules/external/stb"]
+	path = submodules/external/stb
+	url = https://github.com/nothings/stb.git
+[submodule "submodules/external/basis_universal"]
+	path = submodules/external/basis_universal
+	url = https://github.com/BinomialLLC/basis_universal.git
+[submodule "submodules/external/KTX-Software"]
+	path = submodules/external/KTX-Software
+	url = https://github.com/KhronosGroup/KTX-Software.git
+[submodule "submodules/external/bvh"]
+	path = submodules/external/bvh
+	url = https://github.com/madmann91/bvh.git
+[submodule "submodules/external/enkiTS"]
+	path = submodules/external/enkiTS
+	url = https://github.com/dougbinks/enkiTS.git
+[submodule "submodules/external/parallel-hashmap"]
+	path = submodules/external/parallel-hashmap
+	url = https://github.com/greg7mdp/parallel-hashmap.git
+[submodule "submodules/external/mio"]
+	path = submodules/external/mio
+	url = https://github.com/vimpunk/mio.git
+[submodule "submodules/external/lz4"]
+	path = submodules/external/lz4
+	url = https://github.com/lz4/lz4.git
+[submodule "submodules/external/spdlog"]
+	path = submodules/external/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "submodules/external/json"]
+	path = submodules/external/json
+	url = https://github.com/nlohmann/json.git
+[submodule "submodules/external/ImGuizmo"]
+	path = submodules/external/ImGuizmo
+	url = https://github.com/CedricGuillemet/ImGuizmo.git
+[submodule "submodules/external/im3d"]
+	path = submodules/external/im3d
+	url = https://github.com/john-chapman/im3d.git
+[submodule "submodules/external/tracy"]
+	path = submodules/external/tracy
+	url = https://github.com/wolfpld/tracy.git
+[submodule "submodules/external/ImGuiFileDialog"]
+	path = submodules/external/ImGuiFileDialog
+	url = https://github.com/aiekick/ImGuiFileDialog.git
+[submodule "submodules/external/ImGuiColorTextEdit"]
+	path = submodules/external/ImGuiColorTextEdit
+	url = https://github.com/BalazsJako/ImGuiColorTextEdit.git
+[submodule "submodules/external/entt"]
+	path = submodules/external/entt
+	url = https://github.com/skypjack/entt.git
+[submodule "submodules/external/pybind11"]
+	path = submodules/external/pybind11
+	url = https://github.com/pybind/pybind11.git
+[submodule "external/SDL"]
+	path = external/SDL
+	url = https://github.com/libsdl-org/SDL.git
+[submodule "external/imgui"]
+	path = external/imgui
+	url = https://github.com/ocornut/imgui.git
+[submodule "external/libosmium"]
+	path = external/libosmium
+	url = https://github.com/osmcode/libosmium.git
+[submodule "external/protozero"]
+	path = external/protozero
+	url = https://github.com/mapbox/protozero.git
+[submodule "external/glm"]
+	path = external/glm
+	url = https://github.com/g-truc/glm.git
+[submodule "external/Clipper2"]
+	path = external/Clipper2
+	url = https://github.com/AngusJohnson/Clipper2.git
+[submodule "external/earcut"]
+	path = external/earcut
+	url = https://github.com/mapbox/earcut.hpp.git
+[submodule "external/meshoptimizer"]
+	path = external/meshoptimizer
+	url = https://github.com/zeux/meshoptimizer.git
+[submodule "external/draco"]
+	path = external/draco
+	url = https://github.com/google/draco.git
+[submodule "external/assimp"]
+	path = external/assimp
+	url = https://github.com/assimp/assimp.git
+[submodule "external/MaterialX"]
+	path = external/MaterialX
+	url = https://github.com/AcademySoftwareFoundation/MaterialX.git
+[submodule "external/stb"]
+	path = external/stb
+	url = https://github.com/nothings/stb.git
+[submodule "external/basis_universal"]
+	path = external/basis_universal
+	url = https://github.com/BinomialLLC/basis_universal.git
+[submodule "external/KTX-Software"]
+	path = external/KTX-Software
+	url = https://github.com/KhronosGroup/KTX-Software.git
+[submodule "external/bvh"]
+	path = external/bvh
+	url = https://github.com/madmann91/bvh.git
+[submodule "external/enkiTS"]
+	path = external/enkiTS
+	url = https://github.com/dougbinks/enkiTS.git
+[submodule "external/parallel-hashmap"]
+	path = external/parallel-hashmap
+	url = https://github.com/greg7mdp/parallel-hashmap.git
+[submodule "external/mio"]
+	path = external/mio
+	url = https://github.com/vimpunk/mio.git
+[submodule "external/lz4"]
+	path = external/lz4
+	url = https://github.com/lz4/lz4.git
+[submodule "external/spdlog"]
+	path = external/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "external/json"]
+	path = external/json
+	url = https://github.com/nlohmann/json.git
+[submodule "external/ImGuizmo"]
+	path = external/ImGuizmo
+	url = https://github.com/CedricGuillemet/ImGuizmo.git
+[submodule "external/im3d"]
+	path = external/im3d
+	url = https://github.com/john-chapman/im3d.git
+[submodule "external/tracy"]
+	path = external/tracy
+	url = https://github.com/wolfpld/tracy.git
+[submodule "external/ImGuiFileDialog"]
+	path = external/ImGuiFileDialog
+	url = https://github.com/aiekick/ImGuiFileDialog.git
+[submodule "external/ImGuiColorTextEdit"]
+	path = external/ImGuiColorTextEdit
+	url = https://github.com/BalazsJako/ImGuiColorTextEdit.git
+[submodule "external/entt"]
+	path = external/entt
+	url = https://github.com/skypjack/entt.git
+[submodule "external/pybind11"]
+	path = external/pybind11
+	url = https://github.com/pybind/pybind11.git
+[submodule "external/imnodes"]
+	path = external/imnodes
+	url = https://github.com/Nelarius/imnodes.git
