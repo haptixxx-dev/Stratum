@@ -14,12 +14,14 @@ bool Application::init() {
     }
     spdlog::info("SDL initialized");
 
-    // Create window
+    // Create borderless window with custom controls
     WindowConfig config;
     config.title = "Stratum";
-    config.width = 1280;
-    config.height = 800;
-    config.resizable = true;
+    config.width = 1400;
+    config.height = 900;
+    config.borderless = true;
+    config.title_bar_height = 50;  // Height of menu bar for drag area
+    config.resize_border = 10;     // Resize border width
     config.vsync = true;
 
     if (!m_window.init(config)) {
@@ -34,20 +36,34 @@ bool Application::init() {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();
 
-    // Scale ImGui for HiDPI
+    // Simple font config - 16px is readable on most displays
+    ImFontConfig font_config;
+    font_config.SizePixels = 16.0f;
+    font_config.OversampleH = 2;
+    font_config.OversampleV = 2;
+    io.Fonts->AddFontDefault(&font_config);
+
+    // Style tweaks
     ImGuiStyle& style = ImGui::GetStyle();
-    float scale = m_window.get_scale();
-    style.ScaleAllSizes(scale);
+    style.WindowRounding = 4.0f;
+    style.FrameRounding = 2.0f;
+    style.ScrollbarRounding = 4.0f;
 
     // Setup Platform/Renderer backends
     ImGui_ImplSDL3_InitForSDLRenderer(m_window.get_handle(), m_window.get_renderer());
     ImGui_ImplSDLRenderer3_Init(m_window.get_renderer());
 
-    spdlog::info("ImGui initialized");
+    // Initialize the editor
+    m_editor.init();
+    m_editor.set_quit_callback([this]() { request_quit(); });
+    m_editor.set_window_handle(m_window.get_handle());
+
+    spdlog::info("ImGui initialized with docking");
     m_running = true;
     return true;
 }
@@ -58,7 +74,7 @@ void Application::run() {
 
         // Skip rendering if minimized
         if (m_window.is_minimized()) {
-            SDL_Delay(10);
+            SDL_Delay(100);
             continue;
         }
 
@@ -92,28 +108,15 @@ void Application::update() {
 }
 
 void Application::render() {
-    ImGuiIO& io = ImGui::GetIO();
+    // Render the editor UI
+    m_editor.render();
 
-    // Demo window for testing
-    static bool show_demo = true;
-    if (show_demo) {
-        ImGui::ShowDemoWindow(&show_demo);
-    }
-
-    // Main window
-    ImGui::Begin("Stratum");
-    ImGui::Text("Welcome to Stratum!");
-    ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 
-                1000.0f / io.Framerate, io.Framerate);
-    ImGui::Checkbox("Show Demo Window", &show_demo);
-    ImGui::End();
-
-    // Render ImGui
+    // Finalize ImGui frame
     ImGui::Render();
 
     // Clear and render
     SDL_Renderer* renderer = m_window.get_renderer();
-    SDL_SetRenderDrawColor(renderer, 30, 30, 30, 255);
+    SDL_SetRenderDrawColor(renderer, 25, 25, 28, 255);
     SDL_RenderClear(renderer);
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
 
@@ -121,6 +124,9 @@ void Application::render() {
 }
 
 void Application::shutdown() {
+    // Cleanup editor
+    m_editor.shutdown();
+
     // Cleanup ImGui
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();

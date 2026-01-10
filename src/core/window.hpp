@@ -28,7 +28,11 @@ struct WindowConfig {
     int height = 800;                ///< Initial window height in logical pixels
     bool resizable = true;           ///< Whether the window can be resized by the user
     bool maximized = false;          ///< Whether to start maximized
+    bool borderless = false;         ///< Remove window decorations (title bar, etc.)
+    bool fullscreen = false;         ///< Start in fullscreen desktop mode
     bool vsync = true;               ///< Enable vertical synchronization
+    int title_bar_height = 32;       ///< Height of custom title bar for borderless windows
+    int resize_border = 6;           ///< Width of resize border for borderless windows
 };
 
 /**

@@ -12,8 +12,8 @@
 #pragma once
 
 #include "core/window.hpp"
+#include "editor/editor.hpp"
 #include <SDL3/SDL.h>
-#include <memory>
 
 /**
  * @namespace stratum
@@ -142,7 +142,12 @@ public:
      * @return true if the main loop is active
      */
     [[nodiscard]] bool is_running() const { return m_running; }
-    
+
+    /**
+     * @brief Request the application to quit
+     */
+    void request_quit() { m_running = false; }
+
     /// @}
 
 private:
@@ -172,6 +177,7 @@ private:
     void render();
 
     Window m_window;        ///< Main application window
+    Editor m_editor;        ///< Main editor interface
     bool m_running = false; ///< Flag indicating if main loop is active
 };
 
