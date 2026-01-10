@@ -56,6 +56,15 @@ private:
     ImVec2 m_drag_start_mouse;
     int m_drag_start_window_x = 0;
     int m_drag_start_window_y = 0;
+
+    // Window resizing state
+    enum ResizeEdge { RESIZE_NONE = 0, RESIZE_LEFT, RESIZE_RIGHT, RESIZE_TOP, RESIZE_BOTTOM,
+                      RESIZE_TOPLEFT, RESIZE_TOPRIGHT, RESIZE_BOTTOMLEFT, RESIZE_BOTTOMRIGHT };
+    ResizeEdge m_resize_edge = RESIZE_NONE;
+    int m_resize_start_w = 0;
+    int m_resize_start_h = 0;
+
+    void handle_window_resize();
 };
 
 } // namespace stratum
