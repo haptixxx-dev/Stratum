@@ -99,6 +99,12 @@ target_include_directories(osmium INTERFACE
     ${EXTERNAL_DIR}/libosmium/include
     ${EXTERNAL_DIR}/protozero/include
 )
+
+# ───────────────────────────────────────────────────────────────────
+# EARCUT (header-only)
+# ───────────────────────────────────────────────────────────────────
+add_library(earcut INTERFACE)
+target_include_directories(earcut INTERFACE ${EXTERNAL_DIR}/earcut/include)
 # libosmium needs zlib, bzip2, expat for full functionality
 find_package(ZLIB REQUIRED)
 find_package(BZip2 REQUIRED)
@@ -111,12 +117,6 @@ target_link_libraries(osmium INTERFACE ZLIB::ZLIB BZip2::BZip2 EXPAT::EXPAT)
 set(CLIPPER2_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(CLIPPER2_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(Clipper2/CPP)
-
-# ───────────────────────────────────────────────────────────────────
-# EARCUT (header-only)
-# ───────────────────────────────────────────────────────────────────
-add_library(earcut INTERFACE)
-target_include_directories(earcut INTERFACE ${EXTERNAL_DIR}/earcut/include)
 
 # ───────────────────────────────────────────────────────────────────
 # MESHOPTIMIZER
