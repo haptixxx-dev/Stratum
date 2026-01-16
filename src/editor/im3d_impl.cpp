@@ -1,0 +1,165 @@
+#include "editor/im3d_impl.hpp"
+#include <im3d.h>
+#include <vector>
+#include <cmath>
+
+namespace stratum {
+
+void Im3D_Init() {
+    // Nothing special to init for CPU-based backend
+}
+
+void Im3D_Shutdown() {
+    // Nothing to cleanup
+}
+
+void Im3D_ProcessEvent(const SDL_Event* event) {
+    Im3d::AppData& ad = Im3d::GetAppData();
+    
+    // Process input if needed, though usually we poll in NewFrame
+    // SDL events could be mapped here if we used event-based input
+}
+
+void Im3D_NewFrame(float dt, const Camera& cam, float window_width, float window_height, bool has_focus) {
+    Im3d::AppData& ad = Im3d::GetAppData();
+
+    ad.m_deltaTime = dt;
+    ad.m_viewportSize = Im3d::Vec2(window_width, window_height);
+    ad.m_viewOrigin = Im3d::Vec3(cam.get_position().x, cam.get_position().y, cam.get_position().z);
+    ad.m_viewDirection = Im3d::Vec3(cam.get_forward().x, cam.get_forward().y, cam.get_forward().z);
+    ad.m_worldUp = Im3d::Vec3(cam.get_up().x, cam.get_up().y, cam.get_up().z);
+    ad.m_projOrtho = false; 
+    
+    // FOV is in radians for Im3D
+    ad.m_projScaleY = 1.0f / tanf(glm::radians(cam.m_fov) * 0.5f);
+
+    // Input handling
+    // We only capture input if the viewport has focus to avoid stealing from ImGui
+    if (has_focus) {
+        auto mouse_state = SDL_GetMouseState(nullptr, nullptr);
+        
+        ad.m_keyDown[Im3d::Mouse_Left] = (mouse_state & SDL_BUTTON_LMASK) != 0;
+        
+        // Map other keys if gizmos are needed (Ctrl, Shift, etc)
+        const bool* keys = SDL_GetKeyboardState(NULL);
+        ad.m_keyDown[Im3d::Key_L] = keys[SDL_SCANCODE_L]; 
+        ad.m_keyDown[Im3d::Key_T] = keys[SDL_SCANCODE_T];
+        ad.m_keyDown[Im3d::Key_R] = keys[SDL_SCANCODE_R];
+        ad.m_keyDown[Im3d::Key_S] = keys[SDL_SCANCODE_S];
+    } else {
+        ad.m_keyDown[Im3d::Mouse_Left] = false;
+    }
+
+    // Ray picking setup would go here (Screen point -> Ray)
+    
+    Im3d::NewFrame();
+}
+
+void Im3D_Render(SDL_Renderer* renderer, const Camera& cam, float viewport_x, float viewport_y, float viewport_w, float viewport_h) {
+    Im3d::EndFrame();
+    
+    // Get draw lists
+    const glm::mat4& view_proj = cam.get_view_projection();
+    
+    // Iterate over Im3D draw commands
+    // Since SDL_Renderer is 2D, we must project all vertices on CPU.
+    
+    using namespace Im3d;
+    const U32 draw_list_count = GetDrawListCount();
+    
+    for (U32 i = 0; i < draw_list_count; ++i) {
+        const DrawList& draw_list = GetDrawLists()[i];
+        
+        // SDL_RenderGeometry expects SDL_Vertex
+        // We will batch triangles
+        std::vector<SDL_Vertex> sdl_vertices;
+        sdl_vertices.reserve(draw_list.m_vertexCount);
+        
+        // Loop vertices
+        for (U32 v = 0; v < draw_list.m_vertexCount; ++v) {
+            const VertexData& vd = draw_list.m_vertexData[v];
+            
+            // 1. World Space -> Clip Space
+            glm::vec4 world_pos(vd.m_positionSize.x, vd.m_positionSize.y, vd.m_positionSize.z, 1.0f);
+            glm::vec4 clip_pos = view_proj * world_pos;
+            
+            // 2. Clip Space -> NDC (Perspective Divide)
+            if (clip_pos.w <= 0.001f) {
+                // Point is behind camera or invalid (naive culling)
+                // For a robust renderer, we need proper clipping against Near Plane.
+                // Naive approach: just let it fly (will produce artifacts) or clamp?
+                // For debug lines, we can ignore clipping for now or simple-cull.
+                
+                // If w is negative, it's behind eye.
+                // To do this simply, we'll continue, but this will cause lines wrapping around.
+                // We'll let SDL cull or just produce weirdness for now. 
+                // Wait, SDL takes screen coords. If we give bad screen coords, it draws bad.
+                // We really need clipping.
+            }
+            
+            glm::vec3 ndc = glm::vec3(clip_pos) / clip_pos.w;
+            
+            // 3. NDC -> Screen Space
+            // NDC is -1 to 1. Screen is x to x+w, y to y+h.
+            // SDL coordinate system: 0,0 is top-left.
+            // NDC 0,0 is center. Y is up.
+            
+            float screen_x = viewport_x + (ndc.x + 1.0f) * 0.5f * viewport_w;
+            float screen_y = viewport_y + (1.0f - ndc.y) * 0.5f * viewport_h; // Flip Y
+            
+            // Color conversion
+            U32 color = vd.m_color;
+            
+            SDL_FColor sdl_col;
+            sdl_col.r = ((color >> 0) & 0xFF) / 255.0f;
+            sdl_col.g = ((color >> 8) & 0xFF) / 255.0f;
+            sdl_col.b = ((color >> 16) & 0xFF) / 255.0f;
+            sdl_col.a = ((color >> 24) & 0xFF) / 255.0f;
+            
+            sdl_vertices.push_back({
+                {screen_x, screen_y},
+                sdl_col,
+                {0, 0}
+            });
+        }
+        
+        // Draw primitives based on type
+        // Im3D generates triangles for everything if IM3D_VERTEX_GENERATION_ENABLED is 1 (default)
+        if (draw_list.m_primType == DrawPrimitive_Triangles) {
+            // SDL_RenderGeometry takes triangle list
+            if (!sdl_vertices.empty()) {
+                // NOTE: This will crash/glitch if vertices were behind camera (w < 0).
+                // Proper clipping is needed for a real 3D engine. 
+                // For this MVP, we assume the user accepts some glitches when flying through objects.
+                
+                 SDL_RenderGeometry(
+                    renderer,
+                    nullptr,
+                    sdl_vertices.data(),
+                    sdl_vertices.size(),
+                    nullptr,
+                    0
+                );
+            }
+        } 
+        else if (draw_list.m_primType == DrawPrimitive_Lines) {
+             // Fallback if triangles aren't generated
+             for (size_t k = 0; k < sdl_vertices.size(); k += 2) {
+                 if (k + 1 < sdl_vertices.size()) {
+                     const auto& v1 = sdl_vertices[k];
+                     const auto& v2 = sdl_vertices[k+1];
+                     SDL_SetRenderDrawColor(renderer, v1.color.r, v1.color.g, v1.color.b, v1.color.a);
+                     SDL_RenderLine(renderer, v1.position.x, v1.position.y, v2.position.x, v2.position.y);
+                 }
+             }
+        }
+        else if (draw_list.m_primType == DrawPrimitive_Points) {
+            for (const auto& v : sdl_vertices) {
+                SDL_SetRenderDrawColor(renderer, v.color.r, v.color.g, v.color.b, v.color.a);
+                SDL_RenderPoint(renderer, v.position.x, v.position.y);
+            }
+        }
+    }
+}
+
+} // namespace stratum

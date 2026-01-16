@@ -3,6 +3,9 @@
 #include <imgui.h>
 #include <functional>
 #include "osm/parser.hpp"
+#include "editor/camera.hpp"
+
+struct SDL_Renderer;
 
 namespace stratum {
 
@@ -18,6 +21,8 @@ public:
 
     void set_quit_callback(std::function<void()> callback) { m_quit_callback = callback; }
     void set_window_handle(void* window) { m_window_handle = window; }
+    void set_renderer(SDL_Renderer* renderer) { m_renderer = renderer; }
+    void render_im3d_callback();
 
     bool is_viewport_focused() const { return m_viewport_focused; }
     bool is_viewport_hovered() const { return m_viewport_hovered; }
@@ -47,6 +52,11 @@ private:
     // Console log
     ImGuiTextBuffer m_console_buffer;
     bool m_console_scroll_to_bottom = true;
+
+    // Core systems
+    SDL_Renderer* m_renderer = nullptr;
+    Camera m_camera;
+    float m_last_time = 0.0f;
 
     // Callbacks
     std::function<void()> m_quit_callback;

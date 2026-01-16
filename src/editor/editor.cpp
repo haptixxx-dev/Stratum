@@ -1,4 +1,6 @@
 #include "editor/editor.hpp"
+#include "editor/im3d_impl.hpp"
+#include <im3d.h>
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <spdlog/spdlog.h>
@@ -9,11 +11,28 @@
 
 namespace stratum {
 
+static ImVec4 s_viewport_rect;
+
+void Editor::render_im3d_callback() {
+    if (m_renderer) {
+        Im3D_Render(m_renderer, m_camera, s_viewport_rect.x, s_viewport_rect.y, s_viewport_rect.z, s_viewport_rect.w);
+    }
+}
+
+static void DrawIm3D_Callback(const ImDrawList* parent_list, const ImDrawCmd* cmd) {
+    Editor* editor = static_cast<Editor*>(cmd->UserCallbackData);
+    if (editor) {
+        editor->render_im3d_callback();
+    }
+}
+
 void Editor::init() {
     spdlog::info("Editor initialized");
+    Im3D_Init();
 }
 
 void Editor::shutdown() {
+    Im3D_Shutdown();
     spdlog::info("Editor shutdown");
 }
 
@@ -31,6 +50,10 @@ void Editor::render() {
     handle_window_resize();
 
     setup_dockspace();
+
+    
+    // Update Camera (moved to draw_viewport to sync with focus, but could be here)
+    // We do it in draw_viewport to update aspects correctly
 
     if (m_show_demo_window) {
         ImGui::ShowDemoWindow(&m_show_demo_window);
@@ -221,8 +244,7 @@ void Editor::draw_menu_bar() {
         if (ImGui::Button(" X ")) {
             if (m_quit_callback) m_quit_callback();
         }
-        ImGui::PopStyleColor(3);
-
+        ImGui::PopStyleColor(2);
         ImGui::EndMenuBar();
     }
 }
@@ -235,12 +257,46 @@ void Editor::draw_viewport() {
     m_viewport_hovered = ImGui::IsWindowHovered();
 
     ImVec2 viewport_size = ImGui::GetContentRegionAvail();
-
-    // Placeholder viewport content
     ImVec2 pos = ImGui::GetCursorScreenPos();
+    
+    // Save rect for callback
+    s_viewport_rect = ImVec4(pos.x, pos.y, viewport_size.x, viewport_size.y);
+
+    // Update Camera
+    float aspect = viewport_size.x / viewport_size.y;
+    if (aspect <= 0.001f) aspect = 1.0f;
+    
+    // Calculate dt (this is a hack, usually passed in update)
+    if (m_last_time == 0.0f) m_last_time = SDL_GetTicks() / 1000.0f;
+    float current_time = SDL_GetTicks() / 1000.0f;
+    float dt = current_time - m_last_time;
+    m_last_time = current_time;
+
+    m_camera.update(aspect);
+    if (m_viewport_focused) {
+        m_camera.handle_input(dt);
+    }
+    
+    // Im3D Frame
+    Im3D_NewFrame(dt, m_camera, viewport_size.x, viewport_size.y, m_viewport_focused);
+
+    // Draw Content
+    // Grid
+    const int grid_lines = 20;
+    const float grid_spacing = 2.0f;
+    for (int i = -grid_lines; i <= grid_lines; ++i) {
+        Im3d::DrawLine(Im3d::Vec3(i * grid_spacing, 0, -grid_lines * grid_spacing), Im3d::Vec3(i * grid_spacing, 0, grid_lines * grid_spacing), 1.0f, Im3d::Color(1.0f, 1.0f, 1.0f, 0.2f));
+        Im3d::DrawLine(Im3d::Vec3(-grid_lines * grid_spacing, 0, i * grid_spacing), Im3d::Vec3(grid_lines * grid_spacing, 0, i * grid_spacing), 1.0f, Im3d::Color(1.0f, 1.0f, 1.0f, 0.2f));
+    }
+    
+    // Draw Origin Axis
+    Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(1,0,0), 2.0f, Im3d::Color(255, 0, 0));
+    Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,1,0), 2.0f, Im3d::Color(0, 255, 0));
+    Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,0,1), 2.0f, Im3d::Color(0, 0, 255));
+
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
-    // Draw a gradient background to simulate a 3D viewport
+    // Background (Gradient)
     ImU32 col_top = IM_COL32(40, 44, 52, 255);
     ImU32 col_bottom = IM_COL32(30, 33, 39, 255);
     draw_list->AddRectFilledMultiColor(
@@ -249,33 +305,15 @@ void Editor::draw_viewport() {
         col_top, col_top, col_bottom, col_bottom
     );
 
-    // Draw grid
-    ImU32 grid_color = IM_COL32(60, 63, 70, 100);
-    float grid_step = 50.0f;
-    for (float x = fmodf(pos.x, grid_step); x < viewport_size.x; x += grid_step) {
-        draw_list->AddLine(
-            ImVec2(pos.x + x, pos.y),
-            ImVec2(pos.x + x, pos.y + viewport_size.y),
-            grid_color
-        );
-    }
-    for (float y = fmodf(pos.y, grid_step); y < viewport_size.y; y += grid_step) {
-        draw_list->AddLine(
-            ImVec2(pos.x, pos.y + y),
-            ImVec2(pos.x + viewport_size.x, pos.y + y),
-            grid_color
-        );
-    }
+    // Render Im3D via callback
+    draw_list->AddCallback(DrawIm3D_Callback, this);
+    
+    // Reset callback (optional but good practice)
+    draw_list->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
 
-    // Center text
-    const char* text = "3D Viewport (GPU Rendering Coming Soon)";
-    ImVec2 text_size = ImGui::CalcTextSize(text);
-    draw_list->AddText(
-        ImVec2(pos.x + (viewport_size.x - text_size.x) * 0.5f,
-               pos.y + (viewport_size.y - text_size.y) * 0.5f),
-        IM_COL32(150, 150, 150, 255),
-        text
-    );
+    // Overlay Text
+    const char* text_overlay = "3D Viewport (Im3D + SDL3)";
+    draw_list->AddText(ImVec2(pos.x + 10, pos.y + 10), IM_COL32(200, 200, 200, 255), text_overlay);
 
     // Toolbar overlay
     ImGui::SetCursorPos(ImVec2(10, 30));
