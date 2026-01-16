@@ -244,7 +244,7 @@ void Editor::draw_menu_bar() {
         if (ImGui::Button(" X ")) {
             if (m_quit_callback) m_quit_callback();
         }
-        ImGui::PopStyleColor(2);
+        ImGui::PopStyleColor(3);
         ImGui::EndMenuBar();
     }
 }
@@ -293,6 +293,49 @@ void Editor::draw_viewport() {
     Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(1,0,0), 2.0f, Im3d::Color(255, 0, 0));
     Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,1,0), 2.0f, Im3d::Color(0, 255, 0));
     Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,0,1), 2.0f, Im3d::Color(0, 0, 255));
+
+    // Draw OSM Data
+    const auto& osm_data = m_osm_parser.get_data();
+    
+    // Draw Roads
+    for (const auto& road : osm_data.roads) {
+        if (road.polyline.size() < 2) continue;
+        
+        Im3d::Color color = Im3d::Color(1.0f, 1.0f, 1.0f); // Default white
+        float thickness = 2.0f;
+        
+        switch (road.type) {
+            case osm::RoadType::Motorway: 
+            case osm::RoadType::Trunk:
+                color = Im3d::Color(1.0f, 0.5f, 0.0f); thickness = 4.0f; break;
+            case osm::RoadType::Primary:
+                color = Im3d::Color(1.0f, 1.0f, 0.0f); thickness = 3.0f; break;
+            case osm::RoadType::Secondary:
+                color = Im3d::Color(1.0f, 1.0f, 1.0f); thickness = 2.5f; break;
+            default:
+                color = Im3d::Color(0.8f, 0.8f, 0.8f); thickness = 1.5f; break;
+        }
+
+        for (size_t i = 0; i < road.polyline.size() - 1; ++i) {
+            Im3d::Vec3 p0(static_cast<float>(road.polyline[i].x), 0.0f, static_cast<float>(-road.polyline[i].y));
+            Im3d::Vec3 p1(static_cast<float>(road.polyline[i+1].x), 0.0f, static_cast<float>(-road.polyline[i+1].y));
+            Im3d::DrawLine(p0, p1, thickness, color);
+        }
+    }
+
+    // Draw Buildings
+    for (const auto& building : osm_data.buildings) {
+        if (building.footprint.empty()) continue;
+        
+        Im3d::Color color = Im3d::Color(0.2f, 0.6f, 1.0f, 0.8f);
+        
+        for (size_t i = 0; i < building.footprint.size(); ++i) {
+            size_t next = (i + 1) % building.footprint.size();
+            Im3d::Vec3 p0(static_cast<float>(building.footprint[i].x), 0.0f, static_cast<float>(-building.footprint[i].y));
+            Im3d::Vec3 p1(static_cast<float>(building.footprint[next].x), 0.0f, static_cast<float>(-building.footprint[next].y));
+            Im3d::DrawLine(p0, p1, 2.0f, color);
+        }
+    }
 
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
