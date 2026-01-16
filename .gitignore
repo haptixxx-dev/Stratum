@@ -37,3 +37,4 @@ docs/generated/
 
 # Keep compile_commands for clangd
 !build/compile_commands.json
+imgui.ini
