@@ -41,46 +41,52 @@ graph TB
         pybind11["pybind11<br/>(Python)"]
     end
 
-    subgraph Stratum["Stratum Application"]
-        subgraph Core["Core Module"]
-            Application
-            Window
-            Input
+    subgraph Stratum["Stratum Project structure"]
+        subgraph CoreLib["Stratum Core Library (Generic)"]
+            subgraph Scene["Scene Module"]
+                SceneGraph["Scene"]
+                Components
+                Spatial["Spatial Index"]
+            end
+
+            subgraph OSM["OSM Module"]
+                Parser
+                MeshBuilder["Mesh Builder"]
+                TileManager["Tile Manager"]
+            end
+            
+            subgraph ProcGen["ProcGen Module"]
+                TerrainGen
+                RoadNetwork
+                Zoning
+                LotSubdivision
+            end
         end
 
-        subgraph Renderer["Renderer Module"]
-            GPUDevice["GPU Device"]
-            Pipeline
-            Mesh
-            Texture
-            Camera
-        end
+        subgraph Editor["Stratum Editor (SDL3+ImGui)"]
+            subgraph Core["App Core"]
+                Application
+                Window
+                Input
+            end
 
-        subgraph Scene["Scene Module"]
-            SceneGraph["Scene"]
-            Components
-            Spatial["Spatial Index"]
-        end
+            subgraph Renderer["Renderer (Debug/Vis)"]
+                GPUDevice["GPU Device"]
+                Pipeline
+                Mesh
+                Camera
+                Im3D_Integration["Im3D Debug"]
+            end
 
-        subgraph OSM["OSM Module"]
-            Parser
-            MeshBuilder["Mesh Builder"]
-            TileManager["Tile Manager"]
-        end
-
-        subgraph Materials["Materials Module"]
-            Material
-            MaterialLibrary["Material Library"]
-        end
-
-        subgraph Editor["Editor Module"]
-            EditorMain["Editor"]
-            Gizmos
-            subgraph Panels["Editor Panels"]
-                ViewportPanel["Viewport"]
-                ScenePanel["Scene Hierarchy"]
-                PropertiesPanel["Properties"]
-                OSMPanel["OSM Import"]
+            subgraph EditorUI["Editor UI"]
+                EditorMain["Editor"]
+                Gizmos
+                subgraph Panels["Editor Panels"]
+                    ViewportPanel["Viewport"]
+                    ScenePanel["Scene Hierarchy"]
+                    PropertiesPanel["Properties"]
+                    OSMPanel["OSM Import"]
+                end
             end
         end
     end
@@ -93,8 +99,8 @@ graph TB
     Scene --> GLM
     OSM --> Osmium
     OSM --> Clipper2
-    Materials --> MaterialX
     Editor --> ImGui
+    Editor --> CoreLib
 
     %% Internal Dependencies
     Application --> Window
