@@ -62,6 +62,7 @@ bool Application::init() {
     m_editor.init();
     m_editor.set_quit_callback([this]() { request_quit(); });
     m_editor.set_window_handle(m_window.get_handle());
+    m_editor.set_renderer(m_window.get_renderer());
 
     spdlog::info("ImGui initialized with docking");
     m_running = true;
