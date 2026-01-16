@@ -61,102 +61,107 @@ void Im3D_Render(SDL_Renderer* renderer, const Camera& cam, float viewport_x, fl
     // Get draw lists
     const glm::mat4& view_proj = cam.get_view_projection();
     
-    // Iterate over Im3D draw commands
-    // Since SDL_Renderer is 2D, we must project all vertices on CPU.
-    
     using namespace Im3d;
     const U32 draw_list_count = GetDrawListCount();
     
     for (U32 i = 0; i < draw_list_count; ++i) {
         const DrawList& draw_list = GetDrawLists()[i];
         
-        // SDL_RenderGeometry expects SDL_Vertex
-        // We will batch triangles
-        std::vector<SDL_Vertex> sdl_vertices;
-        sdl_vertices.reserve(draw_list.m_vertexCount);
-        
-        // Loop vertices
-        for (U32 v = 0; v < draw_list.m_vertexCount; ++v) {
-            const VertexData& vd = draw_list.m_vertexData[v];
-            
+        // Helper lambda to project a vertex
+        // Returns true if vertex is in front of camera (w > epsilon)
+        struct ProjectedVert {
+            SDL_Vertex v;
+            bool valid;
+        };
+
+        auto project_vert = [&](const VertexData& vd) -> ProjectedVert {
             // 1. World Space -> Clip Space
             glm::vec4 world_pos(vd.m_positionSize.x, vd.m_positionSize.y, vd.m_positionSize.z, 1.0f);
             glm::vec4 clip_pos = view_proj * world_pos;
             
-            // 2. Clip Space -> NDC (Perspective Divide)
-            if (clip_pos.w <= 0.001f) {
-                // Point is behind camera or invalid (naive culling)
-                // For a robust renderer, we need proper clipping against Near Plane.
-                // Naive approach: just let it fly (will produce artifacts) or clamp?
-                // For debug lines, we can ignore clipping for now or simple-cull.
-                
-                // If w is negative, it's behind eye.
-                // To do this simply, we'll continue, but this will cause lines wrapping around.
-                // We'll let SDL cull or just produce weirdness for now. 
-                // Wait, SDL takes screen coords. If we give bad screen coords, it draws bad.
-                // We really need clipping.
+            // Near plane culling (epsilon)
+            if (clip_pos.w < 0.1f) {
+                return { {}, false };
             }
             
+            // 2. Clip Space -> NDC
             glm::vec3 ndc = glm::vec3(clip_pos) / clip_pos.w;
             
             // 3. NDC -> Screen Space
-            // NDC is -1 to 1. Screen is x to x+w, y to y+h.
-            // SDL coordinate system: 0,0 is top-left.
-            // NDC 0,0 is center. Y is up.
-            
             float screen_x = viewport_x + (ndc.x + 1.0f) * 0.5f * viewport_w;
-            float screen_y = viewport_y + (1.0f - ndc.y) * 0.5f * viewport_h; // Flip Y
+            float screen_y = viewport_y + (1.0f - ndc.y) * 0.5f * viewport_h;
             
             // Color conversion
             U32 color = vd.m_color;
-            
             SDL_FColor sdl_col;
             sdl_col.r = ((color >> 0) & 0xFF) / 255.0f;
             sdl_col.g = ((color >> 8) & 0xFF) / 255.0f;
             sdl_col.b = ((color >> 16) & 0xFF) / 255.0f;
             sdl_col.a = ((color >> 24) & 0xFF) / 255.0f;
             
-            sdl_vertices.push_back({
-                {screen_x, screen_y},
-                sdl_col,
-                {0, 0}
-            });
-        }
-        
-        // Draw primitives based on type
-        // Im3D generates triangles for everything if IM3D_VERTEX_GENERATION_ENABLED is 1 (default)
+            return { {{screen_x, screen_y}, sdl_col, {0, 0}}, true };
+        };
+
         if (draw_list.m_primType == DrawPrimitive_Triangles) {
-            // SDL_RenderGeometry takes triangle list
+            std::vector<SDL_Vertex> sdl_vertices;
+            sdl_vertices.reserve(draw_list.m_vertexCount);
+
+            // Process triangles (batches of 3)
+            for (U32 v = 0; v < draw_list.m_vertexCount; v += 3) {
+                if (v + 2 >= draw_list.m_vertexCount) break;
+
+                auto p0 = project_vert(draw_list.m_vertexData[v]);
+                auto p1 = project_vert(draw_list.m_vertexData[v+1]);
+                auto p2 = project_vert(draw_list.m_vertexData[v+2]);
+
+                // Conservative culling: if ANY vertex is behind camera, discard triangle
+                // (Proper solution requires clipping causing new triangles)
+                if (p0.valid && p1.valid && p2.valid) {
+                    sdl_vertices.push_back(p0.v);
+                    sdl_vertices.push_back(p1.v);
+                    sdl_vertices.push_back(p2.v);
+                }
+            }
+
             if (!sdl_vertices.empty()) {
-                // NOTE: This will crash/glitch if vertices were behind camera (w < 0).
-                // Proper clipping is needed for a real 3D engine. 
-                // For this MVP, we assume the user accepts some glitches when flying through objects.
-                
                  SDL_RenderGeometry(
                     renderer,
                     nullptr,
                     sdl_vertices.data(),
-                    sdl_vertices.size(),
+                    static_cast<int>(sdl_vertices.size()),
                     nullptr,
                     0
                 );
             }
         } 
         else if (draw_list.m_primType == DrawPrimitive_Lines) {
-             // Fallback if triangles aren't generated
-             for (size_t k = 0; k < sdl_vertices.size(); k += 2) {
-                 if (k + 1 < sdl_vertices.size()) {
-                     const auto& v1 = sdl_vertices[k];
-                     const auto& v2 = sdl_vertices[k+1];
-                     SDL_SetRenderDrawColor(renderer, v1.color.r, v1.color.g, v1.color.b, v1.color.a);
-                     SDL_RenderLine(renderer, v1.position.x, v1.position.y, v2.position.x, v2.position.y);
-                 }
+             for (U32 v = 0; v < draw_list.m_vertexCount; v += 2) {
+                if (v + 1 >= draw_list.m_vertexCount) break;
+
+                auto p0 = project_vert(draw_list.m_vertexData[v]);
+                auto p1 = project_vert(draw_list.m_vertexData[v+1]);
+
+                if (p0.valid && p1.valid) {
+                     SDL_SetRenderDrawColor(renderer, 
+                        (Uint8)(p0.v.color.r * 255), 
+                        (Uint8)(p0.v.color.g * 255), 
+                        (Uint8)(p0.v.color.b * 255), 
+                        (Uint8)(p0.v.color.a * 255));
+                     SDL_RenderLine(renderer, p0.v.position.x, p0.v.position.y, p1.v.position.x, p1.v.position.y);
+                }
              }
         }
         else if (draw_list.m_primType == DrawPrimitive_Points) {
-            for (const auto& v : sdl_vertices) {
-                SDL_SetRenderDrawColor(renderer, v.color.r, v.color.g, v.color.b, v.color.a);
-                SDL_RenderPoint(renderer, v.position.x, v.position.y);
+            for (U32 v = 0; v < draw_list.m_vertexCount; ++v) {
+                auto p0 = project_vert(draw_list.m_vertexData[v]);
+                if (p0.valid) {
+                    SDL_SetRenderDrawColor(renderer, 
+                        (Uint8)(p0.v.color.r * 255), 
+                        (Uint8)(p0.v.color.g * 255), 
+                        (Uint8)(p0.v.color.b * 255), 
+                        (Uint8)(p0.v.color.a * 255));
+                    SDL_RenderPoint(renderer, p0.v.position.x, p0.v.position.y);
+                }
             }
         }
     }
