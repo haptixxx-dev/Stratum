@@ -68,14 +68,15 @@ target_include_directories(stratum_core PUBLIC
 target_link_libraries(stratum_core PUBLIC
     # Math
     glm::glm
-    
+
     # OSM
     osmium
-    
+
     # Geometry
     Clipper2
     meshoptimizer
     draco::draco
+    earcut
     
     # Threading
     enkiTS

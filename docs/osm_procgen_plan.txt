@@ -36,10 +36,10 @@ OSM IMPORT (v1 Minimum)
   [x] Extract buildings with height estimation
   [x] Extract roads by type (highway tag)
   [x] Extract water and park areas
-  [ ] Generate 3D meshes:
-      - Buildings: extruded footprints with flat roofs
-      - Roads: ribbon meshes with proper width
-      - Areas: triangulated polygons
+  [x] Generate 3D meshes:
+      [x] Buildings: extruded footprints with flat roofs
+      [x] Roads: ribbon meshes with proper width
+      [ ] Areas: triangulated polygons
   [x] Coordinate conversion (lat/lon -> local meters)
 
 PROCEDURAL GENERATION (v1 Minimum)
@@ -51,9 +51,9 @@ PROCEDURAL GENERATION (v1 Minimum)
   [ ] Basic zoning (residential/commercial)
 
 RENDERING (v1 Minimum)
-  [ ] Basic 3D mesh rendering
-  [ ] Flat shading with diffuse colors
-  [ ] Ground plane / grid
+  [x] Basic 3D mesh rendering (via Im3d software rasterizer)
+  [x] Flat shading with diffuse colors
+  [x] Ground plane / grid
   [ ] Wireframe mode toggle
   [ ] Basic lighting (directional sun)
 
@@ -113,19 +113,24 @@ RENDERING (v1 Minimum)
     - Frustum culling per tile
     - Background loading thread
 
-[ ] Mesh Builder (src/osm/mesh_builder.cpp)
-    - Road mesh generation:
-        * Polyline to ribbon mesh with width based on road type
-        * Proper intersections and junctions
-        * Lane markings (dashed/solid lines)
-        * Sidewalks and curbs
-    - Building mesh generation:
-        * Extrude footprints to height (building:levels * 3m default)
-        * Flat and sloped roof styles
-        * Facade texturing based on building type
-    - Area mesh generation:
-        * Triangulate polygons (earcut or similar)
-        * Parks, water, parking lots
+[~] Mesh Builder (src/osm/mesh_builder.cpp)
+    [x] Road mesh generation:
+        [x] Polyline to ribbon mesh with width based on road type
+        [x] Miter joins at corners
+        [x] Colors by road type (asphalt/footway/cycleway)
+        [ ] Proper intersections and junctions
+        [ ] Lane markings (dashed/solid lines)
+        [ ] Sidewalks and curbs
+    [x] Building mesh generation:
+        [x] Extrude footprints to height (building:levels * 3m default)
+        [x] Flat roofs via earcut triangulation
+        [x] Colors from OSM tags (building:colour, roof:colour)
+        [x] Default colors by building type
+        [ ] Sloped roof styles
+        [ ] Facade texturing based on building type
+    [ ] Area mesh generation:
+        [ ] Triangulate polygons (earcut or similar)
+        [ ] Parks, water, parking lots
     - Use Clipper2 (already in external/) for polygon operations
 
 [x] OSM Data Structures (src/osm/types.hpp)
@@ -235,11 +240,11 @@ RENDERING (v1 Minimum)
                          IMPLEMENTATION PHASES
 ================================================================================
 
-PHASE 1: OSM Foundation
+PHASE 1: OSM Foundation [COMPLETE]
     [x] Basic OSM XML parser
-    [ ] Simple building extrusion
-    [ ] Simple road ribbons
-    [ ] Basic rendering in viewport
+    [x] Simple building extrusion (with earcut triangulation, colors)
+    [x] Simple road ribbons (miter joins, width-based)
+    [x] Basic rendering in viewport (Im3d batched triangles)
 
 PHASE 2: OSM Polish
     [ ] PBF parser for large datasets
