@@ -3,6 +3,9 @@
 #include <imgui_internal.h>
 #include <spdlog/spdlog.h>
 #include <SDL3/SDL.h>
+#include <ImGuiFileDialog/ImGuiFileDialog.h>
+#include <map>
+#include <cstring>
 
 namespace stratum {
 
@@ -440,52 +443,170 @@ void Editor::draw_osm_panel() {
     ImGui::Text("OpenStreetMap Import");
     ImGui::Separator();
 
-    // Location input
-    static char location[256] = "Dublin, Ireland";
-    ImGui::InputText("Location", location, sizeof(location));
-
-    static float lat = 53.3498f;
-    static float lon = -6.2603f;
-    static float radius = 500.0f;
-
-    ImGui::DragFloat("Latitude", &lat, 0.0001f, -90.0f, 90.0f, "%.4f");
-    ImGui::DragFloat("Longitude", &lon, 0.0001f, -180.0f, 180.0f, "%.4f");
-    ImGui::DragFloat("Radius (m)", &radius, 10.0f, 100.0f, 10000.0f);
-
-    ImGui::Spacing();
-    if (ImGui::Button("Download Area", ImVec2(-1, 0))) {
-        // TODO: Download OSM data
-    }
-
-    ImGui::Separator();
+    // Import options section
     ImGui::Text("Import Options");
 
-    static bool import_buildings = true;
-    static bool import_roads = true;
-    static bool import_water = true;
-    static bool import_vegetation = true;
-
-    ImGui::Checkbox("Buildings", &import_buildings);
-    ImGui::Checkbox("Roads", &import_roads);
-    ImGui::Checkbox("Water", &import_water);
-    ImGui::Checkbox("Vegetation", &import_vegetation);
+    // Get mutable reference to config
+    static osm::ParserConfig config;
+    ImGui::Checkbox("Buildings", &config.import_buildings);
+    ImGui::Checkbox("Roads", &config.import_roads);
+    ImGui::Checkbox("Water", &config.import_water);
+    ImGui::Checkbox("Landuse", &config.import_landuse);
+    ImGui::Checkbox("Natural", &config.import_natural);
 
     ImGui::Spacing();
-
-    static int building_lod = 2;
-    ImGui::SliderInt("Building LOD", &building_lod, 0, 4);
-
-    static float extrusion_height = 10.0f;
-    ImGui::DragFloat("Default Height", &extrusion_height, 0.5f, 1.0f, 100.0f);
+    ImGui::DragFloat("Default Height (m)", &config.default_building_height, 0.5f, 1.0f, 100.0f);
+    ImGui::DragFloat("Meters/Level", &config.meters_per_level, 0.1f, 2.0f, 5.0f);
 
     ImGui::Separator();
 
-    if (ImGui::Button("Import from File...", ImVec2(-1, 0))) {
-        // TODO: File dialog
+    // File path input
+    static char filepath[512] = "";
+    ImGui::InputText("File Path", filepath, sizeof(filepath));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...")) {
+        IGFD::FileDialogConfig fdConfig;
+        fdConfig.path = ".";
+        fdConfig.flags = ImGuiFileDialogFlags_Modal;
+        ImGuiFileDialog::Instance()->OpenDialog(
+            "ChooseOSMFile",
+            "Choose OSM File",
+            ".osm,.pbf,.osm.bz2,.osm.gz",
+            fdConfig
+        );
     }
 
-    if (ImGui::Button("Generate Mesh", ImVec2(-1, 0))) {
-        // TODO: Generate mesh from OSM data
+    // File dialog display
+    ImVec2 maxSize = ImVec2(800, 600);
+    ImVec2 minSize = ImVec2(400, 300);
+    if (ImGuiFileDialog::Instance()->Display("ChooseOSMFile", ImGuiWindowFlags_NoCollapse, minSize, maxSize)) {
+        if (ImGuiFileDialog::Instance()->IsOk()) {
+            std::string selectedPath = ImGuiFileDialog::Instance()->GetFilePathName();
+            strncpy(filepath, selectedPath.c_str(), sizeof(filepath) - 1);
+            filepath[sizeof(filepath) - 1] = '\0';
+        }
+        ImGuiFileDialog::Instance()->Close();
+    }
+
+    // Import button with status feedback
+    static std::string import_status;
+    static bool import_error = false;
+
+    if (ImGui::Button("Import OSM File", ImVec2(-1, 0))) {
+        if (strlen(filepath) == 0) {
+            import_status = "Please enter a file path first";
+            import_error = true;
+        } else {
+            import_status = "Parsing...";
+            import_error = false;
+
+            m_osm_parser.set_config(config);
+            if (m_osm_parser.parse(filepath)) {
+                m_osm_parser.log_statistics();
+                m_osm_parser.log_sample_data();
+
+                // Log to console
+                const auto& data = m_osm_parser.get_data();
+                char msg[256];
+                snprintf(msg, sizeof(msg), "[OSM] Loaded: %zu roads, %zu buildings, %zu areas\n",
+                        data.roads.size(), data.buildings.size(), data.areas.size());
+                m_console_buffer.append(msg);
+                m_console_scroll_to_bottom = true;
+
+                import_status = "Import successful!";
+                import_error = false;
+            } else {
+                char msg[512];
+                snprintf(msg, sizeof(msg), "[OSM] Error: %s\n", m_osm_parser.get_error().c_str());
+                m_console_buffer.append(msg);
+                m_console_scroll_to_bottom = true;
+
+                import_status = m_osm_parser.get_error();
+                import_error = true;
+            }
+        }
+    }
+
+    // Show status message
+    if (!import_status.empty()) {
+        if (import_error) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", import_status.c_str());
+        } else {
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", import_status.c_str());
+        }
+    }
+
+    ImGui::Separator();
+
+    // Display loaded data statistics
+    if (m_osm_parser.has_data()) {
+        const auto& data = m_osm_parser.get_data();
+
+        ImGui::Text("Loaded Data:");
+        ImGui::BulletText("Nodes: %zu", data.stats.total_nodes);
+        ImGui::BulletText("Ways: %zu", data.stats.total_ways);
+        ImGui::BulletText("Relations: %zu", data.stats.total_relations);
+
+        ImGui::Spacing();
+        ImGui::Text("Processed:");
+        ImGui::BulletText("Roads: %zu", data.roads.size());
+        ImGui::BulletText("Buildings: %zu", data.buildings.size());
+        ImGui::BulletText("Areas: %zu", data.areas.size());
+
+        if (data.bounds.is_valid()) {
+            ImGui::Spacing();
+            ImGui::Text("Bounds:");
+            ImGui::BulletText("Lat: [%.4f, %.4f]", data.bounds.min_lat, data.bounds.max_lat);
+            ImGui::BulletText("Lon: [%.4f, %.4f]", data.bounds.min_lon, data.bounds.max_lon);
+            ImGui::BulletText("Size: ~%.0fm x %.0fm",
+                            data.bounds.width_meters(), data.bounds.height_meters());
+        }
+
+        ImGui::Spacing();
+        ImGui::Text("Timing:");
+        ImGui::BulletText("Parse: %.1f ms", data.stats.parse_time_ms);
+        ImGui::BulletText("Process: %.1f ms", data.stats.process_time_ms);
+
+        // Road type breakdown
+        if (!data.roads.empty() && ImGui::TreeNode("Road Types")) {
+            std::map<osm::RoadType, int> road_counts;
+            for (const auto& road : data.roads) {
+                road_counts[road.type]++;
+            }
+            for (const auto& [type, count] : road_counts) {
+                ImGui::BulletText("%s: %d", osm::road_type_name(type), count);
+            }
+            ImGui::TreePop();
+        }
+
+        // Building type breakdown
+        if (!data.buildings.empty() && ImGui::TreeNode("Building Types")) {
+            std::map<osm::BuildingType, int> building_counts;
+            for (const auto& bldg : data.buildings) {
+                building_counts[bldg.type]++;
+            }
+            for (const auto& [type, count] : building_counts) {
+                ImGui::BulletText("%s: %d", osm::building_type_name(type), count);
+            }
+            ImGui::TreePop();
+        }
+
+        // Area type breakdown
+        if (!data.areas.empty() && ImGui::TreeNode("Area Types")) {
+            std::map<osm::AreaType, int> area_counts;
+            for (const auto& area : data.areas) {
+                area_counts[area.type]++;
+            }
+            for (const auto& [type, count] : area_counts) {
+                ImGui::BulletText("%s: %d", osm::area_type_name(type), count);
+            }
+            ImGui::TreePop();
+        }
+
+        ImGui::Separator();
+        if (ImGui::Button("Clear Data", ImVec2(-1, 0))) {
+            m_osm_parser.clear();
+        }
     }
 
     ImGui::End();

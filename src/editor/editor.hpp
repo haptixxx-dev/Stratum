@@ -2,6 +2,7 @@
 
 #include <imgui.h>
 #include <functional>
+#include "osm/parser.hpp"
 
 namespace stratum {
 
@@ -65,6 +66,10 @@ private:
     int m_resize_start_h = 0;
 
     void handle_window_resize();
+
+    // OSM Parser
+    osm::OSMParser m_osm_parser;
+    std::string m_osm_import_path;
 };
 
 } // namespace stratum
