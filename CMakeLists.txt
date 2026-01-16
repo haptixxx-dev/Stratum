@@ -38,9 +38,64 @@ set(EXTERNAL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external)
 add_subdirectory(external)
 
 # ═══════════════════════════════════════════════════════════════════
-# STRATUM LIBRARY
+# STRATUM CORE (The "Brain")
 # ═══════════════════════════════════════════════════════════════════
-add_library(stratum_lib STATIC
+# This library is engine-agnostic. It contains logic for:
+# - OSM Parsing & Coordinates
+# - Procedural Generation Algorithms
+# - Data Structures (Scene, Components)
+# - Math & Geometry processing
+# It should NOT depend on SDL, OpenGL, ImGui.
+# ═══════════════════════════════════════════════════════════════════
+add_library(stratum_core STATIC
+    # OSM
+    src/osm/parser.cpp
+    src/osm/coordinates.cpp
+    src/osm/mesh_builder.cpp
+    src/osm/tile_manager.cpp
+    
+    # Scene (Data Only)
+    src/scene/scene.cpp
+    src/scene/components.cpp
+    src/scene/spatial.cpp
+)
+
+target_include_directories(stratum_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${EXTERNAL_DIR}
+)
+
+target_link_libraries(stratum_core PUBLIC
+    # Math
+    glm::glm
+    
+    # OSM
+    osmium
+    
+    # Geometry
+    Clipper2
+    meshoptimizer
+    draco::draco
+    
+    # Threading
+    enkiTS
+    
+    # Data & Utils
+    spdlog::spdlog
+    nlohmann_json::nlohmann_json
+    EnTT::EnTT
+    
+    # Spatial
+    bvh
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# STRATUM EDITOR (The "Visualizer")
+# ═══════════════════════════════════════════════════════════════════
+# This library contains the editing tools, renderer, and UI.
+# It is specific to this SDL3+ImGui application.
+# ═══════════════════════════════════════════════════════════════════
+add_library(stratum_editor_lib STATIC
     # Core
     src/core/application.cpp
     src/core/window.cpp
@@ -53,23 +108,14 @@ add_library(stratum_lib STATIC
     src/renderer/texture.cpp
     src/renderer/camera.cpp
     
-    # Scene
-    src/scene/scene.cpp
-    src/scene/components.cpp
-    src/scene/spatial.cpp
-    
-    # OSM
-    src/osm/parser.cpp
-    src/osm/coordinates.cpp
-    src/osm/mesh_builder.cpp
-    src/osm/tile_manager.cpp
-    
     # Materials
     src/materials/material.cpp
     src/materials/material_library.cpp
     
     # Editor
     src/editor/editor.cpp
+    src/editor/camera.cpp
+    src/editor/im3d_impl.cpp
     src/editor/panels/viewport_panel.cpp
     src/editor/panels/scene_panel.cpp
     src/editor/panels/properties_panel.cpp
@@ -77,27 +123,18 @@ add_library(stratum_lib STATIC
     src/editor/gizmos.cpp
 )
 
-target_include_directories(stratum_lib PUBLIC
+target_include_directories(stratum_editor_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${EXTERNAL_DIR}
 )
 
-target_link_libraries(stratum_lib PUBLIC
+target_link_libraries(stratum_editor_lib PUBLIC
+    stratum_core
+
     # Core
     SDL3::SDL3
     imgui
     
-    # Math
-    glm::glm
-    
-    # OSM
-    osmium
-    
-    # Geometry
-    Clipper2
-    meshoptimizer
-    draco::draco
-
     # Import/Export
     assimp
 
@@ -108,46 +145,33 @@ target_link_libraries(stratum_lib PUBLIC
     # Textures
     ktx
     
-    # Spatial
-    bvh
-    
-    # Threading
-    enkiTS
-    
     # Compression
     lz4
-    
-    # Utilities
-    spdlog::spdlog
-    nlohmann_json::nlohmann_json
     
     # Editor
     ImGuizmo
     im3d
     ImGuiFileDialog
     imnodes
-    
-    # Scene
-    EnTT::EnTT
 )
 
 # Tracy (optional)
 if(STRATUM_ENABLE_TRACY)
-    target_link_libraries(stratum_lib PUBLIC TracyClient)
-    target_compile_definitions(stratum_lib PUBLIC STRATUM_ENABLE_TRACY)
+    target_link_libraries(stratum_editor_lib PUBLIC TracyClient)
+    target_compile_definitions(stratum_editor_lib PUBLIC STRATUM_ENABLE_TRACY)
 endif()
 
 # Python (optional)
 if(STRATUM_ENABLE_PYTHON)
-    target_link_libraries(stratum_lib PUBLIC pybind11::embed)
-    target_compile_definitions(stratum_lib PUBLIC STRATUM_ENABLE_PYTHON)
+    target_link_libraries(stratum_editor_lib PUBLIC pybind11::embed)
+    target_compile_definitions(stratum_editor_lib PUBLIC STRATUM_ENABLE_PYTHON)
 endif()
 
 # ═══════════════════════════════════════════════════════════════════
 # STRATUM EXECUTABLE
 # ═══════════════════════════════════════════════════════════════════
 add_executable(stratum src/main.cpp)
-target_link_libraries(stratum PRIVATE stratum_lib)
+target_link_libraries(stratum PRIVATE stratum_editor_lib)
 
 # ═══════════════════════════════════════════════════════════════════
 # INSTALL
