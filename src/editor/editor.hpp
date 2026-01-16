@@ -3,6 +3,8 @@
 #include <imgui.h>
 #include <functional>
 #include "osm/parser.hpp"
+#include "osm/mesh_builder.hpp"
+#include "renderer/mesh.hpp"
 #include "editor/camera.hpp"
 
 struct SDL_Renderer;
@@ -80,6 +82,20 @@ private:
     // OSM Parser
     osm::OSMParser m_osm_parser;
     std::string m_osm_import_path;
+
+    // Cached meshes for rendering
+    std::vector<Mesh> m_building_meshes;
+    std::vector<Mesh> m_road_meshes;
+
+    // Pre-batched geometry for fast rendering (combined from all meshes)
+    struct BatchedTriangle {
+        glm::vec3 p0, p1, p2;
+        glm::vec4 color;
+    };
+    std::vector<BatchedTriangle> m_batched_building_tris;
+    std::vector<BatchedTriangle> m_batched_road_tris;
+
+    void rebuild_osm_meshes();
 };
 
 } // namespace stratum

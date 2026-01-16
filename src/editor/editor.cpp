@@ -294,47 +294,28 @@ void Editor::draw_viewport() {
     Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,1,0), 2.0f, Im3d::Color(0, 255, 0));
     Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,0,1), 2.0f, Im3d::Color(0, 0, 255));
 
-    // Draw OSM Data
-    const auto& osm_data = m_osm_parser.get_data();
-    
-    // Draw Roads
-    for (const auto& road : osm_data.roads) {
-        if (road.polyline.size() < 2) continue;
-        
-        Im3d::Color color = Im3d::Color(1.0f, 1.0f, 1.0f); // Default white
-        float thickness = 2.0f;
-        
-        switch (road.type) {
-            case osm::RoadType::Motorway: 
-            case osm::RoadType::Trunk:
-                color = Im3d::Color(1.0f, 0.5f, 0.0f); thickness = 4.0f; break;
-            case osm::RoadType::Primary:
-                color = Im3d::Color(1.0f, 1.0f, 0.0f); thickness = 3.0f; break;
-            case osm::RoadType::Secondary:
-                color = Im3d::Color(1.0f, 1.0f, 1.0f); thickness = 2.5f; break;
-            default:
-                color = Im3d::Color(0.8f, 0.8f, 0.8f); thickness = 1.5f; break;
+    // Draw Road Meshes - pre-batched for performance (draw first, under buildings)
+    if (!m_batched_road_tris.empty()) {
+        Im3d::BeginTriangles();
+        for (const auto& tri : m_batched_road_tris) {
+            Im3d::Color color(tri.color.r, tri.color.g, tri.color.b, tri.color.a);
+            Im3d::Vertex(Im3d::Vec3(tri.p0.x, tri.p0.y, tri.p0.z), color);
+            Im3d::Vertex(Im3d::Vec3(tri.p1.x, tri.p1.y, tri.p1.z), color);
+            Im3d::Vertex(Im3d::Vec3(tri.p2.x, tri.p2.y, tri.p2.z), color);
         }
-
-        for (size_t i = 0; i < road.polyline.size() - 1; ++i) {
-            Im3d::Vec3 p0(static_cast<float>(road.polyline[i].x), 0.0f, static_cast<float>(-road.polyline[i].y));
-            Im3d::Vec3 p1(static_cast<float>(road.polyline[i+1].x), 0.0f, static_cast<float>(-road.polyline[i+1].y));
-            Im3d::DrawLine(p0, p1, thickness, color);
-        }
+        Im3d::End();
     }
 
-    // Draw Buildings
-    for (const auto& building : osm_data.buildings) {
-        if (building.footprint.empty()) continue;
-        
-        Im3d::Color color = Im3d::Color(0.2f, 0.6f, 1.0f, 0.8f);
-        
-        for (size_t i = 0; i < building.footprint.size(); ++i) {
-            size_t next = (i + 1) % building.footprint.size();
-            Im3d::Vec3 p0(static_cast<float>(building.footprint[i].x), 0.0f, static_cast<float>(-building.footprint[i].y));
-            Im3d::Vec3 p1(static_cast<float>(building.footprint[next].x), 0.0f, static_cast<float>(-building.footprint[next].y));
-            Im3d::DrawLine(p0, p1, 2.0f, color);
+    // Draw Building Meshes - pre-batched for performance
+    if (!m_batched_building_tris.empty()) {
+        Im3d::BeginTriangles();
+        for (const auto& tri : m_batched_building_tris) {
+            Im3d::Color color(tri.color.r, tri.color.g, tri.color.b, tri.color.a);
+            Im3d::Vertex(Im3d::Vec3(tri.p0.x, tri.p0.y, tri.p0.z), color);
+            Im3d::Vertex(Im3d::Vec3(tri.p1.x, tri.p1.y, tri.p1.z), color);
+            Im3d::Vertex(Im3d::Vec3(tri.p2.x, tri.p2.y, tri.p2.z), color);
         }
+        Im3d::End();
     }
 
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
@@ -586,6 +567,9 @@ void Editor::draw_osm_panel() {
                 m_osm_parser.log_statistics();
                 m_osm_parser.log_sample_data();
 
+                // Build meshes from OSM data
+                rebuild_osm_meshes();
+
                 // Log to console
                 const auto& data = m_osm_parser.get_data();
                 char msg[256];
@@ -687,6 +671,10 @@ void Editor::draw_osm_panel() {
         ImGui::Separator();
         if (ImGui::Button("Clear Data", ImVec2(-1, 0))) {
             m_osm_parser.clear();
+            m_building_meshes.clear();
+            m_road_meshes.clear();
+            m_batched_building_tris.clear();
+            m_batched_road_tris.clear();
         }
     }
 
@@ -817,6 +805,97 @@ void Editor::handle_window_resize() {
         } else {
             m_resize_edge = RESIZE_NONE;
         }
+    }
+}
+
+void Editor::rebuild_osm_meshes() {
+    m_building_meshes.clear();
+    m_road_meshes.clear();
+    m_batched_building_tris.clear();
+    m_batched_road_tris.clear();
+
+    const auto& osm_data = m_osm_parser.get_data();
+
+    // Build building meshes
+    m_building_meshes.reserve(osm_data.buildings.size());
+    for (const auto& building : osm_data.buildings) {
+        Mesh mesh = osm::MeshBuilder::build_building_mesh(building);
+        if (mesh.is_valid()) {
+            m_building_meshes.push_back(std::move(mesh));
+        }
+    }
+
+    // Build road meshes
+    m_road_meshes.reserve(osm_data.roads.size());
+    for (const auto& road : osm_data.roads) {
+        Mesh mesh = osm::MeshBuilder::build_road_mesh(road);
+        if (mesh.is_valid()) {
+            m_road_meshes.push_back(std::move(mesh));
+        }
+    }
+
+    // Pre-batch building triangles
+    size_t total_building_tris = 0;
+    for (const auto& mesh : m_building_meshes) {
+        total_building_tris += mesh.indices.size() / 3;
+    }
+    m_batched_building_tris.reserve(total_building_tris);
+
+    glm::vec3 centroid(0.0f);
+    size_t vert_count = 0;
+
+    for (const auto& mesh : m_building_meshes) {
+        for (size_t i = 0; i < mesh.indices.size(); i += 3) {
+            const auto& v0 = mesh.vertices[mesh.indices[i]];
+            const auto& v1 = mesh.vertices[mesh.indices[i + 1]];
+            const auto& v2 = mesh.vertices[mesh.indices[i + 2]];
+
+            m_batched_building_tris.push_back({v0.position, v1.position, v2.position, v0.color});
+
+            centroid += v0.position + v1.position + v2.position;
+            vert_count += 3;
+        }
+    }
+
+    // Pre-batch road triangles
+    size_t total_road_tris = 0;
+    for (const auto& mesh : m_road_meshes) {
+        total_road_tris += mesh.indices.size() / 3;
+    }
+    m_batched_road_tris.reserve(total_road_tris);
+
+    for (const auto& mesh : m_road_meshes) {
+        for (size_t i = 0; i < mesh.indices.size(); i += 3) {
+            const auto& v0 = mesh.vertices[mesh.indices[i]];
+            const auto& v1 = mesh.vertices[mesh.indices[i + 1]];
+            const auto& v2 = mesh.vertices[mesh.indices[i + 2]];
+
+            m_batched_road_tris.push_back({v0.position, v1.position, v2.position, v0.color});
+
+            centroid += v0.position + v1.position + v2.position;
+            vert_count += 3;
+        }
+    }
+
+    spdlog::info("Built {} building meshes ({} tris), {} road meshes ({} tris)",
+                 m_building_meshes.size(), m_batched_building_tris.size(),
+                 m_road_meshes.size(), m_batched_road_tris.size());
+
+    // Center camera on loaded data
+    if (vert_count > 0) {
+        centroid /= static_cast<float>(vert_count);
+
+        // Position camera above and looking at centroid
+        float view_height = 500.0f;
+        float view_distance = 500.0f;
+        glm::vec3 cam_pos = centroid + glm::vec3(0.0f, view_height, view_distance);
+
+        m_camera.set_position(cam_pos);
+        m_camera.set_target(centroid);
+        m_camera.m_far = 50000.0f;
+        m_camera.m_speed = 200.0f;
+
+        spdlog::info("Camera centered at ({}, {}, {})", cam_pos.x, cam_pos.y, cam_pos.z);
     }
 }
 
