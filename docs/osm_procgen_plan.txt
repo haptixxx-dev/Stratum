@@ -1,0 +1,297 @@
+================================================================================
+                         STRATUM - PROJECT SCOPE v1.0
+================================================================================
+
+Version: 0.1.0 (pre-alpha) -> 1.0.0 (v1 release)
+Tracking: VERSION file in project root
+
+================================================================================
+                              V1 SCOPE DEFINITION
+================================================================================
+
+Stratum v1.0 is a 3D city editor and visualization tool with two core modes:
+  1. OSM Import Mode - Load and visualize real-world OpenStreetMap data
+  2. Procedural Mode - Generate fictional cities from scratch
+
+TARGET: Functional editor capable of loading OSM data OR generating procedural
+cities, with basic 3D visualization, camera controls, and entity selection.
+
+--------------------------------------------------------------------------------
+                            V1 FEATURES (MUST HAVE)
+--------------------------------------------------------------------------------
+
+EDITOR CORE
+  [x] SDL3 + ImGui application framework
+  [x] Dockable panel layout (viewport, scene, properties)
+  [x] Basic project structure
+
+  [ ] 3D viewport with orbit/pan/zoom camera
+  [ ] Entity selection (click to select)
+  [ ] Transform gizmos (translate/rotate/scale)
+  [ ] Undo/redo system
+  [ ] Project save/load (.stratum files)
+
+OSM IMPORT (v1 Minimum)
+  [ ] Parse .osm XML files (nodes, ways, relations)
+  [ ] Extract buildings with height estimation
+  [ ] Extract roads by type (highway tag)
+  [ ] Extract water and park areas
+  [ ] Generate 3D meshes:
+      - Buildings: extruded footprints with flat roofs
+      - Roads: ribbon meshes with proper width
+      - Areas: triangulated polygons
+  [ ] Coordinate conversion (lat/lon -> local meters)
+
+PROCEDURAL GENERATION (v1 Minimum)
+  [ ] Flat terrain with configurable size
+  [ ] Grid-based road network
+  [ ] Block subdivision from roads
+  [ ] Simple rectangular building footprints
+  [ ] Random building heights within zone limits
+  [ ] Basic zoning (residential/commercial)
+
+RENDERING (v1 Minimum)
+  [ ] Basic 3D mesh rendering
+  [ ] Flat shading with diffuse colors
+  [ ] Ground plane / grid
+  [ ] Wireframe mode toggle
+  [ ] Basic lighting (directional sun)
+
+--------------------------------------------------------------------------------
+                            V1.x FEATURES (NICE TO HAVE)
+--------------------------------------------------------------------------------
+
+  [ ] .pbf binary OSM format support
+  [ ] Tile-based loading for large areas
+  [ ] Building roof styles (gabled, hipped)
+  [ ] Road intersections and junctions
+  [ ] Street furniture (lights, trees)
+  [ ] Terrain heightmap generation
+  [ ] Organic road layouts
+  [ ] Material system with textures
+  [ ] Shadow mapping
+
+--------------------------------------------------------------------------------
+                            V2+ FEATURES (FUTURE)
+--------------------------------------------------------------------------------
+
+  [ ] Real-time terrain editing
+  [ ] Building facade generation
+  [ ] Traffic simulation
+  [ ] Day/night cycle
+  [ ] Weather effects
+  [ ] VR support
+  [ ] Multiplayer editing
+  [ ] Plugin/scripting system
+
+================================================================================
+                    OSM DATA SYSTEM (DETAILED IMPLEMENTATION)
+================================================================================
+
+================================================================================
+                            PART 1: OSM DATA SYSTEM
+================================================================================
+
+[ ] OSM Parser (src/osm/parser.cpp)
+    - Parse .osm XML files (nodes, ways, relations)
+    - Parse .pbf binary format for large datasets
+    - Extract and categorize element tags:
+        * highway (roads, paths, footways)
+        * building (footprints, heights, building:levels)
+        * landuse (residential, commercial, industrial, park)
+        * natural (water, trees, coastline)
+        * amenity (shops, restaurants, parking)
+        * railway, waterway, aeroway
+    - Convert lat/lon to local coordinate system (Mercator projection)
+    - Handle multipolygons and complex relations
+
+[ ] Tile Manager (src/osm/tile_manager.cpp)
+    - Tile-based spatial indexing (quadtree or grid)
+    - Level-of-detail (LOD) system for large maps
+    - Streaming/lazy loading of tile data
+    - Tile caching (memory + disk)
+    - Frustum culling per tile
+    - Background loading thread
+
+[ ] Mesh Builder (src/osm/mesh_builder.cpp)
+    - Road mesh generation:
+        * Polyline to ribbon mesh with width based on road type
+        * Proper intersections and junctions
+        * Lane markings (dashed/solid lines)
+        * Sidewalks and curbs
+    - Building mesh generation:
+        * Extrude footprints to height (building:levels * 3m default)
+        * Flat and sloped roof styles
+        * Facade texturing based on building type
+    - Area mesh generation:
+        * Triangulate polygons (earcut or similar)
+        * Parks, water, parking lots
+    - Use Clipper2 (already in external/) for polygon operations
+
+[ ] OSM Data Structures
+    - OSMNode: id, lat, lon, tags
+    - OSMWay: id, node_refs[], tags
+    - OSMRelation: id, members[], tags
+    - Processed structures:
+        * Road: polyline, width, type, lanes, speed_limit
+        * Building: polygon, height, roof_type, building_type
+        * Area: polygon, area_type
+
+[ ] Coordinate System
+    - WGS84 (lat/lon) input
+    - Web Mercator projection for rendering
+    - Origin offset for numerical precision (center of loaded area)
+    - Meters-based local coordinates
+
+================================================================================
+                    PART 2: PROCEDURAL CITY GENERATOR
+================================================================================
+
+[ ] Terrain Generation
+    - Heightmap generation (Perlin/Simplex noise layers)
+    - Water bodies:
+        * Rivers (flow simulation or noise-based paths)
+        * Lakes (low elevation flooding)
+        * Coastlines
+    - Slope and elevation analysis for buildability
+
+[ ] Road Network Generation
+    - Primary roads (L-system or tensor field based):
+        * Highways connecting major areas
+        * Main arterial roads
+    - Secondary street grid:
+        * Regular grid in flat areas
+        * Organic curves following terrain
+        * Cul-de-sacs for residential
+    - Intersection handling:
+        * T-junctions, 4-way, roundabouts
+        * Traffic light placement
+    - Road hierarchy: highway > arterial > collector > local
+
+[ ] Zoning System
+    - Land use assignment based on:
+        * Distance from city center
+        * Road access
+        * Terrain suitability
+        * Noise/pollution buffers
+    - Zone types:
+        * Residential (low/medium/high density)
+        * Commercial (retail, office)
+        * Industrial
+        * Parks and recreation
+        * Civic (schools, hospitals)
+
+[ ] Lot Subdivision
+    - Block generation from road network (polygon extraction)
+    - Lot subdivision algorithms:
+        * Recursive subdivision
+        * OBB-based splitting
+        * Lot size based on zone type
+    - Setbacks and building envelopes
+    - Corner lot handling
+
+[ ] Building Generation
+    - Building footprint generation:
+        * Simple rectangles
+        * L-shapes, U-shapes
+        * Fit to lot with setbacks
+    - Height assignment:
+        * Based on zone and density
+        * Gradual height increase toward center
+    - Facade generation (future):
+        * Window placement
+        * Material variation
+        * Ground floor retail
+
+[ ] Infrastructure
+    - Power lines and poles
+    - Street lights
+    - Fire hydrants
+    - Benches, trash cans
+    - Trees and vegetation
+
+================================================================================
+                         PART 3: SHARED SYSTEMS
+================================================================================
+
+[ ] Mesh Generation Pipeline
+    - Vertex format: position, normal, UV, color
+    - Instanced rendering for repeated elements
+    - LOD mesh generation
+    - Batching by material
+
+[ ] Material System
+    - Road materials (asphalt, concrete, dirt)
+    - Building materials (brick, glass, concrete)
+    - Terrain materials (grass, water, sand)
+    - Procedural texture tiling
+
+[ ] Scene Integration
+    - Entity-component system integration
+    - Spatial queries (raycast, box query)
+    - Selection and editing
+
+================================================================================
+                         IMPLEMENTATION PHASES
+================================================================================
+
+PHASE 1: OSM Foundation
+    [ ] Basic OSM XML parser
+    [ ] Simple building extrusion
+    [ ] Simple road ribbons
+    [ ] Basic rendering in viewport
+
+PHASE 2: OSM Polish
+    [ ] PBF parser for large datasets
+    [ ] Tile-based loading
+    [ ] Proper road intersections
+    [ ] Building roof styles
+    [ ] Area triangulation
+
+PHASE 3: Procedural Foundation
+    [ ] Terrain heightmap generation
+    [ ] Basic road network (grid + highways)
+    [ ] Simple block generation
+
+PHASE 4: Procedural City
+    [ ] Zoning system
+    [ ] Lot subdivision
+    [ ] Building footprint generation
+    [ ] Building height variation
+
+PHASE 5: Polish & Detail
+    [ ] Street furniture
+    [ ] Vegetation
+    [ ] LOD system
+    [ ] Performance optimization
+
+================================================================================
+                              DATA SOURCES
+================================================================================
+
+OSM Data:
+    - Overpass API: query specific areas
+    - Geofabrik: pre-extracted regional data
+    - Planet.osm: full world dataset
+
+References:
+    - OSM Wiki: https://wiki.openstreetmap.org
+    - libosmium: efficient OSM parsing library
+    - earcut: polygon triangulation
+    - Procedural city papers: Parish & Muller (2001)
+
+================================================================================
+                               DEPENDENCIES
+================================================================================
+
+Already in project:
+    [x] Clipper2 - polygon boolean operations
+    [x] SDL3 + ImGui - rendering and UI
+
+May need:
+    [ ] pugixml or rapidxml - OSM XML parsing
+    [ ] earcut.hpp - polygon triangulation (header-only)
+    [ ] FastNoise or similar - terrain generation
+    [ ] protozero - PBF parsing (optional)
+
+================================================================================
