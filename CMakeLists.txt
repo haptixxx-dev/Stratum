@@ -60,6 +60,7 @@ add_library(stratum_lib STATIC
     
     # OSM
     src/osm/parser.cpp
+    src/osm/coordinates.cpp
     src/osm/mesh_builder.cpp
     src/osm/tile_manager.cpp
     
