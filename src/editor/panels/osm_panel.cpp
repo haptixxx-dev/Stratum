@@ -21,11 +21,12 @@ void Editor::draw_osm_panel() {
                 std::string filePathName = ImGuiFileDialog::Instance()->GetFilePathName();
                 m_osm_import_path = filePathName;
                 
-                // Trigger parse
+                // Trigger parse and build meshes
                 try {
                     bool success = m_osm_parser.parse(filePathName);
-                    if (!success) {
-                        // TODO: Log error to console
+                    if (success) {
+                        // Build meshes from parsed OSM data
+                        rebuild_osm_meshes();
                     }
                 } catch (const std::exception& e) {
                     // TODO: Log exception
@@ -36,12 +37,54 @@ void Editor::draw_osm_panel() {
 
         ImGui::Separator();
 
+        // Navigation - Go to geometry
+        if (m_tile_manager.tile_count() > 0) {
+            if (ImGui::Button("Go to Geometry")) {
+                // Find first tile with valid bounds and teleport camera there
+                for (const auto& coord : m_tile_manager.get_all_tiles()) {
+                    const auto* tile = m_tile_manager.get_tile(coord);
+                    if (tile && tile->has_valid_bounds()) {
+                        glm::vec3 center = (tile->bounds_min + tile->bounds_max) * 0.5f;
+                        glm::vec3 cam_pos = center + glm::vec3(0.0f, 300.0f, 300.0f);
+                        m_camera.set_position(cam_pos);
+                        m_camera.set_target(center);
+                        
+                        // Disable culling temporarily to see everything
+                        m_use_distance_culling = false;
+                        m_use_tile_culling = false;
+                        break;
+                    }
+                }
+            }
+            ImGui::SameLine();
+            ImGui::Text("(%zu tiles)", m_tile_manager.tile_count());
+        }
+
+        ImGui::Separator();
+
         // Render toggles - always visible
         ImGui::Checkbox("Areas", &m_render_areas);
         ImGui::SameLine();
         ImGui::Checkbox("Roads", &m_render_roads);
         ImGui::SameLine();
         ImGui::Checkbox("Buildings", &m_render_buildings);
+
+        // Culling options (per-mesh)
+        ImGui::Checkbox("Frustum Culling", &m_use_tile_culling);
+        ImGui::SameLine();
+        ImGui::Checkbox("Distance Culling", &m_use_distance_culling);
+        
+        if (m_use_distance_culling) {
+            ImGui::SetNextItemWidth(150);
+            ImGui::SliderFloat("View Radius", &m_view_radius, 500.0f, 10000.0f, "%.0f m");
+        }
+
+        // Stats
+        ImGui::Separator();
+        ImGui::Text("Visible: %zu areas, %zu buildings, %zu roads",
+                    m_batched_area_tris.size(), 
+                    m_batched_building_tris.size(),
+                    m_batched_road_tris.size());
 
         ImGui::Separator();
 
