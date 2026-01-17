@@ -12,7 +12,7 @@ void Editor::draw_osm_panel() {
         if (ImGui::Button("Import OSM File...")) {
             IGFD::FileDialogConfig config;
             config.path = ".";
-            ImGuiFileDialog::Instance()->OpenDialog("ChooseFileDlgKey", "Choose File", ".osm", config);
+            ImGuiFileDialog::Instance()->OpenDialog("ChooseFileDlgKey", "Choose OSM File", ".osm,.pbf,.osm.bz2,.osm.gz", config);
         }
 
         // Display dialog
@@ -35,14 +35,23 @@ void Editor::draw_osm_panel() {
         }
 
         ImGui::Separator();
-        
+
+        // Render toggles - always visible
+        ImGui::Checkbox("Areas", &m_render_areas);
+        ImGui::SameLine();
+        ImGui::Checkbox("Roads", &m_render_roads);
+        ImGui::SameLine();
+        ImGui::Checkbox("Buildings", &m_render_buildings);
+
+        ImGui::Separator();
+
         // Show Stats
         const auto& data = m_osm_parser.get_data();
-        
+
         if (data.stats.total_nodes > 0 || data.stats.total_ways > 0) {
             ImGui::Text("File: %s", m_osm_import_path.c_str());
             ImGui::Spacing();
-            
+
             if (ImGui::CollapsingHeader("Statistics", ImGuiTreeNodeFlags_DefaultOpen)) {
                 if (ImGui::BeginTable("osm_stats", 2)) {
                     ImGui::TableNextColumn(); ImGui::Text("Nodes (Raw)");

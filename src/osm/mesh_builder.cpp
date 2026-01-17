@@ -3,6 +3,8 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cctype>
+#include <limits>
+#include <cmath>
 
 // Earcut adapter for glm::dvec2
 namespace mapbox {
@@ -22,6 +24,57 @@ struct nth<1, glm::dvec2> {
 } // namespace mapbox
 
 namespace stratum::osm {
+
+// Helper: compute 2D centroid of polygon
+static glm::dvec2 compute_centroid(const std::vector<glm::dvec2>& polygon) {
+    glm::dvec2 centroid(0.0);
+    for (const auto& pt : polygon) {
+        centroid += pt;
+    }
+    return centroid / static_cast<double>(polygon.size());
+}
+
+// Helper: compute oriented bounding box and principal axis for gabled roofs
+static void compute_principal_axis(const std::vector<glm::dvec2>& polygon,
+                                   glm::dvec2& axis, glm::dvec2& center,
+                                   double& length, double& width) {
+    // Find the longest edge to determine ridge direction
+    double max_edge_len = 0.0;
+    glm::dvec2 longest_edge(1.0, 0.0);
+
+    for (size_t i = 0; i < polygon.size(); ++i) {
+        size_t next = (i + 1) % polygon.size();
+        glm::dvec2 edge = polygon[next] - polygon[i];
+        double len = glm::length(edge);
+        if (len > max_edge_len) {
+            max_edge_len = len;
+            longest_edge = glm::normalize(edge);
+        }
+    }
+
+    axis = longest_edge;
+    center = compute_centroid(polygon);
+
+    // Compute extent along axis and perpendicular
+    glm::dvec2 perp(-axis.y, axis.x);
+    double min_along = std::numeric_limits<double>::max();
+    double max_along = std::numeric_limits<double>::lowest();
+    double min_perp = std::numeric_limits<double>::max();
+    double max_perp = std::numeric_limits<double>::lowest();
+
+    for (const auto& pt : polygon) {
+        glm::dvec2 rel = pt - center;
+        double along = glm::dot(rel, axis);
+        double across = glm::dot(rel, perp);
+        min_along = std::min(min_along, along);
+        max_along = std::max(max_along, along);
+        min_perp = std::min(min_perp, across);
+        max_perp = std::max(max_perp, across);
+    }
+
+    length = max_along - min_along;
+    width = max_perp - min_perp;
+}
 
 // Parse color from OSM tag (hex "#RRGGBB" or named colors)
 static glm::vec4 parse_color(const std::string& color_str, const glm::vec4& fallback) {
@@ -196,42 +249,147 @@ Mesh MeshBuilder::build_building_mesh(const Building& building) {
         mesh.indices.push_back(base_idx + 3);
     }
 
-    // === Generate roof using earcut triangulation ===
-    // Prepare polygon for earcut (outer ring + holes)
-    std::vector<std::vector<glm::dvec2>> polygon;
-    polygon.push_back(building.footprint);
+    // === Generate roof based on roof type ===
+    const float roof_pitch_ratio = 0.3f; // Roof height = width * ratio
 
-    // Add holes if any
-    for (const auto& hole : building.holes) {
-        polygon.push_back(hole);
-    }
+    if (building.roof_type == RoofType::Gabled && building.holes.empty()) {
+        // Gabled roof: ridge along longest axis
+        glm::dvec2 axis, center;
+        double length, width;
+        compute_principal_axis(building.footprint, axis, center, length, width);
 
-    // Run earcut
-    std::vector<uint32_t> roof_indices = mapbox::earcut<uint32_t>(polygon);
+        float ridge_height = static_cast<float>(width * 0.5 * roof_pitch_ratio);
+        glm::dvec2 perp(-axis.y, axis.x);
 
-    // Add roof vertices and indices
-    glm::vec3 roof_normal(0.0f, 1.0f, 0.0f);
-    uint32_t roof_base_idx = static_cast<uint32_t>(mesh.vertices.size());
+        // Ridge endpoints (at center, along axis)
+        glm::dvec2 ridge_start_2d = center - axis * (length * 0.5);
+        glm::dvec2 ridge_end_2d = center + axis * (length * 0.5);
 
-    // Flatten all polygon points for vertex lookup
-    std::vector<glm::dvec2> all_points;
-    for (const auto& ring : polygon) {
-        for (const auto& pt : ring) {
-            all_points.push_back(pt);
+        glm::vec3 ridge_start(static_cast<float>(ridge_start_2d.x), height + ridge_height,
+                              static_cast<float>(-ridge_start_2d.y));
+        glm::vec3 ridge_end(static_cast<float>(ridge_end_2d.x), height + ridge_height,
+                            static_cast<float>(-ridge_end_2d.y));
+
+        // For each edge, create a sloped roof triangle fan to ridge
+        for (size_t i = 0; i < n; ++i) {
+            size_t next = (i + 1) % n;
+            if (i == n - 1 && building.footprint[0] == building.footprint[n-1]) continue;
+
+            glm::vec3 p0(static_cast<float>(building.footprint[i].x), height,
+                         static_cast<float>(-building.footprint[i].y));
+            glm::vec3 p1(static_cast<float>(building.footprint[next].x), height,
+                         static_cast<float>(-building.footprint[next].y));
+
+            // Determine which side of ridge this edge is on
+            glm::dvec2 edge_mid = (building.footprint[i] + building.footprint[next]) * 0.5;
+            double side = glm::dot(edge_mid - center, perp);
+
+            // Create roof quad from edge to ridge
+            uint32_t base_idx = static_cast<uint32_t>(mesh.vertices.size());
+
+            // Calculate normal for this roof face
+            glm::vec3 edge_vec = p1 - p0;
+            glm::vec3 to_ridge = (side > 0) ? (ridge_start - p0) : (ridge_end - p0);
+            glm::vec3 face_normal = glm::normalize(glm::cross(edge_vec, to_ridge));
+            if (face_normal.y < 0) face_normal = -face_normal; // Ensure upward-facing
+
+            mesh.vertices.push_back({p0, face_normal, glm::vec2(0.0f, 0.0f), roof_color});
+            mesh.vertices.push_back({p1, face_normal, glm::vec2(1.0f, 0.0f), roof_color});
+            mesh.vertices.push_back({ridge_end, face_normal, glm::vec2(1.0f, 1.0f), roof_color});
+            mesh.vertices.push_back({ridge_start, face_normal, glm::vec2(0.0f, 1.0f), roof_color});
+
+            // Two triangles for roof quad
+            mesh.indices.push_back(base_idx + 0);
+            mesh.indices.push_back(base_idx + 1);
+            mesh.indices.push_back(base_idx + 2);
+
+            mesh.indices.push_back(base_idx + 0);
+            mesh.indices.push_back(base_idx + 2);
+            mesh.indices.push_back(base_idx + 3);
         }
-    }
+    } else if ((building.roof_type == RoofType::Hipped || building.roof_type == RoofType::Pyramidal)
+               && building.holes.empty()) {
+        // Hipped/Pyramidal roof: all edges slope to center apex
+        glm::dvec2 center_2d = compute_centroid(building.footprint);
 
-    // Add roof vertices
-    for (const auto& pt : all_points) {
-        glm::vec3 pos(static_cast<float>(pt.x), height, static_cast<float>(-pt.y));
-        mesh.vertices.push_back({pos, roof_normal, glm::vec2(0.0f, 0.0f), roof_color});
-    }
+        // Find the minimum distance from center to any edge for apex height
+        double min_dist = std::numeric_limits<double>::max();
+        for (size_t i = 0; i < n; ++i) {
+            size_t next = (i + 1) % n;
+            if (i == n - 1 && building.footprint[0] == building.footprint[n-1]) continue;
 
-    // Add roof triangles
-    for (size_t i = 0; i < roof_indices.size(); i += 3) {
-        mesh.indices.push_back(roof_base_idx + roof_indices[i]);
-        mesh.indices.push_back(roof_base_idx + roof_indices[i + 1]);
-        mesh.indices.push_back(roof_base_idx + roof_indices[i + 2]);
+            glm::dvec2 edge = building.footprint[next] - building.footprint[i];
+            glm::dvec2 to_center = center_2d - building.footprint[i];
+            double edge_len = glm::length(edge);
+            if (edge_len > 0.001) {
+                double t = glm::clamp(glm::dot(to_center, edge) / (edge_len * edge_len), 0.0, 1.0);
+                glm::dvec2 closest = building.footprint[i] + edge * t;
+                double dist = glm::length(center_2d - closest);
+                min_dist = std::min(min_dist, dist);
+            }
+        }
+
+        float apex_height = static_cast<float>(min_dist * roof_pitch_ratio);
+        glm::vec3 apex(static_cast<float>(center_2d.x), height + apex_height,
+                       static_cast<float>(-center_2d.y));
+
+        // Create triangular roof faces from each edge to apex
+        for (size_t i = 0; i < n; ++i) {
+            size_t next = (i + 1) % n;
+            if (i == n - 1 && building.footprint[0] == building.footprint[n-1]) continue;
+
+            glm::vec3 p0(static_cast<float>(building.footprint[i].x), height,
+                         static_cast<float>(-building.footprint[i].y));
+            glm::vec3 p1(static_cast<float>(building.footprint[next].x), height,
+                         static_cast<float>(-building.footprint[next].y));
+
+            // Calculate face normal
+            glm::vec3 edge_vec = p1 - p0;
+            glm::vec3 to_apex = apex - p0;
+            glm::vec3 face_normal = glm::normalize(glm::cross(edge_vec, to_apex));
+            if (face_normal.y < 0) face_normal = -face_normal;
+
+            uint32_t base_idx = static_cast<uint32_t>(mesh.vertices.size());
+
+            mesh.vertices.push_back({p0, face_normal, glm::vec2(0.0f, 0.0f), roof_color});
+            mesh.vertices.push_back({p1, face_normal, glm::vec2(1.0f, 0.0f), roof_color});
+            mesh.vertices.push_back({apex, face_normal, glm::vec2(0.5f, 1.0f), roof_color});
+
+            mesh.indices.push_back(base_idx + 0);
+            mesh.indices.push_back(base_idx + 1);
+            mesh.indices.push_back(base_idx + 2);
+        }
+    } else {
+        // Flat roof (default): use earcut triangulation
+        std::vector<std::vector<glm::dvec2>> polygon;
+        polygon.push_back(building.footprint);
+
+        for (const auto& hole : building.holes) {
+            polygon.push_back(hole);
+        }
+
+        std::vector<uint32_t> roof_indices = mapbox::earcut<uint32_t>(polygon);
+
+        glm::vec3 roof_normal(0.0f, 1.0f, 0.0f);
+        uint32_t roof_base_idx = static_cast<uint32_t>(mesh.vertices.size());
+
+        std::vector<glm::dvec2> all_points;
+        for (const auto& ring : polygon) {
+            for (const auto& pt : ring) {
+                all_points.push_back(pt);
+            }
+        }
+
+        for (const auto& pt : all_points) {
+            glm::vec3 pos(static_cast<float>(pt.x), height, static_cast<float>(-pt.y));
+            mesh.vertices.push_back({pos, roof_normal, glm::vec2(0.0f, 0.0f), roof_color});
+        }
+
+        for (size_t i = 0; i < roof_indices.size(); i += 3) {
+            mesh.indices.push_back(roof_base_idx + roof_indices[i]);
+            mesh.indices.push_back(roof_base_idx + roof_indices[i + 1]);
+            mesh.indices.push_back(roof_base_idx + roof_indices[i + 2]);
+        }
     }
 
     // Compute bounding box for frustum culling
@@ -354,8 +512,197 @@ Mesh MeshBuilder::build_road_mesh(const Road& road) {
 
 Mesh MeshBuilder::build_area_mesh(const Area& area) {
     Mesh mesh;
-    // TODO: Implement later
+
+    if (area.polygon.size() < 3) {
+        return mesh;
+    }
+
+    // Get color based on area type
+    glm::vec4 area_color;
+    float area_height = 0.02f; // Slightly above ground to avoid z-fighting
+
+    switch (area.type) {
+        case AreaType::Water:
+            area_color = glm::vec4(0.25f, 0.45f, 0.65f, 1.0f); // Blue
+            area_height = 0.01f;
+            break;
+        case AreaType::Park:
+            area_color = glm::vec4(0.35f, 0.55f, 0.35f, 1.0f); // Medium green
+            break;
+        case AreaType::Forest:
+            area_color = glm::vec4(0.25f, 0.4f, 0.25f, 1.0f); // Dark green
+            break;
+        case AreaType::Grass:
+            area_color = glm::vec4(0.45f, 0.58f, 0.4f, 1.0f); // Light green
+            break;
+        case AreaType::Parking:
+            area_color = glm::vec4(0.42f, 0.42f, 0.44f, 1.0f); // Gray asphalt
+            area_height = 0.03f;
+            break;
+        case AreaType::Commercial:
+            area_color = glm::vec4(0.55f, 0.5f, 0.6f, 1.0f); // Muted purple
+            break;
+        case AreaType::Residential:
+            area_color = glm::vec4(0.52f, 0.52f, 0.48f, 1.0f); // Neutral gray-tan
+            break;
+        case AreaType::Industrial:
+            area_color = glm::vec4(0.5f, 0.48f, 0.42f, 1.0f); // Brown-gray
+            break;
+        case AreaType::Farmland:
+            area_color = glm::vec4(0.6f, 0.55f, 0.4f, 1.0f); // Wheat/tan
+            break;
+        case AreaType::Cemetery:
+            area_color = glm::vec4(0.4f, 0.48f, 0.42f, 1.0f); // Muted sage
+            break;
+        default:
+            area_color = glm::vec4(0.48f, 0.48f, 0.48f, 1.0f); // Neutral gray
+            break;
+    }
+
+    // Prepare polygon for earcut (outer ring + holes)
+    std::vector<std::vector<glm::dvec2>> polygon;
+    polygon.push_back(area.polygon);
+
+    // Add holes if any
+    for (const auto& hole : area.holes) {
+        polygon.push_back(hole);
+    }
+
+    // Run earcut triangulation
+    std::vector<uint32_t> indices = mapbox::earcut<uint32_t>(polygon);
+
+    if (indices.empty()) {
+        return mesh; // Triangulation failed
+    }
+
+    // Flatten all polygon points for vertex lookup
+    std::vector<glm::dvec2> all_points;
+    for (const auto& ring : polygon) {
+        for (const auto& pt : ring) {
+            all_points.push_back(pt);
+        }
+    }
+
+    // Add vertices
+    glm::vec3 up_normal(0.0f, 1.0f, 0.0f);
+    for (const auto& pt : all_points) {
+        glm::vec3 pos(static_cast<float>(pt.x), area_height, static_cast<float>(-pt.y));
+        mesh.vertices.push_back({pos, up_normal, glm::vec2(0.0f, 0.0f), area_color});
+    }
+
+    // Add indices
+    for (uint32_t idx : indices) {
+        mesh.indices.push_back(idx);
+    }
+
+    mesh.compute_bounds();
     return mesh;
+}
+
+std::vector<Mesh> MeshBuilder::build_junction_meshes(const std::vector<Road>& roads) {
+    std::vector<Mesh> junctions;
+
+    if (roads.empty()) return junctions;
+
+    const double JUNCTION_THRESHOLD = 2.0; // meters - endpoints within this distance form a junction
+    const float JUNCTION_HEIGHT = 0.06f;   // Slightly above roads
+    const int CIRCLE_SEGMENTS = 12;
+
+    // Collect all road endpoints with their width and direction
+    struct RoadEndpoint {
+        glm::dvec2 position;
+        glm::dvec2 direction; // Pointing into the road
+        float width;
+        size_t road_idx;
+        bool is_start;
+    };
+    std::vector<RoadEndpoint> endpoints;
+
+    for (size_t ri = 0; ri < roads.size(); ++ri) {
+        const auto& road = roads[ri];
+        if (road.polyline.size() < 2) continue;
+
+        // Start endpoint
+        glm::dvec2 start_dir = glm::normalize(road.polyline[1] - road.polyline[0]);
+        endpoints.push_back({road.polyline[0], start_dir, road.width, ri, true});
+
+        // End endpoint
+        size_t last = road.polyline.size() - 1;
+        glm::dvec2 end_dir = glm::normalize(road.polyline[last - 1] - road.polyline[last]);
+        endpoints.push_back({road.polyline[last], end_dir, road.width, ri, false});
+    }
+
+    // Cluster endpoints into junctions
+    std::vector<bool> processed(endpoints.size(), false);
+
+    for (size_t i = 0; i < endpoints.size(); ++i) {
+        if (processed[i]) continue;
+
+        std::vector<size_t> cluster;
+        cluster.push_back(i);
+        processed[i] = true;
+
+        // Find all endpoints close to this one
+        for (size_t j = i + 1; j < endpoints.size(); ++j) {
+            if (processed[j]) continue;
+
+            double dist = glm::length(endpoints[j].position - endpoints[i].position);
+            if (dist < JUNCTION_THRESHOLD) {
+                cluster.push_back(j);
+                processed[j] = true;
+            }
+        }
+
+        // Only create junction mesh if multiple roads meet
+        if (cluster.size() < 2) continue;
+
+        // Compute junction center and max radius
+        glm::dvec2 center(0.0);
+        float max_width = 0.0f;
+        for (size_t idx : cluster) {
+            center += endpoints[idx].position;
+            max_width = std::max(max_width, endpoints[idx].width);
+        }
+        center /= static_cast<double>(cluster.size());
+
+        float radius = max_width * 0.6f; // Junction radius based on widest road
+
+        // Create a filled circle at the junction
+        Mesh mesh;
+        glm::vec4 junction_color(0.3f, 0.3f, 0.32f, 1.0f); // Asphalt color
+        glm::vec3 up_normal(0.0f, 1.0f, 0.0f);
+
+        // Center vertex
+        uint32_t center_idx = 0;
+        glm::vec3 center_pos(static_cast<float>(center.x), JUNCTION_HEIGHT,
+                             static_cast<float>(-center.y));
+        mesh.vertices.push_back({center_pos, up_normal, glm::vec2(0.5f, 0.5f), junction_color});
+
+        // Circle vertices
+        for (int s = 0; s < CIRCLE_SEGMENTS; ++s) {
+            float angle = static_cast<float>(s) / CIRCLE_SEGMENTS * 2.0f * 3.14159265f;
+            float x = static_cast<float>(center.x) + radius * std::cos(angle);
+            float z = static_cast<float>(-center.y) + radius * std::sin(angle);
+
+            mesh.vertices.push_back({glm::vec3(x, JUNCTION_HEIGHT, z), up_normal,
+                                     glm::vec2(0.5f + 0.5f * std::cos(angle),
+                                               0.5f + 0.5f * std::sin(angle)),
+                                     junction_color});
+        }
+
+        // Triangle fan
+        for (int s = 0; s < CIRCLE_SEGMENTS; ++s) {
+            int next = (s + 1) % CIRCLE_SEGMENTS;
+            mesh.indices.push_back(center_idx);
+            mesh.indices.push_back(static_cast<uint32_t>(1 + s));
+            mesh.indices.push_back(static_cast<uint32_t>(1 + next));
+        }
+
+        mesh.compute_bounds();
+        junctions.push_back(std::move(mesh));
+    }
+
+    return junctions;
 }
 
 } // namespace stratum::osm

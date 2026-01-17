@@ -53,11 +53,6 @@ add_library(stratum_core STATIC
     src/osm/coordinates.cpp
     src/osm/mesh_builder.cpp
     src/osm/tile_manager.cpp
-    
-    # Scene (Data Only)
-    src/scene/scene.cpp
-    src/scene/components.cpp
-    src/scene/spatial.cpp
 )
 
 target_include_directories(stratum_core PUBLIC
@@ -107,11 +102,6 @@ add_library(stratum_editor_lib STATIC
     src/renderer/pipeline.cpp
     src/renderer/mesh.cpp
     src/renderer/texture.cpp
-    src/renderer/camera.cpp
-    
-    # Materials
-    src/materials/material.cpp
-    src/materials/material_library.cpp
     
     # Editor
     src/editor/editor.cpp
