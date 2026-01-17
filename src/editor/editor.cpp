@@ -8,6 +8,8 @@
 #include <ImGuiFileDialog/ImGuiFileDialog.h>
 #include <map>
 #include <cstring>
+#include <cmath>
+#include <algorithm>
 
 namespace stratum {
 
@@ -37,7 +39,9 @@ void Editor::shutdown() {
 }
 
 void Editor::update() {
-    // Update logic here
+    // Update visible tile batches based on camera position
+    // Note: Camera matrices are updated in draw_viewport, so we rebuild batches there
+    // to ensure frustum is current
 }
 
 void Editor::render() {
@@ -276,7 +280,12 @@ void Editor::draw_viewport() {
     if (m_viewport_focused) {
         m_camera.handle_input(dt);
     }
-    
+
+    // Rebuild visible batches with current frustum
+    if (m_use_tile_culling && m_tile_manager.tile_count() > 0) {
+        rebuild_visible_batches();
+    }
+
     // Im3D Frame
     Im3D_NewFrame(dt, m_camera, viewport_size.x, viewport_size.y, m_viewport_focused);
 
@@ -294,8 +303,55 @@ void Editor::draw_viewport() {
     Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,1,0), 2.0f, Im3d::Color(0, 255, 0));
     Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,0,1), 2.0f, Im3d::Color(0, 0, 255));
 
-    // Draw Road Meshes - pre-batched for performance (draw first, under buildings)
-    if (!m_batched_road_tris.empty()) {
+    // Draw tile grid if enabled
+    if (m_show_tile_grid && m_tile_manager.tile_count() > 0) {
+        Frustum frustum = m_camera.get_frustum();
+        for (const auto& coord : m_tile_manager.get_all_tiles()) {
+            const auto* tile = m_tile_manager.get_tile(coord);
+            if (!tile || !tile->has_valid_bounds()) continue;
+
+            // Color based on visibility
+            bool in_frustum = frustum.intersects_aabb(tile->bounds_min, tile->bounds_max);
+            Im3d::Color grid_color = in_frustum ? Im3d::Color(0, 255, 0, 200) : Im3d::Color(255, 0, 0, 100);
+
+            // Draw tile bounding box edges
+            glm::vec3 mn = tile->bounds_min;
+            glm::vec3 mx = tile->bounds_max;
+
+            // Bottom face
+            Im3d::DrawLine(Im3d::Vec3(mn.x, mn.y, mn.z), Im3d::Vec3(mx.x, mn.y, mn.z), 1.5f, grid_color);
+            Im3d::DrawLine(Im3d::Vec3(mx.x, mn.y, mn.z), Im3d::Vec3(mx.x, mn.y, mx.z), 1.5f, grid_color);
+            Im3d::DrawLine(Im3d::Vec3(mx.x, mn.y, mx.z), Im3d::Vec3(mn.x, mn.y, mx.z), 1.5f, grid_color);
+            Im3d::DrawLine(Im3d::Vec3(mn.x, mn.y, mx.z), Im3d::Vec3(mn.x, mn.y, mn.z), 1.5f, grid_color);
+
+            // Top face
+            Im3d::DrawLine(Im3d::Vec3(mn.x, mx.y, mn.z), Im3d::Vec3(mx.x, mx.y, mn.z), 1.5f, grid_color);
+            Im3d::DrawLine(Im3d::Vec3(mx.x, mx.y, mn.z), Im3d::Vec3(mx.x, mx.y, mx.z), 1.5f, grid_color);
+            Im3d::DrawLine(Im3d::Vec3(mx.x, mx.y, mx.z), Im3d::Vec3(mn.x, mx.y, mx.z), 1.5f, grid_color);
+            Im3d::DrawLine(Im3d::Vec3(mn.x, mx.y, mx.z), Im3d::Vec3(mn.x, mx.y, mn.z), 1.5f, grid_color);
+
+            // Vertical edges
+            Im3d::DrawLine(Im3d::Vec3(mn.x, mn.y, mn.z), Im3d::Vec3(mn.x, mx.y, mn.z), 1.5f, grid_color);
+            Im3d::DrawLine(Im3d::Vec3(mx.x, mn.y, mn.z), Im3d::Vec3(mx.x, mx.y, mn.z), 1.5f, grid_color);
+            Im3d::DrawLine(Im3d::Vec3(mx.x, mn.y, mx.z), Im3d::Vec3(mx.x, mx.y, mx.z), 1.5f, grid_color);
+            Im3d::DrawLine(Im3d::Vec3(mn.x, mn.y, mx.z), Im3d::Vec3(mn.x, mx.y, mx.z), 1.5f, grid_color);
+        }
+    }
+
+    // Draw Area Meshes - pre-batched for performance (draw first, at bottom layer)
+    if (m_render_areas && !m_batched_area_tris.empty()) {
+        Im3d::BeginTriangles();
+        for (const auto& tri : m_batched_area_tris) {
+            Im3d::Color color(tri.color.r, tri.color.g, tri.color.b, tri.color.a);
+            Im3d::Vertex(Im3d::Vec3(tri.p0.x, tri.p0.y, tri.p0.z), color);
+            Im3d::Vertex(Im3d::Vec3(tri.p1.x, tri.p1.y, tri.p1.z), color);
+            Im3d::Vertex(Im3d::Vec3(tri.p2.x, tri.p2.y, tri.p2.z), color);
+        }
+        Im3d::End();
+    }
+
+    // Draw Road Meshes - pre-batched for performance (draw second, over areas)
+    if (m_render_roads && !m_batched_road_tris.empty()) {
         Im3d::BeginTriangles();
         for (const auto& tri : m_batched_road_tris) {
             Im3d::Color color(tri.color.r, tri.color.g, tri.color.b, tri.color.a);
@@ -306,8 +362,8 @@ void Editor::draw_viewport() {
         Im3d::End();
     }
 
-    // Draw Building Meshes - pre-batched for performance
-    if (!m_batched_building_tris.empty()) {
+    // Draw Building Meshes - pre-batched for performance (draw last, on top)
+    if (m_render_buildings && !m_batched_building_tris.empty()) {
         Im3d::BeginTriangles();
         for (const auto& tri : m_batched_building_tris) {
             Im3d::Color color(tri.color.r, tri.color.g, tri.color.b, tri.color.a);
@@ -502,6 +558,46 @@ void Editor::draw_console() {
 void Editor::draw_osm_panel() {
     ImGui::Begin("OSM");
 
+    // Render toggles at top
+    ImGui::Text("Show:");
+    ImGui::SameLine();
+    ImGui::Checkbox("##show_areas", &m_render_areas);
+    ImGui::SameLine(); ImGui::Text("Areas");
+    ImGui::SameLine();
+    ImGui::Checkbox("##show_roads", &m_render_roads);
+    ImGui::SameLine(); ImGui::Text("Roads");
+    ImGui::SameLine();
+    ImGui::Checkbox("##show_buildings", &m_render_buildings);
+    ImGui::SameLine(); ImGui::Text("Bldgs");
+
+    // Culling controls
+    ImGui::Checkbox("Frustum Culling", &m_use_tile_culling);
+    ImGui::SameLine();
+    ImGui::Checkbox("Tile Grid", &m_show_tile_grid);
+    ImGui::SetNextItemWidth(120);
+    ImGui::SliderFloat("Tile Size", &m_tile_size, 50.0f, 2000.0f, "%.0f m");
+    if (ImGui::IsItemDeactivatedAfterEdit() && m_osm_parser.has_data()) {
+        rebuild_osm_meshes(); // Rebuild tiles with new size
+    }
+    if (m_tile_manager.tile_count() > 0) {
+        // Count visible tiles using frustum
+        size_t visible_count = 0;
+        if (m_use_tile_culling) {
+            Frustum frustum = m_camera.get_frustum();
+            for (const auto& coord : m_tile_manager.get_all_tiles()) {
+                const auto* tile = m_tile_manager.get_tile(coord);
+                if (tile && tile->has_valid_bounds() &&
+                    frustum.intersects_aabb(tile->bounds_min, tile->bounds_max)) {
+                    visible_count++;
+                }
+            }
+        } else {
+            visible_count = m_tile_manager.tile_count();
+        }
+        ImGui::Text("(%zu/%zu tiles)", visible_count, m_tile_manager.tile_count());
+    }
+
+    ImGui::Separator();
     ImGui::Text("OpenStreetMap Import");
     ImGui::Separator();
 
@@ -671,10 +767,13 @@ void Editor::draw_osm_panel() {
         ImGui::Separator();
         if (ImGui::Button("Clear Data", ImVec2(-1, 0))) {
             m_osm_parser.clear();
+            m_tile_manager.clear();
             m_building_meshes.clear();
             m_road_meshes.clear();
+            m_area_meshes.clear();
             m_batched_building_tris.clear();
             m_batched_road_tris.clear();
+            m_batched_area_tris.clear();
         }
     }
 
@@ -811,91 +910,138 @@ void Editor::handle_window_resize() {
 void Editor::rebuild_osm_meshes() {
     m_building_meshes.clear();
     m_road_meshes.clear();
+    m_area_meshes.clear();
     m_batched_building_tris.clear();
     m_batched_road_tris.clear();
+    m_batched_area_tris.clear();
 
     const auto& osm_data = m_osm_parser.get_data();
 
-    // Build building meshes
-    m_building_meshes.reserve(osm_data.buildings.size());
-    for (const auto& building : osm_data.buildings) {
-        Mesh mesh = osm::MeshBuilder::build_building_mesh(building);
-        if (mesh.is_valid()) {
-            m_building_meshes.push_back(std::move(mesh));
+    // Initialize tile manager
+    spdlog::info("Initializing tile manager...");
+    m_tile_manager.clear();
+    m_tile_manager.init(osm_data.bounds, m_tile_size);
+    m_tile_manager.assign_data(osm_data);
+    
+    // Build all tile meshes (includes junctions per-tile now)
+    spdlog::info("Building tile meshes (roads, buildings, areas, junctions)...");
+    m_tile_manager.build_all_meshes();
+
+    spdlog::info("Tile manager: {} tiles, {} roads, {} buildings, {} areas",
+                 m_tile_manager.tile_count(),
+                 m_tile_manager.total_roads(),
+                 m_tile_manager.total_buildings(),
+                 m_tile_manager.total_areas());
+
+    // Find center of first tile with actual geometry for camera positioning
+    glm::vec3 data_center(0.0f);
+    bool found_geometry = false;
+    
+    for (const auto& coord : m_tile_manager.get_all_tiles()) {
+        const auto* tile = m_tile_manager.get_tile(coord);
+        if (!tile) continue;
+        
+        // Use tile bounds center if we have valid bounds
+        if (tile->has_valid_bounds()) {
+            data_center = (tile->bounds_min + tile->bounds_max) * 0.5f;
+            found_geometry = true;
+            spdlog::info("Found tile at ({}, {}) with bounds: ({},{},{}) to ({},{},{})",
+                        coord.x, coord.y,
+                        tile->bounds_min.x, tile->bounds_min.y, tile->bounds_min.z,
+                        tile->bounds_max.x, tile->bounds_max.y, tile->bounds_max.z);
+            break;
         }
     }
 
-    // Build road meshes
-    m_road_meshes.reserve(osm_data.roads.size());
-    for (const auto& road : osm_data.roads) {
-        Mesh mesh = osm::MeshBuilder::build_road_mesh(road);
-        if (mesh.is_valid()) {
-            m_road_meshes.push_back(std::move(mesh));
-        }
+    if (!found_geometry) {
+        spdlog::warn("No geometry found in any tile!");
     }
 
-    // Pre-batch building triangles
-    size_t total_building_tris = 0;
-    for (const auto& mesh : m_building_meshes) {
-        total_building_tris += mesh.indices.size() / 3;
-    }
-    m_batched_building_tris.reserve(total_building_tris);
+    spdlog::info("Data center: ({}, {}, {})", data_center.x, data_center.y, data_center.z);
 
-    glm::vec3 centroid(0.0f);
-    size_t vert_count = 0;
-
-    for (const auto& mesh : m_building_meshes) {
-        for (size_t i = 0; i < mesh.indices.size(); i += 3) {
-            const auto& v0 = mesh.vertices[mesh.indices[i]];
-            const auto& v1 = mesh.vertices[mesh.indices[i + 1]];
-            const auto& v2 = mesh.vertices[mesh.indices[i + 2]];
-
-            m_batched_building_tris.push_back({v0.position, v1.position, v2.position, v0.color});
-
-            centroid += v0.position + v1.position + v2.position;
-            vert_count += 3;
-        }
-    }
-
-    // Pre-batch road triangles
-    size_t total_road_tris = 0;
-    for (const auto& mesh : m_road_meshes) {
-        total_road_tris += mesh.indices.size() / 3;
-    }
-    m_batched_road_tris.reserve(total_road_tris);
-
-    for (const auto& mesh : m_road_meshes) {
-        for (size_t i = 0; i < mesh.indices.size(); i += 3) {
-            const auto& v0 = mesh.vertices[mesh.indices[i]];
-            const auto& v1 = mesh.vertices[mesh.indices[i + 1]];
-            const auto& v2 = mesh.vertices[mesh.indices[i + 2]];
-
-            m_batched_road_tris.push_back({v0.position, v1.position, v2.position, v0.color});
-
-            centroid += v0.position + v1.position + v2.position;
-            vert_count += 3;
-        }
-    }
-
-    spdlog::info("Built {} building meshes ({} tris), {} road meshes ({} tris)",
-                 m_building_meshes.size(), m_batched_building_tris.size(),
-                 m_road_meshes.size(), m_batched_road_tris.size());
-
-    // Center camera on loaded data
-    if (vert_count > 0) {
-        centroid /= static_cast<float>(vert_count);
-
-        // Position camera above and looking at centroid
-        float view_height = 500.0f;
-        float view_distance = 500.0f;
-        glm::vec3 cam_pos = centroid + glm::vec3(0.0f, view_height, view_distance);
+    // Center camera on data FIRST (before culling uses camera position)
+    if (found_geometry) {
+        float view_height = 300.0f;
+        float view_distance = 300.0f;
+        glm::vec3 cam_pos = data_center + glm::vec3(0.0f, view_height, view_distance);
 
         m_camera.set_position(cam_pos);
-        m_camera.set_target(centroid);
+        m_camera.set_target(data_center);
         m_camera.m_far = 50000.0f;
         m_camera.m_speed = 200.0f;
+        m_view_radius = 5000.0f;  // Start with larger view radius
 
-        spdlog::info("Camera centered at ({}, {}, {})", cam_pos.x, cam_pos.y, cam_pos.z);
+        spdlog::info("Camera at ({}, {}, {}) looking at ({}, {}, {})",
+                     cam_pos.x, cam_pos.y, cam_pos.z,
+                     data_center.x, data_center.y, data_center.z);
+    }
+
+    // Enable culling for performance (camera is now positioned correctly)
+    m_use_tile_culling = true;
+    m_use_distance_culling = true;
+    rebuild_visible_batches();
+
+    spdlog::info("Initial batch: {} area tris, {} building tris, {} road tris",
+                 m_batched_area_tris.size(), m_batched_building_tris.size(), m_batched_road_tris.size());
+}
+
+void Editor::rebuild_visible_batches() {
+    m_batched_area_tris.clear();
+    m_batched_building_tris.clear();
+    m_batched_road_tris.clear();
+
+    glm::vec3 cam_pos = m_camera.get_position();
+    float radius_sq = m_view_radius * m_view_radius;
+    Frustum frustum = m_camera.get_frustum();
+
+    // Helper to check if mesh is within view distance (XZ plane)
+    auto is_mesh_in_range = [&](const Mesh& mesh) -> bool {
+        if (!m_use_distance_culling) return true;
+        if (!mesh.bounds.is_valid()) return true;
+        
+        glm::vec3 mesh_center = mesh.bounds.center();
+        glm::vec3 diff = mesh_center - cam_pos;
+        float dist_sq = diff.x * diff.x + diff.z * diff.z;
+        return dist_sq <= radius_sq;
+    };
+
+    // Helper to check if mesh is in frustum
+    auto is_mesh_in_frustum = [&](const Mesh& mesh) -> bool {
+        if (!m_use_tile_culling) return true;  // Reuse tile culling flag for frustum
+        if (!mesh.bounds.is_valid()) return true;
+        return frustum.intersects_aabb(mesh.bounds.min, mesh.bounds.max);
+    };
+
+    // Helper to batch a mesh's triangles
+    auto batch_mesh = [](const Mesh& mesh, std::vector<BatchedTriangle>& batch) {
+        for (size_t i = 0; i < mesh.indices.size(); i += 3) {
+            const auto& v0 = mesh.vertices[mesh.indices[i]];
+            const auto& v1 = mesh.vertices[mesh.indices[i + 1]];
+            const auto& v2 = mesh.vertices[mesh.indices[i + 2]];
+            batch.push_back({v0.position, v1.position, v2.position, v0.color});
+        }
+    };
+
+    // Process all meshes from all tiles with per-mesh culling
+    for (const auto& coord : m_tile_manager.get_all_tiles()) {
+        const auto* tile = m_tile_manager.get_tile(coord);
+        if (!tile) continue;
+
+        for (const auto& mesh : tile->area_meshes) {
+            if (is_mesh_in_range(mesh) && is_mesh_in_frustum(mesh)) {
+                batch_mesh(mesh, m_batched_area_tris);
+            }
+        }
+        for (const auto& mesh : tile->building_meshes) {
+            if (is_mesh_in_range(mesh) && is_mesh_in_frustum(mesh)) {
+                batch_mesh(mesh, m_batched_building_tris);
+            }
+        }
+        for (const auto& mesh : tile->road_meshes) {
+            if (is_mesh_in_range(mesh) && is_mesh_in_frustum(mesh)) {
+                batch_mesh(mesh, m_batched_road_tris);
+            }
+        }
     }
 }
 

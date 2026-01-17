@@ -4,6 +4,7 @@
 #include <functional>
 #include "osm/parser.hpp"
 #include "osm/mesh_builder.hpp"
+#include "osm/tile_manager.hpp"
 #include "renderer/mesh.hpp"
 #include "editor/camera.hpp"
 
@@ -51,6 +52,12 @@ private:
     bool m_show_console = true;
     bool m_show_osm_panel = true;
 
+    // Render toggles
+    bool m_render_areas = true;
+    bool m_render_roads = true;
+    bool m_render_buildings = true;
+    bool m_show_tile_grid = false;
+
     // Console log
     ImGuiTextBuffer m_console_buffer;
     bool m_console_scroll_to_bottom = true;
@@ -79,13 +86,19 @@ private:
 
     void handle_window_resize();
 
-    // OSM Parser
+    // OSM Parser and Tile Manager
     osm::OSMParser m_osm_parser;
+    osm::TileManager m_tile_manager;
     std::string m_osm_import_path;
+    bool m_use_tile_culling = true;
+    bool m_use_distance_culling = true;  // Cull tiles outside view radius
+    float m_view_radius = 2000.0f;       // Max distance from camera to render
+    float m_tile_size = 500.0f;
 
-    // Cached meshes for rendering
+    // Cached meshes for rendering (legacy - now managed by TileManager)
     std::vector<Mesh> m_building_meshes;
     std::vector<Mesh> m_road_meshes;
+    std::vector<Mesh> m_area_meshes;
 
     // Pre-batched geometry for fast rendering (combined from all meshes)
     struct BatchedTriangle {
@@ -94,8 +107,10 @@ private:
     };
     std::vector<BatchedTriangle> m_batched_building_tris;
     std::vector<BatchedTriangle> m_batched_road_tris;
+    std::vector<BatchedTriangle> m_batched_area_tris;
 
     void rebuild_osm_meshes();
+    void rebuild_visible_batches();
 };
 
 } // namespace stratum
