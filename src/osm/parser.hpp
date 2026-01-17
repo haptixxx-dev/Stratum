@@ -6,7 +6,15 @@
  * @date 2026
  *
  * This file provides the OSMParser class for parsing OpenStreetMap
- * data files (.osm XML format) and extracting buildings, roads, and areas.
+ * data files (.osm XML and .pbf binary formats) and extracting
+ * buildings, roads, and areas.
+ *
+ * Supported formats (auto-detected by extension):
+ *   - .osm     - XML format
+ *   - .pbf     - Protobuf binary format
+ *   - .osm.pbf - Protobuf binary format
+ *   - .osm.bz2 - Bzip2-compressed XML
+ *   - .osm.gz  - Gzip-compressed XML
  */
 
 #pragma once

@@ -157,8 +157,21 @@ bool OSMParser::parse(const std::filesystem::path& filepath) {
             return false;
         }
 
-        // Open the file
+        // Open the file (libosmium auto-detects format from extension)
         const osmium::io::File input_file{filepath.string()};
+
+        // Log detected format
+        std::string format_name;
+        switch (input_file.format()) {
+            case osmium::io::file_format::xml:  format_name = "XML"; break;
+            case osmium::io::file_format::pbf:  format_name = "PBF"; break;
+            case osmium::io::file_format::opl:  format_name = "OPL"; break;
+            case osmium::io::file_format::json: format_name = "JSON"; break;
+            case osmium::io::file_format::debug: format_name = "Debug"; break;
+            default: format_name = "Unknown"; break;
+        }
+        spdlog::info("OSM Parser: Detected {} format for {}", format_name, filepath.filename().string());
+
         osmium::io::Reader reader{input_file,
             osmium::osm_entity_bits::node |
             osmium::osm_entity_bits::way |
