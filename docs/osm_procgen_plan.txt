@@ -25,7 +25,7 @@ EDITOR CORE
   [x] Dockable panel layout (viewport, scene, properties)
   [x] Basic project structure
 
-  [ ] 3D viewport with orbit/pan/zoom camera
+  [x] 3D viewport with orbit/pan/zoom camera
   [ ] Entity selection (click to select)
   [ ] Transform gizmos (translate/rotate/scale)
   [ ] Undo/redo system
@@ -105,13 +105,13 @@ RENDERING (v1 Minimum)
     [x] Convert lat/lon to local coordinate system (Mercator projection)
     [ ] Handle multipolygons and complex relations
 
-[ ] Tile Manager (src/osm/tile_manager.cpp)
-    - Tile-based spatial indexing (quadtree or grid)
-    - Level-of-detail (LOD) system for large maps
-    - Streaming/lazy loading of tile data
-    - Tile caching (memory + disk)
-    - Frustum culling per tile
-    - Background loading thread
+[~] Tile Manager (src/osm/tile_manager.cpp)
+    [x] Tile-based spatial indexing (quadtree or grid)
+    [ ] Level-of-detail (LOD) system for large maps
+    [ ] Streaming/lazy loading of tile data
+    [ ] Tile caching (memory + disk)
+    [x] Frustum culling per tile
+    [ ] Background loading thread
 
 [~] Mesh Builder (src/osm/mesh_builder.cpp)
     [x] Road mesh generation:
@@ -246,9 +246,9 @@ PHASE 1: OSM Foundation [COMPLETE]
     [x] Simple road ribbons (miter joins, width-based)
     [x] Basic rendering in viewport (Im3d batched triangles)
 
-PHASE 2: OSM Polish
+PHASE 2: OSM Polish [IN PROGRESS]
     [ ] PBF parser for large datasets
-    [ ] Tile-based loading
+    [~] Tile-based loading (spatial indexing + frustum culling done)
     [ ] Proper road intersections
     [ ] Building roof styles
     [ ] Area triangulation
