@@ -607,33 +607,47 @@ std::vector<Mesh> MeshBuilder::build_junction_meshes(const std::vector<Road>& ro
     const double JUNCTION_THRESHOLD = 2.0; // meters - endpoints within this distance form a junction
     const float JUNCTION_HEIGHT = 0.06f;   // Slightly above roads
     const int CIRCLE_SEGMENTS = 12;
+    const double CELL_SIZE = JUNCTION_THRESHOLD * 2.0;  // Spatial hash cell size
 
-    // Collect all road endpoints with their width and direction
+    // Collect all road endpoints with their width
     struct RoadEndpoint {
         glm::dvec2 position;
-        glm::dvec2 direction; // Pointing into the road
         float width;
         size_t road_idx;
-        bool is_start;
     };
     std::vector<RoadEndpoint> endpoints;
+    endpoints.reserve(roads.size() * 2);
 
     for (size_t ri = 0; ri < roads.size(); ++ri) {
         const auto& road = roads[ri];
         if (road.polyline.size() < 2) continue;
 
         // Start endpoint
-        glm::dvec2 start_dir = glm::normalize(road.polyline[1] - road.polyline[0]);
-        endpoints.push_back({road.polyline[0], start_dir, road.width, ri, true});
+        endpoints.push_back({road.polyline[0], road.width, ri});
 
         // End endpoint
-        size_t last = road.polyline.size() - 1;
-        glm::dvec2 end_dir = glm::normalize(road.polyline[last - 1] - road.polyline[last]);
-        endpoints.push_back({road.polyline[last], end_dir, road.width, ri, false});
+        endpoints.push_back({road.polyline.back(), road.width, ri});
     }
 
-    // Cluster endpoints into junctions
+    // Build spatial hash for O(1) neighbor lookup
+    auto hash_cell = [CELL_SIZE](const glm::dvec2& pos) -> std::pair<int, int> {
+        return {static_cast<int>(std::floor(pos.x / CELL_SIZE)),
+                static_cast<int>(std::floor(pos.y / CELL_SIZE))};
+    };
+
+    std::unordered_map<int64_t, std::vector<size_t>> spatial_hash;
+    auto cell_key = [](int cx, int cy) -> int64_t {
+        return (static_cast<int64_t>(cx) << 32) | static_cast<uint32_t>(cy);
+    };
+
+    for (size_t i = 0; i < endpoints.size(); ++i) {
+        auto [cx, cy] = hash_cell(endpoints[i].position);
+        spatial_hash[cell_key(cx, cy)].push_back(i);
+    }
+
+    // Cluster endpoints into junctions using spatial hash
     std::vector<bool> processed(endpoints.size(), false);
+    double thresh_sq = JUNCTION_THRESHOLD * JUNCTION_THRESHOLD;
 
     for (size_t i = 0; i < endpoints.size(); ++i) {
         if (processed[i]) continue;
@@ -642,14 +656,23 @@ std::vector<Mesh> MeshBuilder::build_junction_meshes(const std::vector<Road>& ro
         cluster.push_back(i);
         processed[i] = true;
 
-        // Find all endpoints close to this one
-        for (size_t j = i + 1; j < endpoints.size(); ++j) {
-            if (processed[j]) continue;
+        auto [cx, cy] = hash_cell(endpoints[i].position);
 
-            double dist = glm::length(endpoints[j].position - endpoints[i].position);
-            if (dist < JUNCTION_THRESHOLD) {
-                cluster.push_back(j);
-                processed[j] = true;
+        // Check neighboring cells (3x3 grid)
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                auto it = spatial_hash.find(cell_key(cx + dx, cy + dy));
+                if (it == spatial_hash.end()) continue;
+
+                for (size_t j : it->second) {
+                    if (j <= i || processed[j]) continue;
+
+                    glm::dvec2 diff = endpoints[j].position - endpoints[i].position;
+                    if (diff.x * diff.x + diff.y * diff.y < thresh_sq) {
+                        cluster.push_back(j);
+                        processed[j] = true;
+                    }
+                }
             }
         }
 
@@ -665,11 +688,11 @@ std::vector<Mesh> MeshBuilder::build_junction_meshes(const std::vector<Road>& ro
         }
         center /= static_cast<double>(cluster.size());
 
-        float radius = max_width * 0.6f; // Junction radius based on widest road
+        float radius = max_width * 0.6f;
 
         // Create a filled circle at the junction
         Mesh mesh;
-        glm::vec4 junction_color(0.3f, 0.3f, 0.32f, 1.0f); // Asphalt color
+        glm::vec4 junction_color(0.3f, 0.3f, 0.32f, 1.0f);
         glm::vec3 up_normal(0.0f, 1.0f, 0.0f);
 
         // Center vertex
