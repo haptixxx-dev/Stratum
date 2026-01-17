@@ -39,7 +39,7 @@ OSM IMPORT (v1 Minimum)
   [x] Generate 3D meshes:
       [x] Buildings: extruded footprints with flat roofs
       [x] Roads: ribbon meshes with proper width
-      [ ] Areas: triangulated polygons
+      [x] Areas: triangulated polygons
   [x] Coordinate conversion (lat/lon -> local meters)
 
 PROCEDURAL GENERATION (v1 Minimum)
@@ -94,7 +94,7 @@ RENDERING (v1 Minimum)
 
 [x] OSM Parser (src/osm/parser.cpp)
     [x] Parse .osm XML files (nodes, ways, relations)
-    [ ] Parse .pbf binary format for large datasets
+    [x] Parse .pbf binary format for large datasets
     [x] Extract and categorize element tags:
         * highway (roads, paths, footways)
         * building (footprints, heights, building:levels)
@@ -118,7 +118,7 @@ RENDERING (v1 Minimum)
         [x] Polyline to ribbon mesh with width based on road type
         [x] Miter joins at corners
         [x] Colors by road type (asphalt/footway/cycleway)
-        [ ] Proper intersections and junctions
+        [x] Proper intersections and junctions
         [ ] Lane markings (dashed/solid lines)
         [ ] Sidewalks and curbs
     [x] Building mesh generation:
@@ -126,11 +126,11 @@ RENDERING (v1 Minimum)
         [x] Flat roofs via earcut triangulation
         [x] Colors from OSM tags (building:colour, roof:colour)
         [x] Default colors by building type
-        [ ] Sloped roof styles
+        [x] Sloped roof styles (gabled, hipped, pyramidal, skillion, dome)
         [ ] Facade texturing based on building type
-    [ ] Area mesh generation:
-        [ ] Triangulate polygons (earcut or similar)
-        [ ] Parks, water, parking lots
+    [x] Area mesh generation:
+        [x] Triangulate polygons (earcut or similar)
+        [x] Parks, water, parking lots
     - Use Clipper2 (already in external/) for polygon operations
 
 [x] OSM Data Structures (src/osm/types.hpp)
@@ -247,11 +247,11 @@ PHASE 1: OSM Foundation [COMPLETE]
     [x] Basic rendering in viewport (Im3d batched triangles)
 
 PHASE 2: OSM Polish [IN PROGRESS]
-    [ ] PBF parser for large datasets
-    [~] Tile-based loading (spatial indexing + frustum culling done)
-    [ ] Proper road intersections
-    [ ] Building roof styles
-    [ ] Area triangulation
+    [x] PBF parser for large datasets (libosmium auto-detects format)
+    [~] Tile-based loading (spatial indexing + frustum culling done, needs polish)
+    [x] Proper road intersections
+    [x] Building roof styles
+    [x] Area triangulation
 
 PHASE 3: Procedural Foundation
     [ ] Terrain heightmap generation
