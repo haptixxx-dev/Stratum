@@ -109,6 +109,9 @@ void Application::update() {
 }
 
 void Application::render() {
+    // Update editor state (tile culling, etc.)
+    m_editor.update();
+
     // Render the editor UI
     m_editor.render();
 
