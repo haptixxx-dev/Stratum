@@ -44,6 +44,11 @@ private:
     float m_yaw = -90.0f;
     float m_pitch = -25.0f;
 
+    float m_yaw_old = m_yaw;
+    float m_pitch_old = m_pitch;
+
+    bool m_was_rotating = false;
+
     glm::mat4 m_view{1.0f};
     glm::mat4 m_projection{1.0f};
     glm::mat4 m_view_projection{1.0f};

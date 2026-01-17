@@ -33,8 +33,17 @@ void Camera::update(float aspect_ratio) {
 void Camera::handle_input(float dt) {
     // Only move if right mouse button is held (standard editor cam)
     auto mouse_state = SDL_GetMouseState(nullptr, nullptr);
-    if (!(mouse_state & SDL_BUTTON_RMASK)) {
+    bool is_rotating = mouse_state & SDL_BUTTON_RMASK;
+
+    if (!is_rotating) {
+        m_was_rotating = false;
         return;
+    }
+
+    // First frame of right-click: flush relative mouse state to avoid jump
+    if (!m_was_rotating) {
+        SDL_GetRelativeMouseState(nullptr, nullptr);
+        m_was_rotating = true;
     }
 
     const bool* state = SDL_GetKeyboardState(nullptr);
@@ -64,8 +73,13 @@ void Camera::handle_input(float dt) {
     SDL_GetRelativeMouseState(&xrel, &yrel);
 
     if (xrel != 0 || yrel != 0) {
-        m_yaw += xrel * m_sensitivity;
-        m_pitch -= yrel * m_sensitivity;
+
+        // update current yaw/pitch using difference from last frame and current movement
+        m_yaw = m_yaw_old + xrel * m_sensitivity;
+        m_pitch = m_pitch_old - yrel * m_sensitivity;
+
+        m_yaw_old = m_yaw;
+        m_pitch_old = m_pitch;
 
         // Clamp pitch
         m_pitch = std::clamp(m_pitch, -89.0f, 89.0f);
