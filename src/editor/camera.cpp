@@ -30,6 +30,18 @@ void Camera::update(float aspect_ratio) {
     recalculate_projection(aspect_ratio);
 }
 
+void Camera::adjust_speed(float scroll_delta) {
+    // Multiply speed by 1.1 for scroll up, divide by 1.1 for scroll down
+    const float scroll_factor = 1.15f;
+    if (scroll_delta > 0) {
+        m_speed_multiplier *= scroll_factor;
+    } else if (scroll_delta < 0) {
+        m_speed_multiplier /= scroll_factor;
+    }
+    // Clamp to reasonable range (0.1x to 100x base speed)
+    m_speed_multiplier = std::clamp(m_speed_multiplier, 0.1f, 100.0f);
+}
+
 void Camera::handle_input(float dt) {
     // Only move if right mouse button is held (standard editor cam)
     auto mouse_state = SDL_GetMouseState(nullptr, nullptr);
@@ -47,7 +59,7 @@ void Camera::handle_input(float dt) {
     }
 
     const bool* state = SDL_GetKeyboardState(nullptr);
-    float speed = m_speed * dt;
+    float speed = m_base_speed * m_speed_multiplier * dt;
     
     // Boost speed with Shift
     if (state[SDL_SCANCODE_LSHIFT]) {

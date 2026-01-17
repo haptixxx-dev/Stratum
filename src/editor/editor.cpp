@@ -281,6 +281,15 @@ void Editor::draw_viewport() {
         m_camera.handle_input(dt);
     }
 
+    // Handle scroll wheel for camera speed adjustment while right-click is held
+    if (m_viewport_hovered || m_viewport_focused) {
+        ImGuiIO& io = ImGui::GetIO();
+        bool right_mouse_held = io.MouseDown[1];  // Right mouse button
+        if (right_mouse_held && io.MouseWheel != 0.0f) {
+            m_camera.adjust_speed(io.MouseWheel);
+        }
+    }
+
     // Rebuild visible batches with current frustum
     if (m_use_tile_culling && m_tile_manager.tile_count() > 0) {
         rebuild_visible_batches();
@@ -968,7 +977,7 @@ void Editor::rebuild_osm_meshes() {
         m_camera.set_position(cam_pos);
         m_camera.set_target(data_center);
         m_camera.m_far = 50000.0f;
-        m_camera.m_speed = 200.0f;
+        m_camera.m_base_speed = 200.0f;
         m_view_radius = 5000.0f;  // Start with larger view radius
 
         spdlog::info("Camera at ({}, {}, {}) looking at ({}, {}, {})",

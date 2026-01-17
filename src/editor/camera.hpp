@@ -82,8 +82,13 @@ public:
     float m_fov = 45.0f;
     float m_near = 0.1f;
     float m_far = 1000.0f;
-    float m_speed = 10.0f;
+    float m_base_speed = 10.0f;
+    float m_speed_multiplier = 1.0f;
     float m_sensitivity = 0.1f;
+
+    // Scroll wheel speed adjustment
+    void adjust_speed(float scroll_delta);
+    float get_current_speed() const { return m_base_speed * m_speed_multiplier; }
 
 private:
     void recalculate_view();
