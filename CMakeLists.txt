@@ -53,6 +53,8 @@ add_library(stratum_core STATIC
     src/osm/coordinates.cpp
     src/osm/mesh_builder.cpp
     src/osm/tile_manager.cpp
+
+
 )
 
 target_include_directories(stratum_core PUBLIC
