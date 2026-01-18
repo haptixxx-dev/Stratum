@@ -6,7 +6,7 @@ layout(location = 1) in vec3 in_normal;
 layout(location = 2) in vec2 in_uv;
 layout(location = 3) in vec4 in_color;
 
-// Uniforms
+// Uniforms - SDL_GPU requires set=1 for vertex shader uniform buffers
 layout(set = 1, binding = 0) uniform MeshUniforms {
     mat4 mvp;
     mat4 model;
