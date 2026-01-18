@@ -254,4 +254,101 @@ size_t TileManager::total_areas() const {
     return count;
 }
 
+TileManager::BuiltMeshes TileManager::build_tile_meshes_internal(const Tile& tile) {
+    BuiltMeshes result;
+
+    // Build road meshes
+    result.road_meshes.reserve(tile.roads.size());
+    for (const auto& road : tile.roads) {
+        Mesh mesh = MeshBuilder::build_road_mesh(road);
+        if (mesh.is_valid()) {
+            result.road_meshes.push_back(std::move(mesh));
+        }
+    }
+
+    // Build junction meshes
+    if (!tile.roads.empty()) {
+        auto junctions = MeshBuilder::build_junction_meshes(tile.roads);
+        for (auto& junction : junctions) {
+            if (junction.is_valid()) {
+                result.road_meshes.push_back(std::move(junction));
+            }
+        }
+    }
+
+    // Build building meshes
+    result.building_meshes.reserve(tile.buildings.size());
+    for (const auto& building : tile.buildings) {
+        Mesh mesh = MeshBuilder::build_building_mesh(building);
+        if (mesh.is_valid()) {
+            result.building_meshes.push_back(std::move(mesh));
+        }
+    }
+
+    // Build area meshes
+    result.area_meshes.reserve(tile.areas.size());
+    for (const auto& area : tile.areas) {
+        Mesh mesh = MeshBuilder::build_area_mesh(area);
+        if (mesh.is_valid()) {
+            result.area_meshes.push_back(std::move(mesh));
+        }
+    }
+
+    return result;
+}
+
+bool TileManager::queue_tile_build_async(TileCoord coord) {
+    auto* tile = get_tile(coord);
+    if (!tile || tile->meshes_built || tile->meshes_pending) {
+        return false;
+    }
+
+    tile->meshes_pending = true;
+
+    // Capture tile data by copy for thread safety
+    Tile tile_copy = *tile;
+
+    std::lock_guard<std::mutex> lock(m_pending_mutex);
+    m_pending_builds.push_back({
+        coord,
+        std::async(std::launch::async, [this, tile_copy]() {
+            return build_tile_meshes_internal(tile_copy);
+        })
+    });
+
+    return true;
+}
+
+size_t TileManager::poll_async_builds() {
+    std::lock_guard<std::mutex> lock(m_pending_mutex);
+
+    size_t completed = 0;
+
+    // Check each pending build
+    for (auto it = m_pending_builds.begin(); it != m_pending_builds.end(); ) {
+        // Check if ready (non-blocking)
+        if (it->future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            // Get the built meshes
+            BuiltMeshes meshes = it->future.get();
+
+            // Apply to tile
+            auto* tile = get_tile(it->coord);
+            if (tile) {
+                tile->road_meshes = std::move(meshes.road_meshes);
+                tile->building_meshes = std::move(meshes.building_meshes);
+                tile->area_meshes = std::move(meshes.area_meshes);
+                tile->meshes_built = true;
+                tile->meshes_pending = false;
+            }
+
+            it = m_pending_builds.erase(it);
+            completed++;
+        } else {
+            ++it;
+        }
+    }
+
+    return completed;
+}
+
 } // namespace stratum::osm

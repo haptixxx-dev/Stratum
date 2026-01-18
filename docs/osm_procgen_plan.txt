@@ -108,10 +108,10 @@ RENDERING (v1 Minimum)
 [~] Tile Manager (src/osm/tile_manager.cpp)
     [x] Tile-based spatial indexing (quadtree or grid)
     [ ] Level-of-detail (LOD) system for large maps
-    [ ] Streaming/lazy loading of tile data
+    [x] Streaming/lazy loading of tile data
     [ ] Tile caching (memory + disk)
     [x] Frustum culling per tile
-    [ ] Background loading thread
+    [x] Background loading thread (async mesh building)
 
 [~] Mesh Builder (src/osm/mesh_builder.cpp)
     [x] Road mesh generation:
@@ -246,9 +246,9 @@ PHASE 1: OSM Foundation [COMPLETE]
     [x] Simple road ribbons (miter joins, width-based)
     [x] Basic rendering in viewport (Im3d batched triangles)
 
-PHASE 2: OSM Polish [IN PROGRESS]
+PHASE 2: OSM Polish [COMPLETE]
     [x] PBF parser for large datasets (libosmium auto-detects format)
-    [~] Tile-based loading (spatial indexing + frustum culling done, needs polish)
+    [x] Tile-based loading (frustum culling, lazy loading, async mesh building)
     [x] Proper road intersections
     [x] Building roof styles
     [x] Area triangulation

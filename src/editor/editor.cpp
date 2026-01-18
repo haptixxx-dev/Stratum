@@ -290,7 +290,15 @@ void Editor::draw_viewport() {
         }
     }
 
-    // Rebuild visible batches only when camera moves significantly
+    // Poll for completed async tile builds
+    if (m_tile_manager.tile_count() > 0) {
+        size_t completed = m_tile_manager.poll_async_builds();
+        if (completed > 0) {
+            m_batches_dirty = true;  // New meshes available, need to rebatch
+        }
+    }
+
+    // Rebuild visible batches only when camera moves significantly or new meshes ready
     if (m_tile_manager.tile_count() > 0 && (m_batches_dirty || check_camera_dirty())) {
         rebuild_visible_batches();
         m_batches_dirty = false;
@@ -320,9 +328,18 @@ void Editor::draw_viewport() {
             const auto* tile = m_tile_manager.get_tile(coord);
             if (!tile || !tile->has_valid_bounds()) continue;
 
-            // Color based on visibility
+            // Color based on state: green=visible+built, yellow=pending, red=culled
             bool in_frustum = frustum.intersects_aabb(tile->bounds_min, tile->bounds_max);
-            Im3d::Color grid_color = in_frustum ? Im3d::Color(0, 255, 0, 200) : Im3d::Color(255, 0, 0, 100);
+            Im3d::Color grid_color;
+            if (!in_frustum) {
+                grid_color = Im3d::Color(255, 0, 0, 100);      // Red = culled
+            } else if (tile->meshes_pending) {
+                grid_color = Im3d::Color(255, 200, 0, 200);    // Yellow = building
+            } else if (tile->meshes_built) {
+                grid_color = Im3d::Color(0, 255, 0, 200);      // Green = ready
+            } else {
+                grid_color = Im3d::Color(100, 100, 100, 150);  // Gray = not yet queued
+            }
 
             // Draw tile bounding box edges
             glm::vec3 mn = tile->bounds_min;
@@ -1059,9 +1076,15 @@ void Editor::rebuild_visible_batches() {
             continue;
         }
 
-        // Lazy mesh building - only build meshes for visible tiles on demand
+        // Async lazy mesh building - queue if not built/pending
+        if (!tile->meshes_built && !tile->meshes_pending) {
+            m_tile_manager.queue_tile_build_async(coord);
+            continue;  // Skip this tile until meshes are ready
+        }
+
+        // Skip tiles still being built
         if (!tile->meshes_built) {
-            m_tile_manager.build_tile_meshes(coord);
+            continue;
         }
 
         // Tile is visible - batch all its meshes (skip per-mesh frustum check since tile passed)

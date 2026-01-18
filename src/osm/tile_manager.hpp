@@ -7,6 +7,8 @@
 #include <unordered_map>
 #include <functional>
 #include <limits>
+#include <future>
+#include <mutex>
 
 namespace stratum::osm {
 
@@ -66,6 +68,7 @@ struct Tile {
 
     bool is_loaded = false;
     bool meshes_built = false;
+    bool meshes_pending = false;  // True if async build is in progress
 
     bool has_valid_bounds() const {
         return bounds_min.x < bounds_max.x || bounds_min.z < bounds_max.z;
@@ -123,12 +126,24 @@ public:
     const Tile* get_tile(const TileCoord& coord) const;
 
     /**
-     * @brief Build meshes for a specific tile
+     * @brief Build meshes for a specific tile (blocking)
      */
     void build_tile_meshes(TileCoord coord);
 
     /**
-     * @brief Build meshes for all tiles
+     * @brief Queue async mesh building for a tile
+     * @return true if queued, false if already built/pending
+     */
+    bool queue_tile_build_async(TileCoord coord);
+
+    /**
+     * @brief Check and collect completed async builds
+     * @return Number of tiles that completed this frame
+     */
+    size_t poll_async_builds();
+
+    /**
+     * @brief Build meshes for all tiles (blocking)
      */
     void build_all_meshes();
 
@@ -148,7 +163,23 @@ public:
 private:
     TileCoord local_to_tile(const glm::dvec2& local) const;
 
+    // Build meshes for a tile (returns built meshes, thread-safe)
+    struct BuiltMeshes {
+        std::vector<Mesh> road_meshes;
+        std::vector<Mesh> building_meshes;
+        std::vector<Mesh> area_meshes;
+    };
+    BuiltMeshes build_tile_meshes_internal(const Tile& tile);
+
     std::unordered_map<TileCoord, Tile> m_tiles;
+
+    // Async build tracking
+    struct PendingBuild {
+        TileCoord coord;
+        std::future<BuiltMeshes> future;
+    };
+    std::vector<PendingBuild> m_pending_builds;
+    std::mutex m_pending_mutex;
 
     // Grid parameters
     glm::dvec2 m_origin{0.0};     // Local coord origin (min corner)
