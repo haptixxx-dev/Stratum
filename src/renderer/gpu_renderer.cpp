@@ -250,7 +250,7 @@ bool GPURenderer::create_pipelines() {
     // Rasterizer state
     SDL_GPURasterizerState rasterizer{};
     rasterizer.fill_mode = SDL_GPU_FILLMODE_FILL;
-    rasterizer.cull_mode = SDL_GPU_CULLMODE_BACK;
+    rasterizer.cull_mode = SDL_GPU_CULLMODE_NONE;  // Disable culling for debugging
     rasterizer.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
     rasterizer.depth_bias_constant_factor = 0.0f;
     rasterizer.depth_bias_clamp = 0.0f;
@@ -321,7 +321,15 @@ uint32_t GPURenderer::upload_mesh(const Mesh& mesh) {
         return 0;
     }
 
-    GPUMesh gpu_mesh{};
+    // Validate indices don't exceed vertex count
+    for (uint32_t idx : mesh.indices) {
+        if (idx >= mesh.vertices.size()) {
+            spdlog::error("Mesh has invalid index {} (vertex count: {})", idx, mesh.vertices.size());
+            return 0;
+        }
+    }
+
+    GPUMesh gpu_mesh{};;
     gpu_mesh.vertex_count = static_cast<uint32_t>(mesh.vertices.size());
     gpu_mesh.index_count = static_cast<uint32_t>(mesh.indices.size());
 
@@ -423,6 +431,10 @@ uint32_t GPURenderer::upload_mesh(const Mesh& mesh) {
 
     SDL_EndGPUCopyPass(copy_pass);
     SDL_SubmitGPUCommandBuffer(cmd);
+    
+    // Wait for the upload to complete before reusing the transfer buffer
+    // This ensures the GPU has finished reading from the transfer buffer
+    SDL_WaitForGPUIdle(m_device);
 
     // Store and return ID
     uint32_t mesh_id = m_next_mesh_id++;
