@@ -62,6 +62,12 @@ struct Tile {
     std::vector<Mesh> building_meshes;
     std::vector<Mesh> area_meshes;
 
+    // GPU mesh IDs (parallel arrays to *_meshes above)
+    std::vector<uint32_t> road_gpu_ids;
+    std::vector<uint32_t> building_gpu_ids;
+    std::vector<uint32_t> area_gpu_ids;
+    bool gpu_uploaded = false;  // True if meshes are uploaded to GPU
+
     // 3D bounding box for frustum culling (set from grid position)
     glm::vec3 bounds_min{0.0f};
     glm::vec3 bounds_max{0.0f};

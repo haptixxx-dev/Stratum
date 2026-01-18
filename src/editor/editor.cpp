@@ -1,5 +1,6 @@
 #include "editor/editor.hpp"
 #include "editor/im3d_impl.hpp"
+#include "renderer/gpu_renderer.hpp"
 #include <im3d.h>
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -16,8 +17,8 @@ namespace stratum {
 static ImVec4 s_viewport_rect;
 
 void Editor::render_im3d_callback() {
-    if (m_renderer) {
-        Im3D_Render(m_renderer, m_camera, s_viewport_rect.x, s_viewport_rect.y, s_viewport_rect.z, s_viewport_rect.w);
+    if (m_gpu_renderer) {
+        render_3d(*m_gpu_renderer);
     }
 }
 
@@ -403,7 +404,8 @@ void Editor::draw_viewport() {
 
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
-    // Background (Gradient)
+    // Background (Gradient) - DISABLED to show 3D underlay
+    /*
     ImU32 col_top = IM_COL32(40, 44, 52, 255);
     ImU32 col_bottom = IM_COL32(30, 33, 39, 255);
     draw_list->AddRectFilledMultiColor(
@@ -411,8 +413,10 @@ void Editor::draw_viewport() {
         ImVec2(pos.x + viewport_size.x, pos.y + viewport_size.y),
         col_top, col_top, col_bottom, col_bottom
     );
+    */
 
     // Render Im3D via callback
+
     draw_list->AddCallback(DrawIm3D_Callback, this);
     
     // Reset callback (optional but good practice)
@@ -1102,6 +1106,123 @@ void Editor::rebuild_visible_batches() {
             if (is_mesh_in_range(mesh)) {
                 batch_mesh(mesh, m_batched_road_tris);
             }
+        }
+    }
+}
+
+void Editor::upload_tile_to_gpu(osm::Tile& tile, GPURenderer& renderer) {
+    if (tile.gpu_uploaded) return;
+
+    // Upload area meshes
+    tile.area_gpu_ids.clear();
+    for (const auto& mesh : tile.area_meshes) {
+        uint32_t id = renderer.upload_mesh(mesh);
+        tile.area_gpu_ids.push_back(id);
+    }
+
+    // Upload road meshes
+    tile.road_gpu_ids.clear();
+    for (const auto& mesh : tile.road_meshes) {
+        uint32_t id = renderer.upload_mesh(mesh);
+        tile.road_gpu_ids.push_back(id);
+    }
+
+    // Upload building meshes
+    tile.building_gpu_ids.clear();
+    for (const auto& mesh : tile.building_meshes) {
+        uint32_t id = renderer.upload_mesh(mesh);
+        tile.building_gpu_ids.push_back(id);
+    }
+
+    tile.gpu_uploaded = true;
+}
+
+void Editor::release_tile_from_gpu(osm::Tile& tile, GPURenderer& renderer) {
+    if (!tile.gpu_uploaded) return;
+
+    for (uint32_t id : tile.area_gpu_ids) {
+        renderer.release_mesh(id);
+    }
+    tile.area_gpu_ids.clear();
+
+    for (uint32_t id : tile.road_gpu_ids) {
+        renderer.release_mesh(id);
+    }
+    tile.road_gpu_ids.clear();
+
+    for (uint32_t id : tile.building_gpu_ids) {
+        renderer.release_mesh(id);
+    }
+    tile.building_gpu_ids.clear();
+
+    tile.gpu_uploaded = false;
+}
+
+void Editor::render_3d(GPURenderer& renderer) {
+    // upload meshes
+    for (const auto& coord : m_tile_manager.get_all_tiles()) {
+        osm::Tile* tile = const_cast<osm::Tile*>(m_tile_manager.get_tile(coord));
+        if (tile && tile->meshes_built && !tile->gpu_uploaded) {
+            tile->area_gpu_ids.clear();
+            for (const auto& mesh : tile->area_meshes) {
+                uint32_t id = renderer.upload_mesh(mesh);
+                if (id) tile->area_gpu_ids.push_back(id);
+            }
+            tile->road_gpu_ids.clear();
+            for (const auto& mesh : tile->road_meshes) {
+                uint32_t id = renderer.upload_mesh(mesh);
+                if (id) tile->road_gpu_ids.push_back(id);
+            }
+            tile->building_gpu_ids.clear();
+            for (const auto& mesh : tile->building_meshes) {
+                uint32_t id = renderer.upload_mesh(mesh);
+                if (id) tile->building_gpu_ids.push_back(id);
+            }
+            tile->gpu_uploaded = true;
+        }
+    }
+
+    // Set Viewport
+    SDL_GPUViewport viewport;
+    viewport.x = s_viewport_rect.x;
+    viewport.y = s_viewport_rect.y;
+    viewport.w = s_viewport_rect.z;
+    viewport.h = s_viewport_rect.w;
+    viewport.min_depth = 0.0f;
+    viewport.max_depth = 1.0f;
+    renderer.set_viewport(viewport);
+
+    SDL_Rect scissor;
+    scissor.x = (int)s_viewport_rect.x;
+    scissor.y = (int)s_viewport_rect.y;
+    scissor.w = (int)s_viewport_rect.z;
+    scissor.h = (int)s_viewport_rect.w;
+    if (renderer.get_render_pass()) {
+        SDL_SetGPUScissor(renderer.get_render_pass(), &scissor);
+    }
+
+    renderer.bind_mesh_pipeline();
+    glm::mat4 view = m_camera.get_view();
+    glm::mat4 proj = m_camera.get_projection();
+    renderer.set_view_projection(view, proj);
+
+    Frustum frustum = m_camera.get_frustum();
+    glm::mat4 model(1.0f);
+
+    for (const auto& coord : m_tile_manager.get_all_tiles()) {
+        const osm::Tile* tile = m_tile_manager.get_tile(coord);
+        if (!tile || !tile->gpu_uploaded) continue;
+
+        if (m_use_tile_culling && !frustum.intersects_aabb(tile->bounds_min, tile->bounds_max)) continue;
+
+        if (m_render_areas) {
+            for (uint32_t id : tile->area_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
+        }
+        if (m_render_roads) {
+            for (uint32_t id : tile->road_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
+        }
+        if (m_render_buildings) {
+            for (uint32_t id : tile->building_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
         }
     }
 }

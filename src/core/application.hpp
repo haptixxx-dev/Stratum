@@ -13,6 +13,7 @@
 
 #include "core/window.hpp"
 #include "editor/editor.hpp"
+#include "renderer/gpu_renderer.hpp"
 #include <SDL3/SDL.h>
 
 /**
@@ -176,9 +177,10 @@ private:
      */
     void render();
 
-    Window m_window;        ///< Main application window
-    Editor m_editor;        ///< Main editor interface
-    bool m_running = false; ///< Flag indicating if main loop is active
+    Window m_window;            ///< Main application window
+    GPURenderer m_gpu_renderer; ///< GPU renderer for 3D graphics
+    Editor m_editor;            ///< Main editor interface
+    bool m_running = false;     ///< Flag indicating if main loop is active
 };
 
 } // namespace stratum

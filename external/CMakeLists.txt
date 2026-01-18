@@ -29,6 +29,7 @@ add_library(imgui STATIC
     # SDL3 + SDL_GPU backends
     ${EXTERNAL_DIR}/imgui/backends/imgui_impl_sdl3.cpp
     ${EXTERNAL_DIR}/imgui/backends/imgui_impl_sdlrenderer3.cpp
+    ${EXTERNAL_DIR}/imgui/backends/imgui_impl_sdlgpu3.cpp
 )
 target_include_directories(imgui PUBLIC 
     ${EXTERNAL_DIR}/imgui
