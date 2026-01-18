@@ -109,8 +109,16 @@ private:
     std::vector<BatchedTriangle> m_batched_road_tris;
     std::vector<BatchedTriangle> m_batched_area_tris;
 
+    // Dirty flag for batch rebuilding - only rebuild when camera moves significantly
+    bool m_batches_dirty = true;
+    glm::vec3 m_last_camera_pos{0.0f};
+    glm::vec3 m_last_camera_dir{0.0f};
+    float m_dirty_threshold_pos = 10.0f;   // Rebuild if camera moves this far
+    float m_dirty_threshold_rot = 0.1f;    // Rebuild if camera rotates this much (dot product)
+
     void rebuild_osm_meshes();
     void rebuild_visible_batches();
+    bool check_camera_dirty();  // Returns true if camera moved enough to warrant rebuild
 };
 
 } // namespace stratum

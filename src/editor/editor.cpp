@@ -290,9 +290,10 @@ void Editor::draw_viewport() {
         }
     }
 
-    // Rebuild visible batches with current frustum
-    if (m_use_tile_culling && m_tile_manager.tile_count() > 0) {
+    // Rebuild visible batches only when camera moves significantly
+    if (m_tile_manager.tile_count() > 0 && (m_batches_dirty || check_camera_dirty())) {
         rebuild_visible_batches();
+        m_batches_dirty = false;
     }
 
     // Im3D Frame
@@ -932,9 +933,7 @@ void Editor::rebuild_osm_meshes() {
     m_tile_manager.init(osm_data.bounds, m_tile_size);
     m_tile_manager.assign_data(osm_data);
     
-    // Build all tile meshes (includes junctions per-tile now)
-    spdlog::info("Building tile meshes (roads, buildings, areas, junctions)...");
-    m_tile_manager.build_all_meshes();
+    // Meshes are now built lazily on-demand when tiles become visible
 
     spdlog::info("Tile manager: {} tiles, {} roads, {} buildings, {} areas",
                  m_tile_manager.tile_count(),
@@ -988,10 +987,36 @@ void Editor::rebuild_osm_meshes() {
     // Enable culling for performance (camera is now positioned correctly)
     m_use_tile_culling = true;
     m_use_distance_culling = true;
+    m_batches_dirty = true;  // Force rebuild on next frame
+    m_last_camera_pos = m_camera.get_position();
+    m_last_camera_dir = m_camera.get_forward();
     rebuild_visible_batches();
 
     spdlog::info("Initial batch: {} area tris, {} building tris, {} road tris",
                  m_batched_area_tris.size(), m_batched_building_tris.size(), m_batched_road_tris.size());
+}
+
+bool Editor::check_camera_dirty() {
+    glm::vec3 cam_pos = m_camera.get_position();
+    glm::vec3 cam_dir = m_camera.get_forward();
+
+    // Check if position changed enough
+    float dist_sq = glm::dot(cam_pos - m_last_camera_pos, cam_pos - m_last_camera_pos);
+    if (dist_sq > m_dirty_threshold_pos * m_dirty_threshold_pos) {
+        m_last_camera_pos = cam_pos;
+        m_last_camera_dir = cam_dir;
+        return true;
+    }
+
+    // Check if rotation changed enough (using dot product)
+    float dot = glm::dot(cam_dir, m_last_camera_dir);
+    if (dot < 1.0f - m_dirty_threshold_rot) {
+        m_last_camera_pos = cam_pos;
+        m_last_camera_dir = cam_dir;
+        return true;
+    }
+
+    return false;
 }
 
 void Editor::rebuild_visible_batches() {
@@ -1014,13 +1039,6 @@ void Editor::rebuild_visible_batches() {
         return dist_sq <= radius_sq;
     };
 
-    // Helper to check if mesh is in frustum
-    auto is_mesh_in_frustum = [&](const Mesh& mesh) -> bool {
-        if (!m_use_tile_culling) return true;  // Reuse tile culling flag for frustum
-        if (!mesh.bounds.is_valid()) return true;
-        return frustum.intersects_aabb(mesh.bounds.min, mesh.bounds.max);
-    };
-
     // Helper to batch a mesh's triangles
     auto batch_mesh = [](const Mesh& mesh, std::vector<BatchedTriangle>& batch) {
         for (size_t i = 0; i < mesh.indices.size(); i += 3) {
@@ -1031,23 +1049,34 @@ void Editor::rebuild_visible_batches() {
         }
     };
 
-    // Process all meshes from all tiles with per-mesh culling
+    // Process only visible tiles (tile-level frustum culling first)
     for (const auto& coord : m_tile_manager.get_all_tiles()) {
-        const auto* tile = m_tile_manager.get_tile(coord);
-        if (!tile) continue;
+        auto* tile = m_tile_manager.get_tile(coord);
+        if (!tile || !tile->has_valid_bounds()) continue;
 
+        // Tile-level frustum cull - skip entire tile if outside frustum
+        if (m_use_tile_culling && !frustum.intersects_aabb(tile->bounds_min, tile->bounds_max)) {
+            continue;
+        }
+
+        // Lazy mesh building - only build meshes for visible tiles on demand
+        if (!tile->meshes_built) {
+            m_tile_manager.build_tile_meshes(coord);
+        }
+
+        // Tile is visible - batch all its meshes (skip per-mesh frustum check since tile passed)
         for (const auto& mesh : tile->area_meshes) {
-            if (is_mesh_in_range(mesh) && is_mesh_in_frustum(mesh)) {
+            if (is_mesh_in_range(mesh)) {
                 batch_mesh(mesh, m_batched_area_tris);
             }
         }
         for (const auto& mesh : tile->building_meshes) {
-            if (is_mesh_in_range(mesh) && is_mesh_in_frustum(mesh)) {
+            if (is_mesh_in_range(mesh)) {
                 batch_mesh(mesh, m_batched_building_tris);
             }
         }
         for (const auto& mesh : tile->road_meshes) {
-            if (is_mesh_in_range(mesh) && is_mesh_in_frustum(mesh)) {
+            if (is_mesh_in_range(mesh)) {
                 batch_mesh(mesh, m_batched_road_tris);
             }
         }
