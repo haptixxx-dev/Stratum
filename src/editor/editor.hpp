@@ -8,9 +8,10 @@
 #include "renderer/mesh.hpp"
 #include "editor/camera.hpp"
 
-struct SDL_Renderer;
-
 namespace stratum {
+
+// Forward declaration
+class GPURenderer;
 
 class Editor {
 public:
@@ -21,10 +22,11 @@ public:
     void shutdown();
     void update();
     void render();
+    void render_3d(GPURenderer& renderer);
 
     void set_quit_callback(std::function<void()> callback) { m_quit_callback = callback; }
     void set_window_handle(void* window) { m_window_handle = window; }
-    void set_renderer(SDL_Renderer* renderer) { m_renderer = renderer; }
+    void set_renderer(GPURenderer* renderer) { m_gpu_renderer = renderer; }
     void render_im3d_callback();
 
     bool is_viewport_focused() const { return m_viewport_focused; }
@@ -63,7 +65,6 @@ private:
     bool m_console_scroll_to_bottom = true;
 
     // Core systems
-    SDL_Renderer* m_renderer = nullptr;
     Camera m_camera;
     float m_last_time = 0.0f;
 
@@ -76,6 +77,8 @@ private:
     ImVec2 m_drag_start_mouse;
     int m_drag_start_window_x = 0;
     int m_drag_start_window_y = 0;
+
+    GPURenderer* m_gpu_renderer = nullptr;
 
     // Window resizing state
     enum ResizeEdge { RESIZE_NONE = 0, RESIZE_LEFT, RESIZE_RIGHT, RESIZE_TOP, RESIZE_BOTTOM,
@@ -119,6 +122,8 @@ private:
     void rebuild_osm_meshes();
     void rebuild_visible_batches();
     bool check_camera_dirty();  // Returns true if camera moved enough to warrant rebuild
+    void upload_tile_to_gpu(osm::Tile& tile, GPURenderer& renderer);
+    void release_tile_from_gpu(osm::Tile& tile, GPURenderer& renderer);
 };
 
 } // namespace stratum
