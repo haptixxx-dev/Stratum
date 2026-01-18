@@ -36,16 +36,16 @@ struct WindowConfig {
 };
 
 /**
- * @brief SDL3 Window wrapper with renderer management
- * 
- * The Window class encapsulates SDL3 window creation, renderer setup,
- * and frame management. It provides:
+ * @brief SDL3 Window wrapper with GPU device management
+ *
+ * The Window class encapsulates SDL3 window creation and GPU device setup.
+ * It provides:
  * - HiDPI/Retina display support with automatic scaling
- * - SDL_Renderer for 2D/ImGui rendering
- * - Frame lifecycle management (begin_frame/end_frame)
- * 
+ * - SDL_GPUDevice for hardware-accelerated 3D rendering
+ *
  * @note This class is non-copyable to prevent accidental resource duplication.
- * 
+ * @note Frame management is handled by GPURenderer, not Window.
+ *
  * Example usage:
  * @code
  * stratum::Window window;
@@ -53,13 +53,9 @@ struct WindowConfig {
  * config.title = "My App";
  * config.width = 1920;
  * config.height = 1080;
- * 
+ *
  * if (window.init(config)) {
- *     while (running) {
- *         window.begin_frame();
- *         // ... render ...
- *         window.end_frame();
- *     }
+ *     // Use GPURenderer for frame management
  *     window.shutdown();
  * }
  * @endcode
@@ -117,66 +113,45 @@ public:
      * @return Pointer to SDL_Window, or nullptr if not initialized
      */
     [[nodiscard]] SDL_Window* get_handle() const { return m_window; }
-    
-    /**
-     * @brief Get the SDL renderer
-     * @return Pointer to SDL_Renderer, or nullptr if not initialized
-     */
-    [[nodiscard]] SDL_Renderer* get_renderer() const { return m_renderer; }
-    
+
     /**
      * @brief Get current window width
-     * @return Width in physical pixels (scaled for HiDPI)
+     * @return Width in logical pixels
      */
     [[nodiscard]] int get_width() const { return m_width; }
-    
+
     /**
      * @brief Get current window height
-     * @return Height in physical pixels (scaled for HiDPI)
+     * @return Height in logical pixels
      */
     [[nodiscard]] int get_height() const { return m_height; }
-    
+
     /**
      * @brief Get the display scale factor
      * @return Scale factor (1.0 for standard displays, 2.0 for Retina, etc.)
      */
     [[nodiscard]] float get_scale() const { return m_scale; }
-    
+
     /**
      * @brief Check if window is minimized
      * @return true if window is currently minimized
      */
     [[nodiscard]] bool is_minimized() const;
-    
+
     /// @}
 
-    /// @name Frame Management
-    /// @{
-    
     /**
-     * @brief Begin a new frame
-     * 
-     * Call at the start of each frame before rendering.
-     * Updates internal window dimensions in case of resize.
+     * @brief Update internal window dimensions
+     *
+     * Call to refresh cached width/height after a resize event.
      */
-    void begin_frame();
-    
-    /**
-     * @brief End the current frame
-     * 
-     * Call after all rendering is complete. Presents the rendered
-     * content to the screen via SDL_RenderPresent.
-     */
-    void end_frame();
-    
-    /// @}
+    void update_size();
 
 private:
-    SDL_Window* m_window = nullptr;      ///< SDL window handle
-    SDL_Renderer* m_renderer = nullptr;  ///< SDL renderer handle
-    int m_width = 0;                     ///< Current window width in pixels
-    int m_height = 0;                    ///< Current window height in pixels
-    float m_scale = 1.0f;                ///< Display scale factor for HiDPI
+    SDL_Window* m_window = nullptr;  ///< SDL window handle
+    int m_width = 0;                 ///< Current window width in pixels
+    int m_height = 0;                ///< Current window height in pixels
+    float m_scale = 1.0f;            ///< Display scale factor for HiDPI
 };
 
 } // namespace stratum
