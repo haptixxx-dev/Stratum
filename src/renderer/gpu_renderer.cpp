@@ -250,7 +250,7 @@ bool GPURenderer::create_pipelines() {
     // Rasterizer state
     SDL_GPURasterizerState rasterizer{};
     rasterizer.fill_mode = SDL_GPU_FILLMODE_FILL;
-    rasterizer.cull_mode = SDL_GPU_CULLMODE_NONE;  // Disable culling for debugging
+    rasterizer.cull_mode = SDL_GPU_CULLMODE_BACK;
     rasterizer.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
     rasterizer.depth_bias_constant_factor = 0.0f;
     rasterizer.depth_bias_clamp = 0.0f;
