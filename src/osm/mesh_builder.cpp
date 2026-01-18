@@ -438,72 +438,79 @@ Mesh MeshBuilder::build_road_mesh(const Road& road) {
     }
 
     const float half_width = road.width * 0.5f;
-    const float road_height = 0.05f; // Slightly above ground to avoid z-fighting
+    const float road_height = 0.1f; // Slightly above ground to avoid z-fighting
     const glm::vec3 up_normal(0.0f, 1.0f, 0.0f);
 
-    // Pre-compute perpendiculars for each point
-    std::vector<glm::vec2> perpendiculars(road.polyline.size());
+    // Generate vertices for each point along the road (left and right edges)
+    std::vector<glm::vec3> left_edge;
+    std::vector<glm::vec3> right_edge;
+    left_edge.reserve(road.polyline.size());
+    right_edge.reserve(road.polyline.size());
 
     for (size_t i = 0; i < road.polyline.size(); ++i) {
-        glm::dvec2 dir;
+        const glm::dvec2& pt = road.polyline[i];
 
+        // Compute tangent direction at this point
+        glm::dvec2 tangent;
         if (i == 0) {
-            // First point: use direction to next point
-            dir = glm::normalize(road.polyline[1] - road.polyline[0]);
+            tangent = road.polyline[1] - road.polyline[0];
         } else if (i == road.polyline.size() - 1) {
-            // Last point: use direction from previous point
-            dir = glm::normalize(road.polyline[i] - road.polyline[i - 1]);
+            tangent = road.polyline[i] - road.polyline[i - 1];
         } else {
-            // Middle points: average of incoming and outgoing directions (miter)
-            glm::dvec2 dir_in = glm::normalize(road.polyline[i] - road.polyline[i - 1]);
-            glm::dvec2 dir_out = glm::normalize(road.polyline[i + 1] - road.polyline[i]);
-            dir = glm::normalize(dir_in + dir_out);
-
-            // Handle case where directions are opposite (180 degree turn)
-            if (glm::length(dir) < 0.001) {
-                dir = dir_in;
-            }
+            // Average of incoming and outgoing for smoother corners
+            glm::dvec2 t_in = road.polyline[i] - road.polyline[i - 1];
+            glm::dvec2 t_out = road.polyline[i + 1] - road.polyline[i];
+            tangent = glm::normalize(t_in) + glm::normalize(t_out);
         }
 
-        // Perpendicular is 90 degrees to direction (in 2D: rotate by 90)
-        // Note: Y is flipped in our coordinate system
-        perpendiculars[i] = glm::vec2(static_cast<float>(-dir.y), static_cast<float>(dir.x));
+        // Normalize tangent
+        double len = glm::length(tangent);
+        if (len < 0.0001) {
+            tangent = glm::dvec2(1.0, 0.0);
+        } else {
+            tangent /= len;
+        }
+
+        // Perpendicular in 2D (rotate tangent 90 degrees)
+        // For tangent (tx, ty), perpendicular pointing right is (ty, -tx)
+        glm::dvec2 perp(tangent.y, -tangent.x);
+
+        // Convert to 3D: X stays X, Y becomes height, Z is -Y (from 2D)
+        // Left edge: pt + perp * half_width
+        // Right edge: pt - perp * half_width
+        glm::vec3 left_pt(
+            static_cast<float>(pt.x + perp.x * half_width),
+            road_height,
+            static_cast<float>(-(pt.y + perp.y * half_width))
+        );
+        glm::vec3 right_pt(
+            static_cast<float>(pt.x - perp.x * half_width),
+            road_height,
+            static_cast<float>(-(pt.y - perp.y * half_width))
+        );
+
+        left_edge.push_back(left_pt);
+        right_edge.push_back(right_pt);
     }
 
-    // Generate vertices and triangles for each segment
+    // Generate quads between consecutive points
     for (size_t i = 0; i < road.polyline.size() - 1; ++i) {
-        const glm::dvec2& p0 = road.polyline[i];
-        const glm::dvec2& p1 = road.polyline[i + 1];
-        const glm::vec2& perp0 = perpendiculars[i];
-        const glm::vec2& perp1 = perpendiculars[i + 1];
-
-        // Four corners of this road segment quad
-        // Note: z is negated because we use -y for z coordinate
-        glm::vec3 v0(static_cast<float>(p0.x) - perp0.x * half_width, road_height,
-                     static_cast<float>(-p0.y) - perp0.y * half_width);
-        glm::vec3 v1(static_cast<float>(p0.x) + perp0.x * half_width, road_height,
-                     static_cast<float>(-p0.y) + perp0.y * half_width);
-        glm::vec3 v2(static_cast<float>(p1.x) + perp1.x * half_width, road_height,
-                     static_cast<float>(-p1.y) + perp1.y * half_width);
-        glm::vec3 v3(static_cast<float>(p1.x) - perp1.x * half_width, road_height,
-                     static_cast<float>(-p1.y) - perp1.y * half_width);
-
         uint32_t base_idx = static_cast<uint32_t>(mesh.vertices.size());
 
-        // Add 4 vertices for this quad
-        mesh.vertices.push_back({v0, up_normal, glm::vec2(0.0f, 0.0f), road_color});
-        mesh.vertices.push_back({v1, up_normal, glm::vec2(1.0f, 0.0f), road_color});
-        mesh.vertices.push_back({v2, up_normal, glm::vec2(1.0f, 1.0f), road_color});
-        mesh.vertices.push_back({v3, up_normal, glm::vec2(0.0f, 1.0f), road_color});
+        // Quad vertices: left0, right0, right1, left1
+        mesh.vertices.push_back({left_edge[i], up_normal, glm::vec2(0.0f, 0.0f), road_color});
+        mesh.vertices.push_back({right_edge[i], up_normal, glm::vec2(1.0f, 0.0f), road_color});
+        mesh.vertices.push_back({right_edge[i + 1], up_normal, glm::vec2(1.0f, 1.0f), road_color});
+        mesh.vertices.push_back({left_edge[i + 1], up_normal, glm::vec2(0.0f, 1.0f), road_color});
 
-        // Two triangles for the quad (CCW winding, facing up)
+        // Two triangles (CCW winding for upward-facing)
         mesh.indices.push_back(base_idx + 0);
+        mesh.indices.push_back(base_idx + 2);
         mesh.indices.push_back(base_idx + 1);
-        mesh.indices.push_back(base_idx + 2);
 
         mesh.indices.push_back(base_idx + 0);
-        mesh.indices.push_back(base_idx + 2);
         mesh.indices.push_back(base_idx + 3);
+        mesh.indices.push_back(base_idx + 2);
     }
 
     mesh.compute_bounds();
