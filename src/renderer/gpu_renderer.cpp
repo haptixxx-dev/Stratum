@@ -136,17 +136,22 @@ void GPURenderer::shutdown() {
 }
 
 bool GPURenderer::load_shaders() {
-    // Shader paths - look in assets/shaders/
-    const char* vert_path = "assets/shaders/mesh.vert.spv";
-    const char* frag_path = "assets/shaders/mesh.frag.spv";
+    // Get base path for asset loading
+    const char* base = SDL_GetBasePath();
+    std::string base_path = base ? base : "";
 
-    m_vertex_shader = load_shader(vert_path, SDL_GPU_SHADERSTAGE_VERTEX);
+    // Shader paths - look in assets/shaders/ relative to executable
+    // The executable is in build/bin/, so assets are at ../../assets/
+    std::string vert_path = base_path + "../../assets/shaders/mesh.vert.spv";
+    std::string frag_path = base_path + "../../assets/shaders/mesh.frag.spv";
+
+    m_vertex_shader = load_shader(vert_path.c_str(), SDL_GPU_SHADERSTAGE_VERTEX);
     if (!m_vertex_shader) {
         spdlog::error("Failed to load vertex shader: {}", vert_path);
         return false;
     }
 
-    m_fragment_shader = load_shader(frag_path, SDL_GPU_SHADERSTAGE_FRAGMENT);
+    m_fragment_shader = load_shader(frag_path.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT);
     if (!m_fragment_shader) {
         spdlog::error("Failed to load fragment shader: {}", frag_path);
         return false;
@@ -287,7 +292,7 @@ bool GPURenderer::create_pipelines() {
     // Multisample state (no MSAA for now)
     SDL_GPUMultisampleState multisample{};
     multisample.sample_count = SDL_GPU_SAMPLECOUNT_1;
-    multisample.sample_mask = 0xFFFFFFFF;
+    multisample.sample_mask = 0;  // Must be 0 when not using multisampling
     multisample.enable_mask = false;
 
     // Create the pipeline
@@ -464,10 +469,10 @@ bool GPURenderer::begin_frame() {
     }
 
     // Acquire swapchain texture
+    uint32_t new_width, new_height;
     if (!SDL_WaitAndAcquireGPUSwapchainTexture(m_cmd_buffer, m_window,
                                                 &m_swapchain_texture,
-                                                &m_swapchain_width,
-                                                &m_swapchain_height)) {
+                                                &new_width, &new_height)) {
         spdlog::error("Failed to acquire swapchain texture: {}", SDL_GetError());
         SDL_CancelGPUCommandBuffer(m_cmd_buffer);
         m_cmd_buffer = nullptr;
@@ -481,36 +486,69 @@ bool GPURenderer::begin_frame() {
         return false;
     }
 
-    // Recreate depth texture if size changed
-    // TODO: Handle resize properly
+    // Handle resize - recreate depth texture if size changed
+    if (new_width != m_swapchain_width || new_height != m_swapchain_height) {
+        m_swapchain_width = new_width;
+        m_swapchain_height = new_height;
 
-    // Begin render pass
+        // Release old depth texture
+        if (m_depth_texture) {
+            SDL_ReleaseGPUTexture(m_device, m_depth_texture);
+            m_depth_texture = nullptr;
+        }
+
+        // Create new depth texture
+        SDL_GPUTextureCreateInfo depth_info{};
+        depth_info.type = SDL_GPU_TEXTURETYPE_2D;
+        depth_info.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+        depth_info.width = m_swapchain_width;
+        depth_info.height = m_swapchain_height;
+        depth_info.layer_count_or_depth = 1;
+        depth_info.num_levels = 1;
+        depth_info.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        depth_info.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+
+        m_depth_texture = SDL_CreateGPUTexture(m_device, &depth_info);
+        if (!m_depth_texture) {
+            spdlog::error("Failed to recreate depth texture: {}", SDL_GetError());
+            SDL_CancelGPUCommandBuffer(m_cmd_buffer);
+            m_cmd_buffer = nullptr;
+            return false;
+        }
+
+        spdlog::debug("Resized to {}x{}", m_swapchain_width, m_swapchain_height);
+    }
+
+    return true;
+}
+
+void GPURenderer::begin_render_pass() {
+    if (!m_cmd_buffer || !m_swapchain_texture) return;
+
     SDL_GPUColorTargetInfo color_target{};
     color_target.texture = m_swapchain_texture;
     color_target.clear_color = {0.1f, 0.1f, 0.12f, 1.0f};  // Dark gray background
     color_target.load_op = SDL_GPU_LOADOP_CLEAR;
     color_target.store_op = SDL_GPU_STOREOP_STORE;
+    color_target.cycle = false;
 
+    // Depth target for 3D rendering
     SDL_GPUDepthStencilTargetInfo depth_target{};
     depth_target.texture = m_depth_texture;
     depth_target.clear_depth = 1.0f;
     depth_target.load_op = SDL_GPU_LOADOP_CLEAR;
-    depth_target.store_op = SDL_GPU_STOREOP_DONT_CARE;
+    depth_target.store_op = SDL_GPU_STOREOP_DONT_CARE;  // Don't need to preserve depth
     depth_target.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
     depth_target.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
-    depth_target.cycle = true;
+    depth_target.cycle = false;
 
     m_render_pass = SDL_BeginGPURenderPass(m_cmd_buffer, &color_target, 1, &depth_target);
     if (!m_render_pass) {
         spdlog::error("Failed to begin render pass: {}", SDL_GetError());
-        SDL_CancelGPUCommandBuffer(m_cmd_buffer);
-        m_cmd_buffer = nullptr;
-        return false;
+        return;
     }
 
-    // Bind pipeline and set viewport
-    SDL_BindGPUGraphicsPipeline(m_render_pass, m_mesh_pipeline);
-
+    // Set viewport
     SDL_GPUViewport viewport{};
     viewport.x = 0;
     viewport.y = 0;
@@ -519,27 +557,48 @@ bool GPURenderer::begin_frame() {
     viewport.min_depth = 0.0f;
     viewport.max_depth = 1.0f;
     SDL_SetGPUViewport(m_render_pass, &viewport);
+}
 
-    return true;
+void GPURenderer::end_render_pass() {
+    if (m_render_pass) {
+        SDL_EndGPURenderPass(m_render_pass);
+        m_render_pass = nullptr;
+    }
 }
 
 void GPURenderer::end_frame() {
     if (!m_cmd_buffer) return;
 
-    if (m_render_pass) {
-        SDL_EndGPURenderPass(m_render_pass);
-        m_render_pass = nullptr;
-    }
+    // End render pass if still active
+    end_render_pass();
 
     SDL_SubmitGPUCommandBuffer(m_cmd_buffer);
     m_cmd_buffer = nullptr;
     m_swapchain_texture = nullptr;
 }
 
+void GPURenderer::render_imgui() {
+    // ImGui rendering is done by Application using the exposed render pass
+    // This is a placeholder for if we want to encapsulate it later
+}
+
+SDL_GPUTextureFormat GPURenderer::get_swapchain_format() const {
+    if (m_device && m_window) {
+        return SDL_GetGPUSwapchainTextureFormat(m_device, m_window);
+    }
+    return SDL_GPU_TEXTUREFORMAT_INVALID;
+}
+
 void GPURenderer::set_view_projection(const glm::mat4& view, const glm::mat4& projection) {
     m_view = view;
     m_projection = projection;
     m_view_projection = projection * view;
+}
+
+void GPURenderer::bind_mesh_pipeline() {
+    if (m_render_pass && m_mesh_pipeline) {
+        SDL_BindGPUGraphicsPipeline(m_render_pass, m_mesh_pipeline);
+    }
 }
 
 void GPURenderer::draw_mesh(uint32_t mesh_id, const glm::mat4& model, const glm::vec4& color_tint) {
@@ -585,6 +644,12 @@ void GPURenderer::draw_mesh_immediate(const Mesh& mesh, const glm::mat4& model) 
         draw_mesh(id, model);
         // Note: We don't release here - caller should manage lifecycle
         // For truly immediate drawing, we'd need a different approach
+    }
+}
+
+void GPURenderer::set_viewport(const SDL_GPUViewport& viewport) {
+    if (m_render_pass) {
+        SDL_SetGPUViewport(m_render_pass, &viewport);
     }
 }
 

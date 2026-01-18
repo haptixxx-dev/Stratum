@@ -31,7 +31,7 @@ struct GPUMesh {
     SDL_GPUBuffer* index_buffer = nullptr;
     uint32_t vertex_count = 0;
     uint32_t index_count = 0;
-    bool is_valid() const { return vertex_buffer != nullptr && index_buffer != nullptr; }
+    bool is_valid() const { return vertex_buffer != nullptr && vertex_count > 0; }
 };
 
 /**
@@ -98,10 +98,23 @@ public:
     // === Frame Rendering ===
 
     /**
-     * @brief Begin a new frame
+     * @brief Begin a new frame - acquire command buffer and swapchain
      * @return true if frame can proceed (swapchain acquired)
+     * @note Does NOT begin render pass. Call begin_render_pass() after
+     *       preparing ImGui draw data.
      */
     bool begin_frame();
+
+    /**
+     * @brief Begin the main render pass
+     * @note Call after ImGui_ImplSDLGPU3_PrepareDrawData()
+     */
+    void begin_render_pass();
+
+    /**
+     * @brief End the current render pass
+     */
+    void end_render_pass();
 
     /**
      * @brief End frame and present
@@ -112,6 +125,12 @@ public:
      * @brief Set the view and projection matrices for this frame
      */
     void set_view_projection(const glm::mat4& view, const glm::mat4& projection);
+
+    /**
+     * @brief Bind the mesh rendering pipeline
+     * @note Call before draw_mesh() calls
+     */
+    void bind_mesh_pipeline();
 
     /**
      * @brief Draw a mesh with the given transform
@@ -129,9 +148,24 @@ public:
      */
     void draw_mesh_immediate(const Mesh& mesh, const glm::mat4& model = glm::mat4(1.0f));
 
+    /**
+     * @brief Set the viewport for the current render pass
+     */
+    void set_viewport(const SDL_GPUViewport& viewport);
+
+    /**
+     * @brief Render ImGui draw data within the current render pass
+     * @note Must be called between begin_frame() and end_frame()
+     */
+    void render_imgui();
+
     // === Getters ===
     SDL_GPUDevice* get_device() const { return m_device; }
     SDL_Window* get_window() const { return m_window; }
+    SDL_GPUCommandBuffer* get_command_buffer() const { return m_cmd_buffer; }
+    SDL_GPURenderPass* get_render_pass() const { return m_render_pass; }
+    SDL_GPUTexture* get_swapchain_texture() const { return m_swapchain_texture; }
+    SDL_GPUTextureFormat get_swapchain_format() const;
 
 private:
     bool create_pipelines();
