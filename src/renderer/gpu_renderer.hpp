@@ -16,6 +16,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
+#include <functional>
 
 namespace stratum {
 
@@ -41,6 +42,14 @@ struct alignas(16) MeshUniforms {
     glm::mat4 mvp;           // Model-View-Projection matrix
     glm::mat4 model;         // Model matrix (for lighting)
     glm::vec4 color_tint;    // Optional color tint/override
+};
+
+/**
+ * @brief Fill mode for mesh rendering
+ */
+enum class FillMode {
+    Solid,
+    Wireframe
 };
 
 /**
@@ -133,6 +142,42 @@ public:
     void bind_mesh_pipeline();
 
     /**
+     * @brief Set the fill mode for mesh rendering
+     * @param mode Solid or Wireframe
+     */
+    void set_fill_mode(FillMode mode);
+
+    /**
+     * @brief Get current fill mode
+     */
+    FillMode get_fill_mode() const { return m_current_fill_mode; }
+
+    /**
+     * @brief Set MSAA level
+     * @param level 0=off, 1=2x, 2=4x, 3=8x
+     * @return true if successful (may fail if level not supported)
+     */
+    bool set_msaa_level(int level);
+
+    /**
+     * @brief Get current MSAA level
+     * @return 0=off, 1=2x, 2=4x, 3=8x
+     */
+    int get_msaa_level() const;
+
+    /**
+     * @brief Get current sample count
+     */
+    SDL_GPUSampleCount get_sample_count() const { return m_sample_count; }
+
+    /**
+     * @brief Set callback for when MSAA changes (for ImGui reinitialization)
+     */
+    void set_msaa_changed_callback(std::function<void(SDL_GPUSampleCount)> callback) {
+        m_msaa_changed_callback = callback;
+    }
+
+    /**
      * @brief Draw a mesh with the given transform
      * @param mesh_id Mesh handle from upload_mesh()
      * @param model Model transform matrix
@@ -171,6 +216,8 @@ private:
     bool create_pipelines();
     bool load_shaders();
     SDL_GPUShader* load_shader(const char* path, SDL_GPUShaderStage stage);
+    void create_msaa_textures();
+    void release_msaa_textures();
 
     // GPU handles
     SDL_GPUDevice* m_device = nullptr;
@@ -178,8 +225,18 @@ private:
 
     // Pipelines
     SDL_GPUGraphicsPipeline* m_mesh_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline* m_mesh_pipeline_wireframe = nullptr;
     SDL_GPUShader* m_vertex_shader = nullptr;
     SDL_GPUShader* m_fragment_shader = nullptr;
+
+    // Render state
+    FillMode m_current_fill_mode = FillMode::Solid;
+
+    // MSAA state
+    SDL_GPUSampleCount m_sample_count = SDL_GPU_SAMPLECOUNT_1;
+    SDL_GPUTexture* m_msaa_color_texture = nullptr;
+    SDL_GPUTexture* m_msaa_depth_texture = nullptr;
+    std::function<void(SDL_GPUSampleCount)> m_msaa_changed_callback;
 
     // Frame state
     SDL_GPUCommandBuffer* m_cmd_buffer = nullptr;

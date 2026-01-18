@@ -27,6 +27,7 @@ public:
     void set_quit_callback(std::function<void()> callback) { m_quit_callback = callback; }
     void set_window_handle(void* window) { m_window_handle = window; }
     void set_renderer(GPURenderer* renderer) { m_gpu_renderer = renderer; }
+    void set_msaa_change_callback(std::function<void(int)> callback) { m_msaa_change_callback = callback; }
     void render_im3d_callback();
 
     bool is_viewport_focused() const { return m_viewport_focused; }
@@ -41,6 +42,7 @@ private:
     void draw_console();
     void draw_osm_panel();
     void draw_toolbar();
+    void draw_render_settings();
 
     bool m_viewport_focused = false;
     bool m_viewport_hovered = false;
@@ -53,6 +55,7 @@ private:
     bool m_show_properties = true;
     bool m_show_console = true;
     bool m_show_osm_panel = true;
+    bool m_show_render_settings = false;
 
     // Render toggles
     bool m_render_areas = true;
@@ -70,6 +73,7 @@ private:
 
     // Callbacks
     std::function<void()> m_quit_callback;
+    std::function<void(int)> m_msaa_change_callback;
     void* m_window_handle = nullptr;
 
     // Window dragging state

@@ -102,10 +102,14 @@ void GPURenderer::shutdown() {
         m_transfer_buffer = nullptr;
     }
 
-    // Release pipeline
+    // Release pipelines
     if (m_mesh_pipeline) {
         SDL_ReleaseGPUGraphicsPipeline(m_device, m_mesh_pipeline);
         m_mesh_pipeline = nullptr;
+    }
+    if (m_mesh_pipeline_wireframe) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_mesh_pipeline_wireframe);
+        m_mesh_pipeline_wireframe = nullptr;
     }
 
     // Release shaders
@@ -117,6 +121,9 @@ void GPURenderer::shutdown() {
         SDL_ReleaseGPUShader(m_device, m_fragment_shader);
         m_fragment_shader = nullptr;
     }
+
+    // Release MSAA textures
+    release_msaa_textures();
 
     // Release depth texture
     if (m_depth_texture) {
@@ -289,10 +296,10 @@ bool GPURenderer::create_pipelines() {
     target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     target_info.has_depth_stencil_target = true;
 
-    // Multisample state (no MSAA for now)
+    // Multisample state
     SDL_GPUMultisampleState multisample{};
-    multisample.sample_count = SDL_GPU_SAMPLECOUNT_1;
-    multisample.sample_mask = 0;  // Must be 0 when not using multisampling
+    multisample.sample_count = m_sample_count;
+    multisample.sample_mask = 0;
     multisample.enable_mask = false;
 
     // Create the pipeline
@@ -312,7 +319,17 @@ bool GPURenderer::create_pipelines() {
         return false;
     }
 
-    spdlog::info("Graphics pipeline created");
+    // Create wireframe pipeline (same as solid but with line fill mode)
+    rasterizer.fill_mode = SDL_GPU_FILLMODE_LINE;
+    pipeline_info.rasterizer_state = rasterizer;
+
+    m_mesh_pipeline_wireframe = SDL_CreateGPUGraphicsPipeline(m_device, &pipeline_info);
+    if (!m_mesh_pipeline_wireframe) {
+        spdlog::error("Failed to create wireframe pipeline: {}", SDL_GetError());
+        return false;
+    }
+
+    spdlog::info("Graphics pipelines created (solid + wireframe)");
     return true;
 }
 
@@ -528,6 +545,11 @@ bool GPURenderer::begin_frame() {
             return false;
         }
 
+        // Recreate MSAA textures if enabled
+        if (m_sample_count != SDL_GPU_SAMPLECOUNT_1) {
+            create_msaa_textures();
+        }
+
         spdlog::debug("Resized to {}x{}", m_swapchain_width, m_swapchain_height);
     }
 
@@ -538,21 +560,36 @@ void GPURenderer::begin_render_pass() {
     if (!m_cmd_buffer || !m_swapchain_texture) return;
 
     SDL_GPUColorTargetInfo color_target{};
-    color_target.texture = m_swapchain_texture;
     color_target.clear_color = {0.1f, 0.1f, 0.12f, 1.0f};  // Dark gray background
     color_target.load_op = SDL_GPU_LOADOP_CLEAR;
-    color_target.store_op = SDL_GPU_STOREOP_STORE;
     color_target.cycle = false;
+
+    // Configure for MSAA if enabled
+    if (m_sample_count != SDL_GPU_SAMPLECOUNT_1 && m_msaa_color_texture) {
+        color_target.texture = m_msaa_color_texture;
+        color_target.resolve_texture = m_swapchain_texture;
+        color_target.store_op = SDL_GPU_STOREOP_RESOLVE;
+    } else {
+        color_target.texture = m_swapchain_texture;
+        color_target.resolve_texture = nullptr;
+        color_target.store_op = SDL_GPU_STOREOP_STORE;
+    }
 
     // Depth target for 3D rendering
     SDL_GPUDepthStencilTargetInfo depth_target{};
-    depth_target.texture = m_depth_texture;
     depth_target.clear_depth = 1.0f;
     depth_target.load_op = SDL_GPU_LOADOP_CLEAR;
     depth_target.store_op = SDL_GPU_STOREOP_DONT_CARE;  // Don't need to preserve depth
     depth_target.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
     depth_target.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
     depth_target.cycle = false;
+
+    // Use MSAA depth if enabled
+    if (m_sample_count != SDL_GPU_SAMPLECOUNT_1 && m_msaa_depth_texture) {
+        depth_target.texture = m_msaa_depth_texture;
+    } else {
+        depth_target.texture = m_depth_texture;
+    }
 
     m_render_pass = SDL_BeginGPURenderPass(m_cmd_buffer, &color_target, 1, &depth_target);
     if (!m_render_pass) {
@@ -608,8 +645,134 @@ void GPURenderer::set_view_projection(const glm::mat4& view, const glm::mat4& pr
 }
 
 void GPURenderer::bind_mesh_pipeline() {
-    if (m_render_pass && m_mesh_pipeline) {
-        SDL_BindGPUGraphicsPipeline(m_render_pass, m_mesh_pipeline);
+    if (!m_render_pass) return;
+
+    SDL_GPUGraphicsPipeline* pipeline = (m_current_fill_mode == FillMode::Wireframe)
+        ? m_mesh_pipeline_wireframe
+        : m_mesh_pipeline;
+
+    if (pipeline) {
+        SDL_BindGPUGraphicsPipeline(m_render_pass, pipeline);
+    }
+}
+
+void GPURenderer::set_fill_mode(FillMode mode) {
+    m_current_fill_mode = mode;
+}
+
+void GPURenderer::create_msaa_textures() {
+    if (m_sample_count == SDL_GPU_SAMPLECOUNT_1) return;
+
+    // Release existing MSAA textures
+    release_msaa_textures();
+
+    SDL_GPUTextureFormat swapchain_format = SDL_GetGPUSwapchainTextureFormat(m_device, m_window);
+
+    // Create MSAA color texture
+    SDL_GPUTextureCreateInfo msaa_color_info{};
+    msaa_color_info.type = SDL_GPU_TEXTURETYPE_2D;
+    msaa_color_info.format = swapchain_format;
+    msaa_color_info.width = m_swapchain_width;
+    msaa_color_info.height = m_swapchain_height;
+    msaa_color_info.layer_count_or_depth = 1;
+    msaa_color_info.num_levels = 1;
+    msaa_color_info.sample_count = m_sample_count;
+    msaa_color_info.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+
+    m_msaa_color_texture = SDL_CreateGPUTexture(m_device, &msaa_color_info);
+    if (!m_msaa_color_texture) {
+        spdlog::error("Failed to create MSAA color texture: {}", SDL_GetError());
+        return;
+    }
+
+    // Create MSAA depth texture
+    SDL_GPUTextureCreateInfo msaa_depth_info{};
+    msaa_depth_info.type = SDL_GPU_TEXTURETYPE_2D;
+    msaa_depth_info.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    msaa_depth_info.width = m_swapchain_width;
+    msaa_depth_info.height = m_swapchain_height;
+    msaa_depth_info.layer_count_or_depth = 1;
+    msaa_depth_info.num_levels = 1;
+    msaa_depth_info.sample_count = m_sample_count;
+    msaa_depth_info.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+
+    m_msaa_depth_texture = SDL_CreateGPUTexture(m_device, &msaa_depth_info);
+    if (!m_msaa_depth_texture) {
+        spdlog::error("Failed to create MSAA depth texture: {}", SDL_GetError());
+        SDL_ReleaseGPUTexture(m_device, m_msaa_color_texture);
+        m_msaa_color_texture = nullptr;
+        return;
+    }
+
+    spdlog::info("MSAA textures created ({}x samples)", static_cast<int>(m_sample_count));
+}
+
+void GPURenderer::release_msaa_textures() {
+    if (m_msaa_color_texture) {
+        SDL_ReleaseGPUTexture(m_device, m_msaa_color_texture);
+        m_msaa_color_texture = nullptr;
+    }
+    if (m_msaa_depth_texture) {
+        SDL_ReleaseGPUTexture(m_device, m_msaa_depth_texture);
+        m_msaa_depth_texture = nullptr;
+    }
+}
+
+bool GPURenderer::set_msaa_level(int level) {
+    SDL_GPUSampleCount new_count;
+    switch (level) {
+        case 0: new_count = SDL_GPU_SAMPLECOUNT_1; break;
+        case 1: new_count = SDL_GPU_SAMPLECOUNT_2; break;
+        case 2: new_count = SDL_GPU_SAMPLECOUNT_4; break;
+        case 3: new_count = SDL_GPU_SAMPLECOUNT_8; break;
+        default: return false;
+    }
+
+    if (new_count == m_sample_count) return true;
+
+    // Wait for GPU to finish before modifying resources
+    SDL_WaitForGPUIdle(m_device);
+
+    m_sample_count = new_count;
+
+    // Recreate MSAA textures
+    if (m_sample_count != SDL_GPU_SAMPLECOUNT_1) {
+        create_msaa_textures();
+    } else {
+        release_msaa_textures();
+    }
+
+    // Recreate pipelines with new sample count
+    if (m_mesh_pipeline) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_mesh_pipeline);
+        m_mesh_pipeline = nullptr;
+    }
+    if (m_mesh_pipeline_wireframe) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_mesh_pipeline_wireframe);
+        m_mesh_pipeline_wireframe = nullptr;
+    }
+
+    if (!create_pipelines()) {
+        spdlog::error("Failed to recreate pipelines for MSAA level {}", level);
+        return false;
+    }
+
+    // Notify callback (for ImGui reinitialization)
+    if (m_msaa_changed_callback) {
+        m_msaa_changed_callback(m_sample_count);
+    }
+
+    spdlog::info("MSAA level set to {}", level);
+    return true;
+}
+
+int GPURenderer::get_msaa_level() const {
+    switch (m_sample_count) {
+        case SDL_GPU_SAMPLECOUNT_1: return 0;
+        case SDL_GPU_SAMPLECOUNT_2: return 1;
+        case SDL_GPU_SAMPLECOUNT_4: return 2;
+        case SDL_GPU_SAMPLECOUNT_8: return 3;
+        default: return 0;
     }
 }
 

@@ -83,6 +83,9 @@ bool Application::init() {
     m_editor.set_window_handle(m_window.get_handle());
     m_editor.set_renderer(&m_gpu_renderer);
 
+    // MSAA change callback disabled - runtime MSAA changes not supported
+    // TODO: Implement offscreen MSAA rendering for proper runtime support
+
     spdlog::info("ImGui initialized with SDL_GPU backend");
     m_running = true;
     return true;

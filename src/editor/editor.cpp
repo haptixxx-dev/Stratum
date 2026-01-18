@@ -75,6 +75,7 @@ void Editor::render() {
     if (m_show_properties) draw_properties();
     if (m_show_console) draw_console();
     if (m_show_osm_panel) draw_osm_panel();
+    if (m_show_render_settings) draw_render_settings();
 }
 
 void Editor::setup_dockspace() {
@@ -208,6 +209,7 @@ void Editor::draw_menu_bar() {
             ImGui::MenuItem("Properties", nullptr, &m_show_properties);
             ImGui::MenuItem("Console", nullptr, &m_show_console);
             ImGui::MenuItem("OSM Panel", nullptr, &m_show_osm_panel);
+            ImGui::MenuItem("Render Settings", nullptr, &m_show_render_settings);
             ImGui::Separator();
             ImGui::MenuItem("ImGui Demo", nullptr, &m_show_demo_window);
             ImGui::MenuItem("Style Editor", nullptr, &m_show_style_editor);
@@ -227,18 +229,30 @@ void Editor::draw_menu_bar() {
             ImGui::EndMenu();
         }
 
-        // Right side: FPS and window controls
-        float right_offset = 200.0f;
+        // Right side: FPS, render settings toggle, and window controls
+        float right_offset = 240.0f;
         ImGui::SetCursorPosX(ImGui::GetWindowWidth() - right_offset);
         ImGui::Text("%.0f FPS", ImGui::GetIO().Framerate);
 
         ImGui::SameLine();
-        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - 90);
 
         // Window control buttons
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
 
+        // Render settings toggle button
+        bool render_active = m_show_render_settings;
+        if (render_active) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.4f, 0.6f, 1.0f));
+        }
+        if (ImGui::Button("Render")) {
+            m_show_render_settings = !m_show_render_settings;
+        }
+        if (render_active) {
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::SameLine();
         if (ImGui::Button(" - ")) {
             if (m_window_handle) {
                 SDL_MinimizeWindow(static_cast<SDL_Window*>(m_window_handle));
@@ -815,6 +829,78 @@ void Editor::draw_toolbar() {
     // Implemented as overlay in viewport
 }
 
+void Editor::draw_render_settings() {
+    ImGui::Begin("Render Settings", &m_show_render_settings);
+
+    // Wireframe mode
+    if (m_gpu_renderer) {
+        bool wireframe = (m_gpu_renderer->get_fill_mode() == FillMode::Wireframe);
+        if (ImGui::Checkbox("Wireframe Mode", &wireframe)) {
+            m_gpu_renderer->set_fill_mode(wireframe ? FillMode::Wireframe : FillMode::Solid);
+        }
+
+        // MSAA - disabled for now (requires app restart to change)
+        // TODO: Implement offscreen MSAA rendering to allow runtime changes
+        ImGui::Separator();
+        ImGui::BeginDisabled();
+        ImGui::Text("Anti-Aliasing");
+        const char* msaa_options[] = { "Off", "2x MSAA", "4x MSAA", "8x MSAA" };
+        int current_msaa = m_gpu_renderer->get_msaa_level();
+        ImGui::Combo("MSAA", &current_msaa, msaa_options, 4);
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("(Requires restart)");
+    }
+
+    // Culling settings
+    ImGui::Separator();
+    ImGui::Text("Culling");
+
+    ImGui::Checkbox("Frustum Culling", &m_use_tile_culling);
+    ImGui::Checkbox("Distance Culling", &m_use_distance_culling);
+
+    if (m_use_distance_culling) {
+        ImGui::SetNextItemWidth(150);
+        ImGui::SliderFloat("View Radius", &m_view_radius, 500.0f, 20000.0f, "%.0f m");
+    }
+
+    // Stats
+    if (m_tile_manager.tile_count() > 0) {
+        ImGui::Separator();
+        ImGui::Text("Statistics");
+
+        size_t visible_count = 0;
+        size_t total_tris = 0;
+        Frustum frustum = m_camera.get_frustum();
+        glm::vec3 cam_pos = m_camera.get_position();
+        float radius_sq = m_view_radius * m_view_radius;
+
+        for (const auto& coord : m_tile_manager.get_all_tiles()) {
+            const auto* tile = m_tile_manager.get_tile(coord);
+            if (!tile || !tile->has_valid_bounds()) continue;
+
+            bool visible = true;
+            if (m_use_tile_culling && !frustum.intersects_aabb(tile->bounds_min, tile->bounds_max)) {
+                visible = false;
+            }
+            if (visible && m_use_distance_culling) {
+                glm::vec3 tile_center = (tile->bounds_min + tile->bounds_max) * 0.5f;
+                float dist_sq = glm::dot(tile_center - cam_pos, tile_center - cam_pos);
+                if (dist_sq > radius_sq) visible = false;
+            }
+            if (visible) {
+                visible_count++;
+            }
+        }
+
+        total_tris = m_batched_area_tris.size() + m_batched_building_tris.size() + m_batched_road_tris.size();
+
+        ImGui::BulletText("Visible Tiles: %zu / %zu", visible_count, m_tile_manager.tile_count());
+        ImGui::BulletText("Batched Triangles: %zu", total_tris);
+    }
+
+    ImGui::End();
+}
+
 void Editor::handle_window_resize() {
     if (!m_window_handle) return;
 
@@ -1208,12 +1294,21 @@ void Editor::render_3d(GPURenderer& renderer) {
 
     Frustum frustum = m_camera.get_frustum();
     glm::mat4 model(1.0f);
+    glm::vec3 cam_pos = m_camera.get_position();
+    float radius_sq = m_view_radius * m_view_radius;
 
     for (const auto& coord : m_tile_manager.get_all_tiles()) {
         const osm::Tile* tile = m_tile_manager.get_tile(coord);
         if (!tile || !tile->gpu_uploaded) continue;
 
         if (m_use_tile_culling && !frustum.intersects_aabb(tile->bounds_min, tile->bounds_max)) continue;
+
+        // Distance culling at tile level
+        if (m_use_distance_culling) {
+            glm::vec3 tile_center = (tile->bounds_min + tile->bounds_max) * 0.5f;
+            float dist_sq = glm::dot(tile_center - cam_pos, tile_center - cam_pos);
+            if (dist_sq > radius_sq) continue;
+        }
 
         if (m_render_areas) {
             for (uint32_t id : tile->area_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));

@@ -172,7 +172,7 @@ private:
     
     /**
      * @brief Render the current frame
-     * 
+     *
      * Renders all UI elements and presents to screen.
      */
     void render();
