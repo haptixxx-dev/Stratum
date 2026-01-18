@@ -51,11 +51,12 @@ PROCEDURAL GENERATION (v1 Minimum)
   [ ] Basic zoning (residential/commercial)
 
 RENDERING (v1 Minimum)
-  [x] Basic 3D mesh rendering (via Im3d software rasterizer)
+  [x] GPU-accelerated 3D mesh rendering (SDL_GPU with Vulkan backend)
+  [x] Vertex/fragment shader pipeline (SPIR-V compiled shaders)
   [x] Flat shading with diffuse colors
+  [x] Basic lighting (directional sun)
   [x] Ground plane / grid
   [ ] Wireframe mode toggle
-  [ ] Basic lighting (directional sun)
 
 --------------------------------------------------------------------------------
                             V1.x FEATURES (NICE TO HAVE)
@@ -221,11 +222,14 @@ RENDERING (v1 Minimum)
 
 [ ] Mesh Generation Pipeline
     - Vertex format: position, normal, UV, color
+    [x] GPU buffer management (vertex/index buffers via SDL_GPU)
+    [x] Efficient mesh upload and rendering pipeline
     - Instanced rendering for repeated elements
     - LOD mesh generation
     - Batching by material
 
 [ ] Material System
+    [x] Basic shader pipeline with uniforms (MVP, model matrix, color tint)
     - Road materials (asphalt, concrete, dirt)
     - Building materials (brick, glass, concrete)
     - Terrain materials (grass, water, sand)
