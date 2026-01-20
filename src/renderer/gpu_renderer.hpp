@@ -59,7 +59,18 @@ struct alignas(16) MeshUniforms {
 };
 
 /**
- * @brief Scene uniforms for lighting (set 0, binding 0)
+ * @brief PBR Mesh uniforms - extended layout for PBR shader (set 1, binding 0)
+ */
+struct alignas(16) MeshUniformsPBR {
+    glm::mat4 mvp;               // Model-View-Projection
+    glm::mat4 model;             // World transform
+    glm::mat4 normal_matrix;     // Inverse-transpose for correct normals
+    glm::vec4 color_tint;        // RGBA color multiplier
+    glm::vec4 camera_position;   // xyz = camera pos, w = time
+};
+
+/**
+ * @brief Scene uniforms for PBR lighting (set 2, binding 0)
  */
 struct alignas(16) SceneUniforms {
     glm::vec4 camera_position;   // xyz = position, w = exposure
@@ -67,6 +78,7 @@ struct alignas(16) SceneUniforms {
     glm::vec4 sun_color;         // rgb = color, a = ambient intensity
     glm::vec4 fog_params;        // x = start, y = end, z = density, w = enabled
     glm::vec4 fog_color;         // rgb = color, a = unused
+    glm::vec4 pbr_params;        // x = metallic, y = roughness, z = ao, w = unused
 };
 
 /**
@@ -77,6 +89,14 @@ struct alignas(16) GPUMaterial {
     glm::vec4 pbr_params;        // r = metallic, g = roughness, b = ao, a = emissive
     glm::vec4 emissive_color;    // rgb = emissive, a = intensity
     glm::uvec4 texture_indices;  // x = albedo, y = normal, z = metallic_roughness, w = emissive
+};
+
+/**
+ * @brief Shader rendering mode - can be switched at runtime
+ */
+enum class ShaderMode {
+    Simple,     // Basic diffuse lighting, fast, good for debugging
+    PBR         // Full PBR with Cook-Torrance BRDF, tone mapping, fog
 };
 
 /**
@@ -216,6 +236,30 @@ public:
     FillMode get_fill_mode() const { return m_current_fill_mode; }
 
     /**
+     * @brief Set shader mode (Simple or PBR) - can be changed at runtime
+     * @param mode ShaderMode to use
+     * @return true if switch was successful
+     */
+    bool set_shader_mode(ShaderMode mode);
+
+    /**
+     * @brief Get current shader mode
+     */
+    ShaderMode get_shader_mode() const { return m_current_shader_mode; }
+
+    /**
+     * @brief Set PBR material parameters (only used in PBR mode)
+     */
+    void set_pbr_params(float metallic, float roughness, float ao = 1.0f);
+
+    /**
+     * @brief Get current PBR parameters
+     */
+    glm::vec3 get_pbr_params() const { 
+        return glm::vec3(m_scene_uniforms.pbr_params); 
+    }
+
+    /**
      * @brief Set MSAA level
      * @param level 0=off, 1=2x, 2=4x, 3=8x
      * @return true if successful (may fail if level not supported)
@@ -292,10 +336,16 @@ public:
 
 private:
     bool create_pipelines();
+    bool create_simple_pipelines();
+    bool create_pbr_pipelines();
     bool load_shaders();
-    SDL_GPUShader* load_shader(const char* path, SDL_GPUShaderStage stage);
+    bool load_simple_shaders();
+    bool load_pbr_shaders();
+    SDL_GPUShader* load_shader(const char* path, SDL_GPUShaderStage stage, 
+                                int num_uniform_buffers, int num_storage_buffers);
     void create_msaa_textures();
     void release_msaa_textures();
+    void release_pipelines();
     void update_scene_uniforms();
     glm::mat4 compute_normal_matrix(const glm::mat4& model);
 
@@ -303,14 +353,21 @@ private:
     SDL_GPUDevice* m_device = nullptr;
     SDL_Window* m_window = nullptr;
 
-    // Pipelines
+    // Simple shader pipelines
     SDL_GPUGraphicsPipeline* m_mesh_pipeline = nullptr;
     SDL_GPUGraphicsPipeline* m_mesh_pipeline_wireframe = nullptr;
     SDL_GPUShader* m_vertex_shader = nullptr;
     SDL_GPUShader* m_fragment_shader = nullptr;
 
+    // PBR shader pipelines
+    SDL_GPUGraphicsPipeline* m_pbr_pipeline = nullptr;
+    SDL_GPUGraphicsPipeline* m_pbr_pipeline_wireframe = nullptr;
+    SDL_GPUShader* m_pbr_vertex_shader = nullptr;
+    SDL_GPUShader* m_pbr_fragment_shader = nullptr;
+
     // Render state
     FillMode m_current_fill_mode = FillMode::Solid;
+    ShaderMode m_current_shader_mode = ShaderMode::Simple;
 
     // MSAA state
     SDL_GPUSampleCount m_sample_count = SDL_GPU_SAMPLECOUNT_1;

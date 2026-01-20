@@ -832,8 +832,72 @@ void Editor::draw_toolbar() {
 void Editor::draw_render_settings() {
     ImGui::Begin("Render Settings", &m_show_render_settings);
 
-    // Wireframe mode
     if (m_gpu_renderer) {
+        // Shader Mode selection
+        ImGui::Text("Shader Mode");
+        int shader_mode = static_cast<int>(m_gpu_renderer->get_shader_mode());
+        const char* shader_options[] = { "Simple (Fast)", "PBR (Quality)" };
+        if (ImGui::Combo("##ShaderMode", &shader_mode, shader_options, 2)) {
+            m_gpu_renderer->set_shader_mode(static_cast<ShaderMode>(shader_mode));
+        }
+        
+        // PBR settings (only visible in PBR mode)
+        if (m_gpu_renderer->get_shader_mode() == ShaderMode::PBR) {
+            ImGui::Separator();
+            ImGui::Text("PBR Material");
+            
+            glm::vec3 pbr = m_gpu_renderer->get_pbr_params();
+            bool changed = false;
+            changed |= ImGui::SliderFloat("Metallic", &pbr.x, 0.0f, 1.0f);
+            changed |= ImGui::SliderFloat("Roughness", &pbr.y, 0.04f, 1.0f);
+            changed |= ImGui::SliderFloat("Ambient Occlusion", &pbr.z, 0.0f, 1.0f);
+            if (changed) {
+                m_gpu_renderer->set_pbr_params(pbr.x, pbr.y, pbr.z);
+            }
+            
+            ImGui::Separator();
+            ImGui::Text("Lighting");
+            
+            float exposure = m_gpu_renderer->get_exposure();
+            if (ImGui::SliderFloat("Exposure", &exposure, 0.1f, 5.0f)) {
+                m_gpu_renderer->set_exposure(exposure);
+            }
+            
+            // Sun direction (simplified - azimuth angle)
+            static float sun_angle = 45.0f;
+            static float sun_height = 60.0f;
+            bool sun_changed = false;
+            sun_changed |= ImGui::SliderFloat("Sun Azimuth", &sun_angle, 0.0f, 360.0f, "%.0f°");
+            sun_changed |= ImGui::SliderFloat("Sun Height", &sun_height, 5.0f, 90.0f, "%.0f°");
+            if (sun_changed) {
+                float az_rad = glm::radians(sun_angle);
+                float h_rad = glm::radians(sun_height);
+                glm::vec3 sun_dir = glm::normalize(glm::vec3(
+                    cos(h_rad) * sin(az_rad),
+                    sin(h_rad),
+                    cos(h_rad) * cos(az_rad)
+                ));
+                m_gpu_renderer->set_scene_lighting(sun_dir, glm::vec3(1.0f, 0.98f, 0.95f), 1.0f, 0.1f);
+            }
+            
+            // Fog
+            static bool fog_enabled = false;
+            static float fog_density = 0.0005f;
+            static glm::vec3 fog_color = glm::vec3(0.7f, 0.8f, 0.9f);
+            bool fog_changed = false;
+            fog_changed |= ImGui::Checkbox("Enable Fog", &fog_enabled);
+            if (fog_enabled) {
+                fog_changed |= ImGui::SliderFloat("Fog Density", &fog_density, 0.0001f, 0.01f, "%.4f");
+                fog_changed |= ImGui::ColorEdit3("Fog Color", &fog_color.x);
+            }
+            if (fog_changed) {
+                m_gpu_renderer->set_fog(fog_enabled, fog_color, fog_density);
+            }
+        }
+
+        ImGui::Separator();
+        
+        // Wireframe mode
         bool wireframe = (m_gpu_renderer->get_fill_mode() == FillMode::Wireframe);
         if (ImGui::Checkbox("Wireframe Mode", &wireframe)) {
             m_gpu_renderer->set_fill_mode(wireframe ? FillMode::Wireframe : FillMode::Solid);
@@ -1291,10 +1355,13 @@ void Editor::render_3d(GPURenderer& renderer) {
     glm::mat4 view = m_camera.get_view();
     glm::mat4 proj = m_camera.get_projection();
     renderer.set_view_projection(view, proj);
+    
+    // Set camera position for PBR lighting calculations
+    glm::vec3 cam_pos = m_camera.get_position();
+    renderer.set_camera_position(cam_pos);
 
     Frustum frustum = m_camera.get_frustum();
     glm::mat4 model(1.0f);
-    glm::vec3 cam_pos = m_camera.get_position();
     float radius_sq = m_view_radius * m_view_radius;
 
     for (const auto& coord : m_tile_manager.get_all_tiles()) {

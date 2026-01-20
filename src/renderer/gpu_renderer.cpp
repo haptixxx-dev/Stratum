@@ -102,25 +102,8 @@ void GPURenderer::shutdown() {
         m_transfer_buffer = nullptr;
     }
 
-    // Release pipelines
-    if (m_mesh_pipeline) {
-        SDL_ReleaseGPUGraphicsPipeline(m_device, m_mesh_pipeline);
-        m_mesh_pipeline = nullptr;
-    }
-    if (m_mesh_pipeline_wireframe) {
-        SDL_ReleaseGPUGraphicsPipeline(m_device, m_mesh_pipeline_wireframe);
-        m_mesh_pipeline_wireframe = nullptr;
-    }
-
-    // Release shaders
-    if (m_vertex_shader) {
-        SDL_ReleaseGPUShader(m_device, m_vertex_shader);
-        m_vertex_shader = nullptr;
-    }
-    if (m_fragment_shader) {
-        SDL_ReleaseGPUShader(m_device, m_fragment_shader);
-        m_fragment_shader = nullptr;
-    }
+    // Release all pipelines and shaders
+    release_pipelines();
 
     // Release MSAA textures
     release_msaa_textures();
@@ -142,33 +125,121 @@ void GPURenderer::shutdown() {
     spdlog::info("GPURenderer shutdown");
 }
 
+void GPURenderer::release_pipelines() {
+    // Release simple pipelines
+    if (m_mesh_pipeline) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_mesh_pipeline);
+        m_mesh_pipeline = nullptr;
+    }
+    if (m_mesh_pipeline_wireframe) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_mesh_pipeline_wireframe);
+        m_mesh_pipeline_wireframe = nullptr;
+    }
+
+    // Release simple shaders
+    if (m_vertex_shader) {
+        SDL_ReleaseGPUShader(m_device, m_vertex_shader);
+        m_vertex_shader = nullptr;
+    }
+    if (m_fragment_shader) {
+        SDL_ReleaseGPUShader(m_device, m_fragment_shader);
+        m_fragment_shader = nullptr;
+    }
+
+    // Release PBR pipelines
+    if (m_pbr_pipeline) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_pbr_pipeline);
+        m_pbr_pipeline = nullptr;
+    }
+    if (m_pbr_pipeline_wireframe) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_pbr_pipeline_wireframe);
+        m_pbr_pipeline_wireframe = nullptr;
+    }
+
+    // Release PBR shaders
+    if (m_pbr_vertex_shader) {
+        SDL_ReleaseGPUShader(m_device, m_pbr_vertex_shader);
+        m_pbr_vertex_shader = nullptr;
+    }
+    if (m_pbr_fragment_shader) {
+        SDL_ReleaseGPUShader(m_device, m_pbr_fragment_shader);
+        m_pbr_fragment_shader = nullptr;
+    }
+}
+
 bool GPURenderer::load_shaders() {
-    // Get base path for asset loading
-    const char* base = SDL_GetBasePath();
-    std::string base_path = base ? base : "";
-
-    // Shader paths - look in assets/shaders/ relative to executable
-    // The executable is in build/bin/, so assets are at ../../assets/
-    std::string vert_path = base_path + "../../assets/shaders/mesh.vert.spv";
-    std::string frag_path = base_path + "../../assets/shaders/mesh.frag.spv";
-
-    m_vertex_shader = load_shader(vert_path.c_str(), SDL_GPU_SHADERSTAGE_VERTEX);
-    if (!m_vertex_shader) {
-        spdlog::error("Failed to load vertex shader: {}", vert_path);
+    // Load both simple and PBR shaders
+    if (!load_simple_shaders()) {
         return false;
     }
-
-    m_fragment_shader = load_shader(frag_path.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT);
-    if (!m_fragment_shader) {
-        spdlog::error("Failed to load fragment shader: {}", frag_path);
-        return false;
+    
+    if (!load_pbr_shaders()) {
+        spdlog::warn("PBR shaders not available - PBR mode disabled");
+        // Not a fatal error - simple mode still works
     }
-
-    spdlog::info("Shaders loaded successfully");
+    
     return true;
 }
 
-SDL_GPUShader* GPURenderer::load_shader(const char* path, SDL_GPUShaderStage stage) {
+bool GPURenderer::load_simple_shaders() {
+    const char* base = SDL_GetBasePath();
+    std::string base_path = base ? base : "";
+
+    std::string vert_path = base_path + "../../assets/shaders/mesh.vert.spv";
+    std::string frag_path = base_path + "../../assets/shaders/mesh.frag.spv";
+
+    // Simple shader: 1 vertex uniform buffer, 0 fragment uniforms, 0 SSBOs
+    m_vertex_shader = load_shader(vert_path.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 1, 0);
+    if (!m_vertex_shader) {
+        spdlog::error("Failed to load simple vertex shader: {}", vert_path);
+        return false;
+    }
+
+    m_fragment_shader = load_shader(frag_path.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 0);
+    if (!m_fragment_shader) {
+        spdlog::error("Failed to load simple fragment shader: {}", frag_path);
+        return false;
+    }
+
+    spdlog::info("Simple shaders loaded successfully");
+    return true;
+}
+
+bool GPURenderer::load_pbr_shaders() {
+    const char* base = SDL_GetBasePath();
+    std::string base_path = base ? base : "";
+
+    std::string vert_path = base_path + "../../assets/shaders/mesh_pbr.vert.spv";
+    std::string frag_path = base_path + "../../assets/shaders/mesh_pbr.frag.spv";
+
+    // Check if PBR shaders exist
+    if (!std::filesystem::exists(vert_path) || !std::filesystem::exists(frag_path)) {
+        spdlog::warn("PBR shaders not found at {}", vert_path);
+        return false;
+    }
+
+    // PBR vertex shader: 1 uniform buffer (MeshUniformsPBR)
+    m_pbr_vertex_shader = load_shader(vert_path.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 1, 0);
+    if (!m_pbr_vertex_shader) {
+        spdlog::error("Failed to load PBR vertex shader: {}", vert_path);
+        return false;
+    }
+
+    // PBR fragment shader: 1 uniform buffer (SceneUniforms at set=2)
+    m_pbr_fragment_shader = load_shader(frag_path.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0);
+    if (!m_pbr_fragment_shader) {
+        spdlog::error("Failed to load PBR fragment shader: {}", frag_path);
+        SDL_ReleaseGPUShader(m_device, m_pbr_vertex_shader);
+        m_pbr_vertex_shader = nullptr;
+        return false;
+    }
+
+    spdlog::info("PBR shaders loaded successfully");
+    return true;
+}
+
+SDL_GPUShader* GPURenderer::load_shader(const char* path, SDL_GPUShaderStage stage,
+                                         int num_uniform_buffers, int num_storage_buffers) {
     // Read shader file
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
@@ -192,19 +263,11 @@ SDL_GPUShader* GPURenderer::load_shader(const char* path, SDL_GPUShaderStage sta
     shader_info.format = SDL_GPU_SHADERFORMAT_SPIRV;
     shader_info.stage = stage;
 
-    // Set resource counts based on our shader design
-    // Current shaders use simple uniforms without SSBOs
-    if (stage == SDL_GPU_SHADERSTAGE_VERTEX) {
-        shader_info.num_uniform_buffers = 1;  // MeshUniforms (set=1, binding=0)
-        shader_info.num_storage_buffers = 0;  // No SSBOs in simple shader
-        shader_info.num_storage_textures = 0;
-        shader_info.num_samplers = 0;
-    } else {
-        shader_info.num_uniform_buffers = 0;  // No fragment uniforms in simple shader
-        shader_info.num_storage_buffers = 0;  // No SSBOs in simple shader
-        shader_info.num_storage_textures = 0;
-        shader_info.num_samplers = 0;
-    }
+    // Use provided resource counts
+    shader_info.num_uniform_buffers = num_uniform_buffers;
+    shader_info.num_storage_buffers = num_storage_buffers;
+    shader_info.num_storage_textures = 0;
+    shader_info.num_samplers = 0;
 
     SDL_GPUShader* shader = SDL_CreateGPUShader(m_device, &shader_info);
     if (!shader) {
@@ -216,6 +279,22 @@ SDL_GPUShader* GPURenderer::load_shader(const char* path, SDL_GPUShaderStage sta
 }
 
 bool GPURenderer::create_pipelines() {
+    // Create simple pipelines first
+    if (!create_simple_pipelines()) {
+        return false;
+    }
+    
+    // Try to create PBR pipelines (optional)
+    if (m_pbr_vertex_shader && m_pbr_fragment_shader) {
+        if (!create_pbr_pipelines()) {
+            spdlog::warn("Failed to create PBR pipelines - PBR mode disabled");
+        }
+    }
+    
+    return true;
+}
+
+bool GPURenderer::create_simple_pipelines() {
     // Vertex input layout matching our Vertex struct
     // Note: Vertex has tangent but simple shader only uses 4 attributes
     SDL_GPUVertexBufferDescription vertex_buffer_desc{};
@@ -332,7 +411,122 @@ bool GPURenderer::create_pipelines() {
         return false;
     }
 
-    spdlog::info("Graphics pipelines created (solid + wireframe)");
+    spdlog::info("Simple graphics pipelines created (solid + wireframe)");
+    return true;
+}
+
+bool GPURenderer::create_pbr_pipelines() {
+    // PBR shader uses 5 vertex attributes (including tangent)
+    SDL_GPUVertexBufferDescription vertex_buffer_desc{};
+    vertex_buffer_desc.slot = 0;
+    vertex_buffer_desc.pitch = sizeof(Vertex);
+    vertex_buffer_desc.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+    vertex_buffer_desc.instance_step_rate = 0;
+
+    SDL_GPUVertexAttribute vertex_attributes[5]{};
+
+    // Position: vec3
+    vertex_attributes[0].location = 0;
+    vertex_attributes[0].buffer_slot = 0;
+    vertex_attributes[0].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;
+    vertex_attributes[0].offset = offsetof(Vertex, position);
+
+    // Normal: vec3
+    vertex_attributes[1].location = 1;
+    vertex_attributes[1].buffer_slot = 0;
+    vertex_attributes[1].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;
+    vertex_attributes[1].offset = offsetof(Vertex, normal);
+
+    // UV: vec2
+    vertex_attributes[2].location = 2;
+    vertex_attributes[2].buffer_slot = 0;
+    vertex_attributes[2].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2;
+    vertex_attributes[2].offset = offsetof(Vertex, uv);
+
+    // Color: vec4
+    vertex_attributes[3].location = 3;
+    vertex_attributes[3].buffer_slot = 0;
+    vertex_attributes[3].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4;
+    vertex_attributes[3].offset = offsetof(Vertex, color);
+
+    // Tangent: vec4 (xyz = tangent, w = bitangent sign)
+    vertex_attributes[4].location = 4;
+    vertex_attributes[4].buffer_slot = 0;
+    vertex_attributes[4].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4;
+    vertex_attributes[4].offset = offsetof(Vertex, tangent);
+
+    SDL_GPUVertexInputState vertex_input{};
+    vertex_input.vertex_buffer_descriptions = &vertex_buffer_desc;
+    vertex_input.num_vertex_buffers = 1;
+    vertex_input.vertex_attributes = vertex_attributes;
+    vertex_input.num_vertex_attributes = 5;
+
+    // Rasterizer state
+    SDL_GPURasterizerState rasterizer{};
+    rasterizer.fill_mode = SDL_GPU_FILLMODE_FILL;
+    rasterizer.cull_mode = SDL_GPU_CULLMODE_BACK;
+    rasterizer.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+    rasterizer.enable_depth_bias = false;
+    rasterizer.enable_depth_clip = true;
+
+    // Depth stencil state
+    SDL_GPUDepthStencilState depth_stencil{};
+    depth_stencil.compare_op = SDL_GPU_COMPAREOP_LESS;
+    depth_stencil.enable_depth_test = true;
+    depth_stencil.enable_depth_write = true;
+    depth_stencil.enable_stencil_test = false;
+
+    // Color target
+    SDL_GPUColorTargetDescription color_target{};
+    color_target.format = SDL_GetGPUSwapchainTextureFormat(m_device, m_window);
+
+    SDL_GPUColorTargetBlendState blend{};
+    blend.enable_blend = false;
+    blend.color_write_mask = SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G |
+                             SDL_GPU_COLORCOMPONENT_B | SDL_GPU_COLORCOMPONENT_A;
+    color_target.blend_state = blend;
+
+    // Pipeline target info
+    SDL_GPUGraphicsPipelineTargetInfo target_info{};
+    target_info.color_target_descriptions = &color_target;
+    target_info.num_color_targets = 1;
+    target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    target_info.has_depth_stencil_target = true;
+
+    // Multisample state
+    SDL_GPUMultisampleState multisample{};
+    multisample.sample_count = m_sample_count;
+
+    // Create the PBR pipeline
+    SDL_GPUGraphicsPipelineCreateInfo pipeline_info{};
+    pipeline_info.vertex_shader = m_pbr_vertex_shader;
+    pipeline_info.fragment_shader = m_pbr_fragment_shader;
+    pipeline_info.vertex_input_state = vertex_input;
+    pipeline_info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    pipeline_info.rasterizer_state = rasterizer;
+    pipeline_info.multisample_state = multisample;
+    pipeline_info.depth_stencil_state = depth_stencil;
+    pipeline_info.target_info = target_info;
+
+    m_pbr_pipeline = SDL_CreateGPUGraphicsPipeline(m_device, &pipeline_info);
+    if (!m_pbr_pipeline) {
+        spdlog::error("Failed to create PBR pipeline: {}", SDL_GetError());
+        return false;
+    }
+
+    // Create PBR wireframe pipeline
+    rasterizer.fill_mode = SDL_GPU_FILLMODE_LINE;
+    pipeline_info.rasterizer_state = rasterizer;
+
+    m_pbr_pipeline_wireframe = SDL_CreateGPUGraphicsPipeline(m_device, &pipeline_info);
+    if (!m_pbr_pipeline_wireframe) {
+        spdlog::error("Failed to create PBR wireframe pipeline: {}", SDL_GetError());
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_pbr_pipeline);
+        m_pbr_pipeline = nullptr;
+        return false;
+    }
+
+    spdlog::info("PBR graphics pipelines created (solid + wireframe)");
     return true;
 }
 
@@ -653,9 +847,19 @@ void GPURenderer::set_view_projection(const glm::mat4& view, const glm::mat4& pr
 void GPURenderer::bind_mesh_pipeline() {
     if (!m_render_pass) return;
 
-    SDL_GPUGraphicsPipeline* pipeline = (m_current_fill_mode == FillMode::Wireframe)
-        ? m_mesh_pipeline_wireframe
-        : m_mesh_pipeline;
+    SDL_GPUGraphicsPipeline* pipeline = nullptr;
+
+    if (m_current_shader_mode == ShaderMode::PBR && m_pbr_pipeline) {
+        // Use PBR pipeline
+        pipeline = (m_current_fill_mode == FillMode::Wireframe)
+            ? m_pbr_pipeline_wireframe
+            : m_pbr_pipeline;
+    } else {
+        // Fall back to simple pipeline
+        pipeline = (m_current_fill_mode == FillMode::Wireframe)
+            ? m_mesh_pipeline_wireframe
+            : m_mesh_pipeline;
+    }
 
     if (pipeline) {
         SDL_BindGPUGraphicsPipeline(m_render_pass, pipeline);
@@ -664,6 +868,27 @@ void GPURenderer::bind_mesh_pipeline() {
 
 void GPURenderer::set_fill_mode(FillMode mode) {
     m_current_fill_mode = mode;
+}
+
+bool GPURenderer::set_shader_mode(ShaderMode mode) {
+    if (mode == ShaderMode::PBR) {
+        // Check if PBR pipelines are available
+        if (!m_pbr_pipeline || !m_pbr_pipeline_wireframe) {
+            spdlog::warn("PBR shaders not available - staying in Simple mode");
+            return false;
+        }
+    }
+    
+    if (m_current_shader_mode != mode) {
+        m_current_shader_mode = mode;
+        spdlog::info("Shader mode changed to: {}", 
+                     mode == ShaderMode::Simple ? "Simple" : "PBR");
+    }
+    return true;
+}
+
+void GPURenderer::set_pbr_params(float metallic, float roughness, float ao) {
+    m_scene_uniforms.pbr_params = glm::vec4(metallic, roughness, ao, 0.0f);
 }
 
 void GPURenderer::create_msaa_textures() {
@@ -792,13 +1017,28 @@ void GPURenderer::draw_mesh(uint32_t mesh_id, const glm::mat4& model,
     const GPUMesh& mesh = it->second;
     if (!mesh.is_valid()) return;
 
-    // Simple shader uniform layout: { mvp, model, color_tint }
-    MeshUniforms uniforms{};
-    uniforms.mvp = m_view_projection * model;
-    uniforms.model = model;
-    uniforms.color_tint = color_tint;
+    if (m_current_shader_mode == ShaderMode::PBR && m_pbr_pipeline) {
+        // PBR shader uniform layout: { mvp, model, normal_matrix, color_tint, camera_position }
+        MeshUniformsPBR uniforms{};
+        uniforms.mvp = m_view_projection * model;
+        uniforms.model = model;
+        uniforms.normal_matrix = compute_normal_matrix(model);
+        uniforms.color_tint = color_tint;
+        uniforms.camera_position = glm::vec4(m_camera_position, SDL_GetTicks() / 1000.0f);
 
-    SDL_PushGPUVertexUniformData(m_cmd_buffer, 0, &uniforms, sizeof(uniforms));
+        SDL_PushGPUVertexUniformData(m_cmd_buffer, 0, &uniforms, sizeof(uniforms));
+
+        // Push scene uniforms to fragment shader (set 2, binding 0)
+        SDL_PushGPUFragmentUniformData(m_cmd_buffer, 0, &m_scene_uniforms, sizeof(m_scene_uniforms));
+    } else {
+        // Simple shader uniform layout: { mvp, model, color_tint }
+        MeshUniforms uniforms{};
+        uniforms.mvp = m_view_projection * model;
+        uniforms.model = model;
+        uniforms.color_tint = color_tint;
+
+        SDL_PushGPUVertexUniformData(m_cmd_buffer, 0, &uniforms, sizeof(uniforms));
+    }
 
     // Bind vertex buffer
     SDL_GPUBufferBinding vertex_binding{};
@@ -862,13 +1102,22 @@ glm::mat4 GPURenderer::compute_normal_matrix(const glm::mat4& model) {
 void GPURenderer::update_scene_uniforms() {
     // Called at the start of each frame to ensure scene uniforms are current
     // The actual push happens in draw_mesh, but this ensures defaults are set
+    
+    // Default sun lighting
     if (m_scene_uniforms.sun_direction.w <= 0.0f) {
-        // Set default lighting if not configured
         m_scene_uniforms.sun_direction = glm::vec4(glm::normalize(glm::vec3(0.5f, 1.0f, 0.3f)), 1.0f);
         m_scene_uniforms.sun_color = glm::vec4(1.0f, 0.98f, 0.95f, 0.3f);  // Warm white, 0.3 ambient
     }
+    
+    // Default exposure
     if (m_scene_uniforms.camera_position.w <= 0.0f) {
-        m_scene_uniforms.camera_position.w = 1.0f;  // Default exposure
+        m_scene_uniforms.camera_position.w = 1.0f;
+    }
+    
+    // Default PBR params (metallic=0, roughness=0.5, ao=1.0)
+    // Only initialize if roughness is 0 (uninitialized) since 0 roughness = mirror = black
+    if (m_scene_uniforms.pbr_params.y <= 0.0f) {
+        m_scene_uniforms.pbr_params = glm::vec4(0.0f, 0.5f, 1.0f, 0.0f);
     }
 }
 
