@@ -193,14 +193,15 @@ SDL_GPUShader* GPURenderer::load_shader(const char* path, SDL_GPUShaderStage sta
     shader_info.stage = stage;
 
     // Set resource counts based on our shader design
+    // Current shaders use simple uniforms without SSBOs
     if (stage == SDL_GPU_SHADERSTAGE_VERTEX) {
-        shader_info.num_uniform_buffers = 1;  // MeshUniforms
-        shader_info.num_storage_buffers = 0;
+        shader_info.num_uniform_buffers = 1;  // MeshUniforms (set=1, binding=0)
+        shader_info.num_storage_buffers = 0;  // No SSBOs in simple shader
         shader_info.num_storage_textures = 0;
         shader_info.num_samplers = 0;
     } else {
-        shader_info.num_uniform_buffers = 0;
-        shader_info.num_storage_buffers = 0;
+        shader_info.num_uniform_buffers = 0;  // No fragment uniforms in simple shader
+        shader_info.num_storage_buffers = 0;  // No SSBOs in simple shader
         shader_info.num_storage_textures = 0;
         shader_info.num_samplers = 0;
     }
@@ -216,12 +217,14 @@ SDL_GPUShader* GPURenderer::load_shader(const char* path, SDL_GPUShaderStage sta
 
 bool GPURenderer::create_pipelines() {
     // Vertex input layout matching our Vertex struct
+    // Note: Vertex has tangent but simple shader only uses 4 attributes
     SDL_GPUVertexBufferDescription vertex_buffer_desc{};
     vertex_buffer_desc.slot = 0;
     vertex_buffer_desc.pitch = sizeof(Vertex);
     vertex_buffer_desc.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
     vertex_buffer_desc.instance_step_rate = 0;
 
+    // Simple shader only uses 4 vertex attributes (no tangent)
     SDL_GPUVertexAttribute vertex_attributes[4]{};
 
     // Position: vec3 at offset 0
@@ -597,6 +600,9 @@ void GPURenderer::begin_render_pass() {
         return;
     }
 
+    // Update scene uniforms with defaults if not set
+    update_scene_uniforms();
+
     // Set viewport
     SDL_GPUViewport viewport{};
     viewport.x = 0;
@@ -776,7 +782,8 @@ int GPURenderer::get_msaa_level() const {
     }
 }
 
-void GPURenderer::draw_mesh(uint32_t mesh_id, const glm::mat4& model, const glm::vec4& color_tint) {
+void GPURenderer::draw_mesh(uint32_t mesh_id, const glm::mat4& model, 
+                            const glm::vec4& color_tint, uint32_t material_id) {
     if (!m_render_pass) return;
 
     auto it = m_meshes.find(mesh_id);
@@ -785,7 +792,7 @@ void GPURenderer::draw_mesh(uint32_t mesh_id, const glm::mat4& model, const glm:
     const GPUMesh& mesh = it->second;
     if (!mesh.is_valid()) return;
 
-    // Push uniforms
+    // Simple shader uniform layout: { mvp, model, color_tint }
     MeshUniforms uniforms{};
     uniforms.mvp = m_view_projection * model;
     uniforms.model = model;
@@ -825,6 +832,43 @@ void GPURenderer::draw_mesh_immediate(const Mesh& mesh, const glm::mat4& model) 
 void GPURenderer::set_viewport(const SDL_GPUViewport& viewport) {
     if (m_render_pass) {
         SDL_SetGPUViewport(m_render_pass, &viewport);
+    }
+}
+
+void GPURenderer::set_camera_position(const glm::vec3& position) {
+    m_camera_position = position;
+    m_scene_uniforms.camera_position = glm::vec4(position, m_scene_uniforms.camera_position.w);
+}
+
+void GPURenderer::set_scene_lighting(const glm::vec3& sun_dir, const glm::vec3& sun_color, 
+                                     float sun_intensity, float ambient_intensity) {
+    m_scene_uniforms.sun_direction = glm::vec4(glm::normalize(sun_dir), sun_intensity);
+    m_scene_uniforms.sun_color = glm::vec4(sun_color, ambient_intensity);
+}
+
+void GPURenderer::set_fog(bool enabled, const glm::vec3& color, float density) {
+    m_scene_uniforms.fog_params = glm::vec4(0.0f, 1000.0f, density, enabled ? 1.0f : 0.0f);
+    m_scene_uniforms.fog_color = glm::vec4(color, 1.0f);
+}
+
+glm::mat4 GPURenderer::compute_normal_matrix(const glm::mat4& model) {
+    // For correct normal transformation with non-uniform scaling,
+    // we need the inverse-transpose of the upper-left 3x3 of the model matrix
+    // Padded to mat4 for GPU alignment
+    glm::mat3 normal_mat3 = glm::transpose(glm::inverse(glm::mat3(model)));
+    return glm::mat4(normal_mat3);
+}
+
+void GPURenderer::update_scene_uniforms() {
+    // Called at the start of each frame to ensure scene uniforms are current
+    // The actual push happens in draw_mesh, but this ensures defaults are set
+    if (m_scene_uniforms.sun_direction.w <= 0.0f) {
+        // Set default lighting if not configured
+        m_scene_uniforms.sun_direction = glm::vec4(glm::normalize(glm::vec3(0.5f, 1.0f, 0.3f)), 1.0f);
+        m_scene_uniforms.sun_color = glm::vec4(1.0f, 0.98f, 0.95f, 0.3f);  // Warm white, 0.3 ambient
+    }
+    if (m_scene_uniforms.camera_position.w <= 0.0f) {
+        m_scene_uniforms.camera_position.w = 1.0f;  // Default exposure
     }
 }
 

@@ -6,6 +6,7 @@
  * @date 2026
  *
  * Uses SDL3's GPU API with Vulkan backend for efficient mesh rendering.
+ * Supports PBR lighting, push constants, and bindless textures.
  */
 
 #pragma once
@@ -36,12 +37,58 @@ struct GPUMesh {
 };
 
 /**
- * @brief Uniform data pushed to vertex shader
+ * @brief Push constants for per-draw data (fastest path)
+ * Must match shader layout - max 128 bytes
+ * NOTE: Currently unused - simple shader uses uniform buffer only
+ */
+struct alignas(16) PushConstants {
+    glm::mat4 mvp;              // 64 bytes - Model-View-Projection matrix
+    uint32_t material_id;       // 4 bytes - Material index for bindless
+    uint32_t instance_offset;   // 4 bytes - Base instance for instancing
+    glm::vec2 uv_scale;         // 8 bytes - UV tiling
+    // Total: 80 bytes (within 128 byte limit)
+};
+
+/**
+ * @brief Mesh uniforms - matches the simple shader layout (set 1, binding 0)
  */
 struct alignas(16) MeshUniforms {
-    glm::mat4 mvp;           // Model-View-Projection matrix
-    glm::mat4 model;         // Model matrix (for lighting)
-    glm::vec4 color_tint;    // Optional color tint/override
+    glm::mat4 mvp;               // Model-View-Projection
+    glm::mat4 model;             // World transform
+    glm::vec4 color_tint;        // RGBA color multiplier
+};
+
+/**
+ * @brief Scene uniforms for lighting (set 0, binding 0)
+ */
+struct alignas(16) SceneUniforms {
+    glm::vec4 camera_position;   // xyz = position, w = exposure
+    glm::vec4 sun_direction;     // xyz = normalized direction, w = intensity
+    glm::vec4 sun_color;         // rgb = color, a = ambient intensity
+    glm::vec4 fog_params;        // x = start, y = end, z = density, w = enabled
+    glm::vec4 fog_color;         // rgb = color, a = unused
+};
+
+/**
+ * @brief PBR Material data for material buffer
+ */
+struct alignas(16) GPUMaterial {
+    glm::vec4 base_color;        // rgb = albedo, a = alpha
+    glm::vec4 pbr_params;        // r = metallic, g = roughness, b = ao, a = emissive
+    glm::vec4 emissive_color;    // rgb = emissive, a = intensity
+    glm::uvec4 texture_indices;  // x = albedo, y = normal, z = metallic_roughness, w = emissive
+};
+
+/**
+ * @brief Specialization constants for shader variants
+ */
+struct ShaderSpecialization {
+    bool use_textures = false;
+    bool use_vertex_colors = true;
+    bool use_normal_mapping = false;
+    bool use_instancing = false;
+    bool use_pbr = true;
+    bool use_ibl = false;
 };
 
 /**
@@ -56,7 +103,7 @@ enum class FillMode {
  * @brief SDL_GPU based renderer
  *
  * Manages GPU device, pipelines, and provides efficient mesh rendering.
- * Designed for rendering large amounts of city geometry.
+ * Designed for rendering large amounts of city geometry with PBR lighting.
  */
 class GPURenderer {
 public:
@@ -136,6 +183,22 @@ public:
     void set_view_projection(const glm::mat4& view, const glm::mat4& projection);
 
     /**
+     * @brief Set camera position for lighting calculations
+     */
+    void set_camera_position(const glm::vec3& position);
+
+    /**
+     * @brief Update scene lighting parameters
+     */
+    void set_scene_lighting(const glm::vec3& sun_dir, const glm::vec3& sun_color, 
+                            float sun_intensity, float ambient_intensity);
+
+    /**
+     * @brief Set fog parameters
+     */
+    void set_fog(bool enabled, const glm::vec3& color, float density);
+
+    /**
      * @brief Bind the mesh rendering pipeline
      * @note Call before draw_mesh() calls
      */
@@ -182,9 +245,11 @@ public:
      * @param mesh_id Mesh handle from upload_mesh()
      * @param model Model transform matrix
      * @param color_tint Optional color tint (default white = no tint)
+     * @param material_id Material index for PBR (default 0)
      */
     void draw_mesh(uint32_t mesh_id, const glm::mat4& model = glm::mat4(1.0f),
-                   const glm::vec4& color_tint = glm::vec4(1.0f));
+                   const glm::vec4& color_tint = glm::vec4(1.0f),
+                   uint32_t material_id = 0);
 
     /**
      * @brief Draw a mesh directly without caching (for dynamic geometry)
@@ -204,6 +269,16 @@ public:
      */
     void render_imgui();
 
+    /**
+     * @brief Set exposure for tone mapping
+     */
+    void set_exposure(float exposure) { m_scene_uniforms.camera_position.w = exposure; }
+
+    /**
+     * @brief Get current exposure value
+     */
+    float get_exposure() const { return m_scene_uniforms.camera_position.w; }
+
     // === Getters ===
     SDL_GPUDevice* get_device() const { return m_device; }
     SDL_Window* get_window() const { return m_window; }
@@ -212,12 +287,17 @@ public:
     SDL_GPUTexture* get_swapchain_texture() const { return m_swapchain_texture; }
     SDL_GPUTextureFormat get_swapchain_format() const;
 
+    // === Scene state getters ===
+    const SceneUniforms& get_scene_uniforms() const { return m_scene_uniforms; }
+
 private:
     bool create_pipelines();
     bool load_shaders();
     SDL_GPUShader* load_shader(const char* path, SDL_GPUShaderStage stage);
     void create_msaa_textures();
     void release_msaa_textures();
+    void update_scene_uniforms();
+    glm::mat4 compute_normal_matrix(const glm::mat4& model);
 
     // GPU handles
     SDL_GPUDevice* m_device = nullptr;
@@ -250,6 +330,12 @@ private:
     glm::mat4 m_view{1.0f};
     glm::mat4 m_projection{1.0f};
     glm::mat4 m_view_projection{1.0f};
+
+    // Scene uniforms (lighting, fog, etc.)
+    SceneUniforms m_scene_uniforms{};
+
+    // Camera position (for specular calculations)
+    glm::vec3 m_camera_position{0.0f};
 
     // Mesh storage
     std::unordered_map<uint32_t, GPUMesh> m_meshes;
