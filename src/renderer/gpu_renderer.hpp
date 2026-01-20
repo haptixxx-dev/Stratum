@@ -215,8 +215,24 @@ public:
 
     /**
      * @brief Set fog parameters
+     * @param mode 0 = disabled, 1 = linear, 2 = exponential, 3 = exponential squared
+     * @param color Fog color
+     * @param start Start distance for linear fog
+     * @param end End distance for linear fog
+     * @param density Density for exponential fog modes
      */
-    void set_fog(bool enabled, const glm::vec3& color, float density);
+    void set_fog(int mode, const glm::vec3& color, float start, float end, float density);
+
+    /**
+     * @brief Get current fog parameters
+     * @return vec4(start, end, density, mode)
+     */
+    glm::vec4 get_fog_params() const { return m_scene_uniforms.fog_params; }
+
+    /**
+     * @brief Get current fog color
+     */
+    glm::vec3 get_fog_color() const { return glm::vec3(m_scene_uniforms.fog_color); }
 
     /**
      * @brief Bind the mesh rendering pipeline

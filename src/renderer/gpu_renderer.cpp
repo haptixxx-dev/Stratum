@@ -1086,8 +1086,8 @@ void GPURenderer::set_scene_lighting(const glm::vec3& sun_dir, const glm::vec3& 
     m_scene_uniforms.sun_color = glm::vec4(sun_color, ambient_intensity);
 }
 
-void GPURenderer::set_fog(bool enabled, const glm::vec3& color, float density) {
-    m_scene_uniforms.fog_params = glm::vec4(0.0f, 1000.0f, density, enabled ? 1.0f : 0.0f);
+void GPURenderer::set_fog(int mode, const glm::vec3& color, float start, float end, float density) {
+    m_scene_uniforms.fog_params = glm::vec4(start, end, density, static_cast<float>(mode));
     m_scene_uniforms.fog_color = glm::vec4(color, 1.0f);
 }
 

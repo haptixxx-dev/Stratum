@@ -881,17 +881,35 @@ void Editor::draw_render_settings() {
             }
             
             // Fog
-            static bool fog_enabled = false;
-            static float fog_density = 0.0005f;
+            ImGui::Separator();
+            ImGui::Text("Fog");
+            
+            static int fog_mode = 0;  // 0 = off, 1 = linear, 2 = exp, 3 = exp squared
+            static float fog_start = 50.0f;
+            static float fog_end = 500.0f;
+            static float fog_density = 0.005f;
             static glm::vec3 fog_color = glm::vec3(0.7f, 0.8f, 0.9f);
             bool fog_changed = false;
-            fog_changed |= ImGui::Checkbox("Enable Fog", &fog_enabled);
-            if (fog_enabled) {
-                fog_changed |= ImGui::SliderFloat("Fog Density", &fog_density, 0.0001f, 0.01f, "%.4f");
+            
+            const char* fog_modes[] = { "Off", "Linear", "Exponential", "Exponential Squared" };
+            fog_changed |= ImGui::Combo("Fog Mode", &fog_mode, fog_modes, 4);
+            
+            if (fog_mode > 0) {
                 fog_changed |= ImGui::ColorEdit3("Fog Color", &fog_color.x);
+                
+                if (fog_mode == 1) {
+                    // Linear fog - use start/end distances
+                    fog_changed |= ImGui::SliderFloat("Fog Start", &fog_start, 0.0f, 500.0f, "%.0f m");
+                    fog_changed |= ImGui::SliderFloat("Fog End", &fog_end, 10.0f, 2000.0f, "%.0f m");
+                    if (fog_start >= fog_end) fog_end = fog_start + 10.0f;
+                } else {
+                    // Exponential fog modes - use density
+                    fog_changed |= ImGui::SliderFloat("Fog Density", &fog_density, 0.0001f, 0.05f, "%.4f", ImGuiSliderFlags_Logarithmic);
+                }
             }
+            
             if (fog_changed) {
-                m_gpu_renderer->set_fog(fog_enabled, fog_color, fog_density);
+                m_gpu_renderer->set_fog(fog_mode, fog_color, fog_start, fog_end, fog_density);
             }
         }
 

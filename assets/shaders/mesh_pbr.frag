@@ -80,6 +80,35 @@ vec3 tonemap_aces(vec3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
+// Fog calculation
+// fog_params: x = start, y = end, z = density, w = enabled (0 = off, 1 = linear, 2 = exponential, 3 = exponential squared)
+vec3 apply_fog(vec3 color, float distance) {
+    if (scene.fog_params.w < 0.5) {
+        return color; // Fog disabled
+    }
+    
+    float fog_start = scene.fog_params.x;
+    float fog_end = scene.fog_params.y;
+    float fog_density = scene.fog_params.z;
+    float fog_mode = scene.fog_params.w;
+    
+    float fog_factor = 0.0;
+    
+    if (fog_mode < 1.5) {
+        // Linear fog
+        fog_factor = clamp((fog_end - distance) / (fog_end - fog_start), 0.0, 1.0);
+    } else if (fog_mode < 2.5) {
+        // Exponential fog
+        fog_factor = exp(-fog_density * distance);
+    } else {
+        // Exponential squared fog
+        float d = fog_density * distance;
+        fog_factor = exp(-d * d);
+    }
+    
+    return mix(scene.fog_color.rgb, color, fog_factor);
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -164,6 +193,10 @@ void main() {
 
     // Final color
     vec3 color = ambient + Lo;
+
+    // Apply fog based on distance from camera
+    float frag_distance = length(frag_world_pos - scene.camera_position.xyz);
+    color = apply_fog(color, frag_distance);
 
     // Tone mapping and gamma correction
     color = tonemap_aces(color);
