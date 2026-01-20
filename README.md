@@ -7,23 +7,27 @@ Stratum is a desktop application for converting OpenStreetMap data into optimize
 
 It (will) support kitbashing, LOD generation, MaterialX materials, and exports to industry-standard formats.
 
+NB: Docs and C4 Diagrams are AI-Generated / Made with LLM based tools. Trust but verify.
+
 ---
 
-## Features (To Be Implemented)
+## Features
 
-- OSM Import:  Parse `.osm` and `.pbf` files via libosmium
-- Mesh Generation:  Extrude buildings, generate roads, terrain, landuse
-- Triangulation:  Fast polygon triangulation with earcut
-- MaterialX:  Industry-standard, cross-application material definitions
-- GPU Compression:  Basis Universal / KTX2 for VRAM-efficient textures
-- LOD Generation:  Automatic mesh simplification via meshoptimizer
-- Texture Atlasing:  Reduce draw calls with packed textures
-- Debug Visualization:  BVH bounds, LOD rings, chunk boundaries
-- Node Editor:  Visual material graph editing
-- Python Scripting:  Automate workflows, batch processing
-- Formats:  glTF, FBX, OBJ via Assimp
-- Materials:  Embedded MaterialX or converted PBR
-- Profiling:  Tracy integration for CPU/GPU profiling
+Completed ( or mostly completed ) features are checked. this is not in order.
+
+- [x] OSM Import:  Parse `.osm` and `.pbf` files via libosmium
+- [x] Mesh Generation:  Extrude buildings, generate roads, terrain, landuse
+- [ ] Triangulation:  Fast polygon triangulation with earcut
+- [ ] MaterialX:  Industry-standard, cross-application material definitions
+- [ ] GPU Compression:  Basis Universal / KTX2 for VRAM-efficient textures
+- [ ] LOD Generation:  Automatic mesh simplification via meshoptimizer
+- [ ] Texture Atlasing:  Reduce draw calls with packed textures
+- [ ] Debug Visualization:  BVH bounds, LOD rings, chunk boundaries
+- [ ] Node Editor:  Visual material graph editing
+- [ ] Python Scripting:  Automate workflows, batch processing
+- [ ] Formats:  glTF, FBX, OBJ via Assimp
+- [ ] Materials:  Embedded MaterialX or converted PBR
+- [ ] Profiling:  Tracy integration for CPU/GPU profiling
 
 ---
 
@@ -64,6 +68,8 @@ cmake --build build -j$(nproc) && ./build/bin/stratum
 ```
 
 ### Build Options
+
+Right now these dont do buch, but hopefully they will soon
 
 NB: Python scripting will *eventually*(tm) be always on
 
