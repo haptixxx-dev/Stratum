@@ -1,0 +1,351 @@
+@startuml C4_SystemContext
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+LAYOUT_WITH_LEGEND()
+
+title System Context Diagram for Stratum
+
+Person(developer, "Developer", "Creates and edits 3D city maps from OpenStreetMap data")
+Person(game_dev, "Game Developer", "Integrates generated 3D maps into game engines")
+
+System(stratum, "Stratum", "Application for converting OpenStreetMap data into optimized, textured 3D maps with procedural generation capabilities")
+
+System_Ext(osm_data, "OpenStreetMap", "Provides geographic data including roads, buildings, land use, and POIs")
+System_Ext(game_engine, "Game Engine (X3)", "Target platform for exported 3D city data")
+System_Ext(dcc_tools, "DCC Tools", "3D modeling software (Blender, Maya) for further editing of exported assets")
+
+Rel(developer, stratum, "Uses", "GUI Editor")
+Rel(game_dev, stratum, "Integrates", "Core Library")
+Rel(stratum, osm_data, "Imports from", ".osm/.pbf files")
+Rel(stratum, game_engine, "Exports to", "JSON/Binary format")
+Rel(stratum, dcc_tools, "Exports to", "glTF/FBX/OBJ")
+
+@enduml
+
+@startuml C4_Container
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Container Diagram for Stratum
+
+Person(developer, "Developer", "Creates and edits 3D city maps")
+
+System_Boundary(stratum, "Stratum") {
+    Container(editor, "Stratum Editor", "C++20, SDL3, ImGui", "Lightweight visualization and editing tool for debugging and iterating on generated city data")
+
+    Container(core_lib, "Stratum Core Library", "C++20, Static Library", "Pure logic library containing OSM processing, procedural generation, and scene management. No graphics API dependencies.")
+
+    ContainerDb(cache, "Asset Cache", "File System", "Cached tile data, textures, and processed OSM data")
+
+    ContainerDb(projects, "Project Files", "File System", "User projects with scene data and settings")
+}
+
+System_Ext(osm, "OpenStreetMap Data", ".osm/.pbf files")
+System_Ext(gpu, "GPU", "Vulkan/Metal/D3D12 via SDL3 GPU API")
+
+Rel(developer, editor, "Uses", "GUI")
+Rel(editor, core_lib, "Uses", "C++ API")
+Rel(editor, gpu, "Renders via", "SDL_GPU")
+Rel(core_lib, osm, "Parses", "libosmium")
+Rel(core_lib, cache, "Reads/Writes")
+Rel(editor, projects, "Loads/Saves")
+
+@enduml
+
+@startuml C4_Component_CoreLib
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Component Diagram - Stratum Core Library
+
+Container_Boundary(core_lib, "Stratum Core Library") {
+    Component(scene, "Scene Module", "EnTT, GLM", "Entity Component System for managing scene graph, spatial indexing, and entity queries")
+
+    Component(osm_module, "OSM Module", "libosmium, Clipper2", "Parses OSM files, extracts geographic features, manages tile-based data loading")
+
+    Component(procgen, "ProcGen Module", "C++20", "Procedural generation algorithms: terrain, road networks, zoning, lot subdivision")
+
+    Component(mesh_builder, "Mesh Builder", "earcut, meshoptimizer", "Generates 3D meshes from 2D data: building extrusion, road geometry, triangulation")
+
+    Component(materials, "Materials Module", "MaterialX", "Material definitions, tag-to-material mapping, shader parameter management")
+
+    Component(exporter, "Export Module", "Assimp", "Exports scene data to glTF, FBX, OBJ, and engine-specific formats")
+}
+
+Rel(osm_module, scene, "Creates entities in")
+Rel(procgen, scene, "Generates entities in")
+Rel(procgen, osm_module, "Uses data from")
+Rel(mesh_builder, osm_module, "Builds geometry from")
+Rel(mesh_builder, scene, "Attaches meshes to")
+Rel(materials, mesh_builder, "Provides materials to")
+Rel(exporter, scene, "Reads from")
+Rel(exporter, mesh_builder, "Exports meshes from")
+
+@enduml
+
+@startuml C4_Component_Editor
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Component Diagram - Stratum Editor
+
+Container_Boundary(editor, "Stratum Editor") {
+    Component(app_core, "Application Core", "SDL3", "Window management, event handling, main loop control")
+
+    Component(renderer, "Renderer", "SDL_GPU", "GPU device management, pipeline creation, mesh rendering, texture handling")
+
+    Component(camera, "Camera System", "GLM", "Free-flight camera, frustum culling, view/projection matrices")
+
+    Component(debug_viz, "Debug Visualization", "Im3D", "Immediate-mode debug rendering: lines, points, shapes, grids")
+
+    Component(ui_panels, "UI Panels", "Dear ImGui", "Editor panels: viewport, scene hierarchy, properties, OSM import")
+
+    Component(gizmos, "Gizmos", "ImGuizmo", "3D manipulation gizmos for translate, rotate, scale operations")
+}
+
+Container_Ext(core_lib, "Stratum Core Library")
+
+Rel(app_core, renderer, "Initializes")
+Rel(ui_panels, app_core, "Runs in")
+Rel(ui_panels, core_lib, "Calls")
+Rel(renderer, camera, "Uses")
+Rel(debug_viz, renderer, "Renders through")
+Rel(debug_viz, core_lib, "Visualizes data from")
+Rel(gizmos, ui_panels, "Embedded in")
+Rel(gizmos, camera, "Projects via")
+
+@enduml
+
+@startuml C4_Component_Scene
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Component Diagram - Scene Module
+
+Container_Boundary(scene_module, "Scene Module") {
+    Component(registry, "Entity Registry", "EnTT", "Central ECS registry managing all entities and their components")
+
+    Component(spatial_index, "Spatial Index", "BVH", "Bounding Volume Hierarchy for efficient spatial queries and frustum culling")
+
+    Component(transform_sys, "Transform System", "GLM", "Manages entity positions, rotations, scales, and world matrices")
+
+    Component(components, "Component Types", "C++ structs", "TransformComponent, MeshComponent, MaterialComponent, BoundsComponent, TagComponent, OSMMetadataComponent")
+
+    Component(query_sys, "Query System", "EnTT views", "Efficient queries for visible entities, spatial lookups, component filtering")
+}
+
+Rel(registry, components, "Stores")
+Rel(spatial_index, registry, "Indexes entities from")
+Rel(transform_sys, registry, "Updates transforms in")
+Rel(query_sys, registry, "Queries")
+Rel(query_sys, spatial_index, "Uses for culling")
+
+@enduml
+
+@startuml C4_Component_OSM
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Component Diagram - OSM Module
+
+Container_Boundary(osm_module, "OSM Module") {
+    Component(parser, "OSM Parser", "libosmium", "Parses .osm XML and .pbf binary files, extracts nodes, ways, relations")
+
+    Component(coord_system, "Coordinate System", "C++", "Converts lat/lon to local Cartesian coordinates, handles projections")
+
+    Component(feature_classifier, "Feature Classifier", "C++", "Classifies OSM ways by tags: buildings, roads, water, land use, POIs")
+
+    Component(tile_manager, "Tile Manager", "C++", "Manages tile-based loading/unloading, tracks loaded regions, handles LOD")
+
+    Component(road_network, "Road Network Builder", "C++", "Constructs road graph from ways, handles intersections, lane widths")
+
+    Component(building_extractor, "Building Extractor", "Clipper2", "Extracts building footprints, handles multipolygon relations")
+}
+
+Rel(parser, coord_system, "Coordinates to")
+Rel(parser, feature_classifier, "Features to")
+Rel(feature_classifier, building_extractor, "Building data to")
+Rel(feature_classifier, road_network, "Road data to")
+Rel(tile_manager, parser, "Requests parsing from")
+Rel(tile_manager, building_extractor, "Manages")
+Rel(tile_manager, road_network, "Manages")
+
+@enduml
+
+@startuml C4_Component_ProcGen
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Component Diagram - ProcGen Module
+
+Container_Boundary(procgen_module, "ProcGen Module") {
+    Component(terrain_gen, "Terrain Generator", "C++", "Generates terrain meshes, elevation data, natural features")
+
+    Component(road_gen, "Road Network Generator", "C++", "Converts OSM ways to road segments with width, lanes, intersections")
+
+    Component(zoning, "Zoning System", "C++", "Assigns zone types (residential, commercial, industrial) to empty areas")
+
+    Component(lot_subdivision, "Lot Subdivision", "Clipper2", "Subdivides large blocks into individual buildable lots/parcels")
+
+    Component(building_gen, "Building Generator", "C++", "Generates building volumes from footprints, handles roof types, heights")
+}
+
+Rel(road_gen, zoning, "Road network informs")
+Rel(zoning, lot_subdivision, "Zones feed into")
+Rel(lot_subdivision, building_gen, "Lots feed into")
+Rel(terrain_gen, road_gen, "Terrain constrains")
+
+@enduml
+
+@startuml C4_Component_Renderer
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Component Diagram - Renderer Module
+
+Container_Boundary(renderer_module, "Renderer Module") {
+    Component(gpu_device, "GPU Device", "SDL_GPU", "Manages GPU context, creates resources, handles command submission")
+
+    Component(pipeline_mgr, "Pipeline Manager", "C++", "Creates and caches graphics pipelines, shader compilation")
+
+    Component(mesh_renderer, "Mesh Renderer", "C++", "Manages vertex/index buffers, draws meshes, handles instancing")
+
+    Component(texture_mgr, "Texture Manager", "KTX", "Loads and manages GPU textures, texture arrays, mipmaps")
+
+    Component(camera_sys, "Camera", "GLM", "View/projection matrices, frustum generation, screen-to-world projection")
+
+    Component(culling, "Culling System", "C++", "Frustum culling, occlusion queries, LOD selection")
+}
+
+Rel(gpu_device, pipeline_mgr, "Creates pipelines via")
+Rel(gpu_device, mesh_renderer, "Creates buffers via")
+Rel(gpu_device, texture_mgr, "Creates textures via")
+Rel(mesh_renderer, pipeline_mgr, "Binds pipelines from")
+Rel(mesh_renderer, texture_mgr, "Binds textures from")
+Rel(culling, camera_sys, "Uses frustum from")
+Rel(culling, mesh_renderer, "Filters draw calls for")
+
+@enduml
+
+@startuml C4_Dynamic_AppLifecycle
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Dynamic.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Dynamic Diagram - Application Lifecycle
+
+ContainerDb(main, "main()")
+Container(app, "Application")
+Container(window, "Window")
+Container(imgui, "ImGui")
+Container(renderer, "Renderer")
+
+Rel(main, app, "1. Creates")
+Rel(app, window, "2. Initializes SDL3 window")
+Rel(app, imgui, "3. Initializes ImGui context")
+Rel(app, renderer, "4. Initializes GPU device")
+Rel(app, app, "5. Enters main loop")
+Rel(app, app, "6. Process events -> Update -> Render")
+Rel(app, renderer, "7. Shutdown renderer")
+Rel(app, imgui, "8. Shutdown ImGui")
+Rel(app, window, "9. Shutdown window")
+
+@enduml
+
+@startuml C4_Dynamic_OSMImport
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Dynamic.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Dynamic Diagram - OSM Import Flow
+
+Person(user, "User")
+Container(osm_panel, "OSM Panel")
+Container(parser, "OSM Parser")
+Container(classifier, "Feature Classifier")
+Container(mesh_builder, "Mesh Builder")
+Container(scene, "Scene")
+
+Rel(user, osm_panel, "1. Selects .osm/.pbf file")
+Rel(osm_panel, parser, "2. parse_file(path)")
+Rel(parser, parser, "3. Extract nodes, ways, relations")
+Rel(parser, classifier, "4. Classify features by tags")
+Rel(classifier, mesh_builder, "5. Build buildings, roads, terrain")
+Rel(mesh_builder, scene, "6. Create entities with components")
+Rel(scene, osm_panel, "7. Import complete")
+
+@enduml
+
+@startuml C4_Dynamic_FrameRender
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Dynamic.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Dynamic Diagram - Frame Rendering Flow
+
+Container(app, "Application")
+Container(events, "Event System")
+Container(scene, "Scene")
+Container(culling, "Culling System")
+Container(renderer, "Renderer")
+Container(imgui, "ImGui")
+
+Rel(app, events, "1. Poll SDL events")
+Rel(events, imgui, "2. Forward to ImGui")
+Rel(app, scene, "3. Update scene systems")
+Rel(scene, culling, "4. Frustum cull visible entities")
+Rel(culling, renderer, "5. Submit draw calls")
+Rel(renderer, renderer, "6. Sort by material/depth")
+Rel(renderer, renderer, "7. Execute render pass")
+Rel(app, imgui, "8. Render UI overlay")
+Rel(renderer, renderer, "9. Present frame")
+
+@enduml
+
+@startuml C4_Deployment
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Deployment Diagram - Stratum
+
+Deployment_Node(user_machine, "User's Machine", "Windows/macOS/Linux") {
+    Deployment_Node(os, "Operating System") {
+        Deployment_Node(gpu_driver, "GPU Driver", "Vulkan/Metal/D3D12") {
+            Container(gpu, "GPU", "Graphics Processing")
+        }
+
+        Deployment_Node(filesystem, "File System") {
+            ContainerDb(projects, "Projects", "User project files")
+            ContainerDb(cache, "Cache", "Tile cache, textures")
+            ContainerDb(settings, "Settings", "User preferences")
+        }
+    }
+
+    Deployment_Node(app_dir, "Application Directory") {
+        Container(stratum_exe, "stratum", "Executable")
+        Container(sdl3_lib, "SDL3", "Shared Library")
+
+        Deployment_Node(assets, "Assets") {
+            ContainerDb(shaders, "Shaders", "GPU shader code")
+            ContainerDb(materials, "Default Materials", "MaterialX files")
+            ContainerDb(ui_assets, "UI Assets", "Fonts, icons")
+        }
+    }
+}
+
+Rel(stratum_exe, sdl3_lib, "Links")
+Rel(stratum_exe, gpu, "Renders via")
+Rel(stratum_exe, projects, "Reads/Writes")
+Rel(stratum_exe, cache, "Caches to")
+Rel(stratum_exe, shaders, "Loads")
+Rel(stratum_exe, materials, "Loads")
+
+@enduml
