@@ -25,12 +25,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            plantuml \
             pandoc \
             texlive-xetex \
             texlive-fonts-recommended \
             texlive-fonts-extra \
-            fonts-dejavu
+            fonts-dejavu \
+            graphviz
+
+      - name: Download PlantUML
+        run: |
+          wget -q https://github.com/plantuml/plantuml/releases/download/v1.2024.8/plantuml-1.2024.8.jar -O plantuml.jar
 
       - name: Create output directories
         run: |
@@ -40,7 +44,7 @@ jobs:
       - name: Generate PlantUML diagrams
         run: |
           cd docs
-          plantuml -tpng -Sdpi=150 c4-architecture.puml -o images/c4/
+          java -jar ../plantuml.jar -tpng -Sdpi=150 c4-architecture.puml -o images/c4/
           echo "Generated diagrams:"
           ls -la images/c4/
 
