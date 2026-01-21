@@ -5,6 +5,9 @@
 #include "osm/parser.hpp"
 #include "osm/mesh_builder.hpp"
 #include "osm/tile_manager.hpp"
+#include "procgen/terrain_generator.hpp"
+#include "procgen/terrain_mesh_builder.hpp"
+#include "procgen/terrain_tile_manager.hpp"
 #include "renderer/mesh.hpp"
 #include "editor/camera.hpp"
 
@@ -41,8 +44,17 @@ private:
     void draw_properties();
     void draw_console();
     void draw_osm_panel();
+    void draw_procgen_panel();
     void draw_toolbar();
     void draw_render_settings();
+    
+    // Procgen helpers
+    void generate_terrain();
+    void clear_terrain();
+    void generate_chunked_terrain();
+    void clear_chunked_terrain();
+    void draw_chunked_terrain_ui();
+    void draw_legacy_terrain_ui();
 
     bool m_viewport_focused = false;
     bool m_viewport_hovered = false;
@@ -55,6 +67,7 @@ private:
     bool m_show_properties = true;
     bool m_show_console = true;
     bool m_show_osm_panel = true;
+    bool m_show_procgen_panel = true;
     bool m_show_render_settings = false;
 
     // Render toggles
@@ -128,6 +141,23 @@ private:
     bool check_camera_dirty();  // Returns true if camera moved enough to warrant rebuild
     void upload_tile_to_gpu(osm::Tile& tile, GPURenderer& renderer);
     void release_tile_from_gpu(osm::Tile& tile, GPURenderer& renderer);
+
+    // Procedural Generation (single terrain - legacy)
+    procgen::TerrainGenerator m_terrain_generator;
+    procgen::TerrainConfig m_terrain_config;
+    procgen::TerrainMeshConfig m_terrain_mesh_config;
+    procgen::Heightmap m_terrain_heightmap;
+    Mesh m_terrain_mesh;
+    Mesh m_water_mesh;
+    uint32_t m_terrain_gpu_id = 0;
+    uint32_t m_water_gpu_id = 0;
+    bool m_render_terrain = true;
+    bool m_render_water = true;
+    
+    // Chunked terrain system (new)
+    procgen::TerrainTileManager m_terrain_tile_manager;
+    procgen::TerrainTileConfig m_terrain_tile_config;
+    bool m_use_chunked_terrain = true;  // Use new chunked system vs legacy single terrain
 };
 
 } // namespace stratum

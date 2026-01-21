@@ -153,13 +153,19 @@ RENDERING (v1 Minimum)
                     PART 2: PROCEDURAL CITY GENERATOR
 ================================================================================
 
-[ ] Terrain Generation
-    - Heightmap generation (Perlin/Simplex noise layers)
-    - Water bodies:
+[x] Terrain Generation (src/procgen/)
+    [x] Heightmap generation (Simplex noise with fBm, ridged multifractal)
+    [x] Configurable terrain types (Flat, Rolling, Hilly, Mountainous)
+    [x] Height-based and slope-based coloring (biome system)
+    [x] LOD support for terrain meshes
+    [x] Water plane mesh generation
+    [x] Center flattening for city placement
+    [x] Simple thermal erosion
+    - Water bodies (future):
         * Rivers (flow simulation or noise-based paths)
         * Lakes (low elevation flooding)
         * Coastlines
-    - Slope and elevation analysis for buildability
+    [x] Slope and elevation analysis for buildability
 
 [ ] Road Network Generation
     - Primary roads (L-system or tensor field based):
@@ -257,8 +263,8 @@ PHASE 2: OSM Polish [COMPLETE]
     [x] Building roof styles
     [x] Area triangulation
 
-PHASE 3: Procedural Foundation
-    [ ] Terrain heightmap generation
+PHASE 3: Procedural Foundation [IN PROGRESS]
+    [x] Terrain heightmap generation
     [ ] Basic road network (grid + highways)
     [ ] Simple block generation
 

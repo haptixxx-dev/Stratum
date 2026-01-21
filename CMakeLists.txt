@@ -54,7 +54,11 @@ add_library(stratum_core STATIC
     src/osm/mesh_builder.cpp
     src/osm/tile_manager.cpp
 
-
+    # Procedural Generation
+    src/procgen/noise.cpp
+    src/procgen/terrain_generator.cpp
+    src/procgen/terrain_mesh_builder.cpp
+    src/procgen/terrain_tile_manager.cpp
 )
 
 target_include_directories(stratum_core PUBLIC
@@ -74,15 +78,15 @@ target_link_libraries(stratum_core PUBLIC
     meshoptimizer
     draco::draco
     earcut
-    
+
     # Threading
     enkiTS
-    
+
     # Data & Utils
     spdlog::spdlog
     nlohmann_json::nlohmann_json
     EnTT::EnTT
-    
+
     # Spatial
     bvh
 )
@@ -98,14 +102,14 @@ add_library(stratum_editor_lib STATIC
     src/core/application.cpp
     src/core/window.cpp
     src/core/input.cpp
-    
+
     # Renderer
     src/renderer/gpu_device.cpp
     src/renderer/gpu_renderer.cpp
     src/renderer/pipeline.cpp
     src/renderer/mesh.cpp
     src/renderer/texture.cpp
-    
+
     # Editor
     src/editor/editor.cpp
     src/editor/camera.cpp
@@ -114,6 +118,7 @@ add_library(stratum_editor_lib STATIC
     src/editor/panels/scene_panel.cpp
     src/editor/panels/properties_panel.cpp
     src/editor/panels/osm_panel.cpp
+    src/editor/panels/procgen_panel.cpp
     src/editor/gizmos.cpp
 )
 
@@ -128,20 +133,20 @@ target_link_libraries(stratum_editor_lib PUBLIC
     # Core
     SDL3::SDL3
     imgui
-    
+
     # Import/Export
     assimp
 
     # Materials
     MaterialXCore
     MaterialXFormat
-    
+
     # Textures
     ktx
-    
+
     # Compression
     lz4
-    
+
     # Editor
     ImGuizmo
     im3d
@@ -179,17 +184,17 @@ install(DIRECTORY scripts/ DESTINATION share/stratum/scripts)
 # ═══════════════════════════════════════════════════════════════════
 if(STRATUM_BUILD_DOCS)
     find_package(Doxygen REQUIRED)
-    
+
     if(DOXYGEN_FOUND)
         set(DOXYGEN_IN ${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile)
-        
+
         add_custom_target(docs
             COMMAND ${DOXYGEN_EXECUTABLE} ${DOXYGEN_IN}
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
             COMMENT "Generating API documentation with Doxygen"
             VERBATIM
         )
-        
+
         message(STATUS "Doxygen found: Documentation target 'docs' available")
     else()
         message(WARNING "Doxygen not found: Documentation will not be built")

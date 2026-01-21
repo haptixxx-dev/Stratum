@@ -75,6 +75,7 @@ void Editor::render() {
     if (m_show_properties) draw_properties();
     if (m_show_console) draw_console();
     if (m_show_osm_panel) draw_osm_panel();
+    if (m_show_procgen_panel) draw_procgen_panel();
     if (m_show_render_settings) draw_render_settings();
 }
 
@@ -209,6 +210,7 @@ void Editor::draw_menu_bar() {
             ImGui::MenuItem("Properties", nullptr, &m_show_properties);
             ImGui::MenuItem("Console", nullptr, &m_show_console);
             ImGui::MenuItem("OSM Panel", nullptr, &m_show_osm_panel);
+            ImGui::MenuItem("Procgen Panel", nullptr, &m_show_procgen_panel);
             ImGui::MenuItem("Render Settings", nullptr, &m_show_render_settings);
             ImGui::Separator();
             ImGui::MenuItem("ImGui Demo", nullptr, &m_show_demo_window);
@@ -1403,6 +1405,58 @@ void Editor::render_3d(GPURenderer& renderer) {
         }
         if (m_render_buildings) {
             for (uint32_t id : tile->building_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
+        }
+    }
+
+    // Render procedural terrain
+    if (m_use_chunked_terrain) {
+        // Render chunked terrain
+        if (m_render_terrain) {
+            for (const auto& coord : m_terrain_tile_manager.get_all_chunks()) {
+                auto* chunk = const_cast<procgen::TerrainChunk*>(m_terrain_tile_manager.get_chunk(coord));
+                if (!chunk || !chunk->mesh_built) continue;
+                
+                // Upload to GPU if needed
+                if (!chunk->gpu_uploaded && m_gpu_renderer) {
+                    if (chunk->terrain_mesh.is_valid()) {
+                        chunk->terrain_gpu_id = m_gpu_renderer->upload_mesh(chunk->terrain_mesh);
+                    }
+                    if (chunk->water_mesh.is_valid()) {
+                        chunk->water_gpu_id = m_gpu_renderer->upload_mesh(chunk->water_mesh);
+                    }
+                    chunk->gpu_uploaded = true;
+                }
+                
+                // Frustum culling
+                if (m_use_tile_culling && !frustum.intersects_aabb(chunk->bounds_min, chunk->bounds_max)) {
+                    continue;
+                }
+                
+                // Distance culling
+                if (m_use_distance_culling) {
+                    glm::vec3 chunk_center = (chunk->bounds_min + chunk->bounds_max) * 0.5f;
+                    float dist_sq = glm::dot(chunk_center - cam_pos, chunk_center - cam_pos);
+                    if (dist_sq > radius_sq) continue;
+                }
+                
+                // Draw terrain
+                if (chunk->terrain_gpu_id != 0) {
+                    renderer.draw_mesh(chunk->terrain_gpu_id, model, glm::vec4(1.0f));
+                }
+                
+                // Draw water
+                if (m_render_water && chunk->water_gpu_id != 0) {
+                    renderer.draw_mesh(chunk->water_gpu_id, model, glm::vec4(1.0f));
+                }
+            }
+        }
+    } else {
+        // Legacy single terrain rendering
+        if (m_render_terrain && m_terrain_gpu_id != 0) {
+            renderer.draw_mesh(m_terrain_gpu_id, model, glm::vec4(1.0f));
+        }
+        if (m_render_water && m_water_gpu_id != 0) {
+            renderer.draw_mesh(m_water_gpu_id, model, glm::vec4(1.0f));
         }
     }
 }
