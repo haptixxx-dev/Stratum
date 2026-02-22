@@ -169,40 +169,64 @@ void TileManager::build_tile_meshes(TileCoord coord) {
     auto* tile = get_tile(coord);
     if (!tile || tile->meshes_built) return;
 
-    // Build road meshes
-    tile->road_meshes.reserve(tile->roads.size());
-    for (const auto& road : tile->roads) {
-        Mesh mesh = MeshBuilder::build_road_mesh(road);
-        if (mesh.is_valid()) {
-            tile->road_meshes.push_back(std::move(mesh));
-        }
-    }
-
-    // Build junction meshes for roads in this tile and add to road_meshes
-    if (!tile->roads.empty()) {
-        auto junctions = MeshBuilder::build_junction_meshes(tile->roads);
-        for (auto& junction : junctions) {
-            if (junction.is_valid()) {
-                tile->road_meshes.push_back(std::move(junction));
+    // Build individual road meshes, then merge into one
+    {
+        std::vector<Mesh> individual;
+        individual.reserve(tile->roads.size());
+        for (const auto& road : tile->roads) {
+            Mesh mesh = MeshBuilder::build_road_mesh(road);
+            if (mesh.is_valid()) {
+                individual.push_back(std::move(mesh));
             }
         }
-    }
 
-    // Build building meshes
-    tile->building_meshes.reserve(tile->buildings.size());
-    for (const auto& building : tile->buildings) {
-        Mesh mesh = MeshBuilder::build_building_mesh(building);
-        if (mesh.is_valid()) {
-            tile->building_meshes.push_back(std::move(mesh));
+        // Add junction meshes
+        if (!tile->roads.empty()) {
+            auto junctions = MeshBuilder::build_junction_meshes(tile->roads);
+            for (auto& junction : junctions) {
+                if (junction.is_valid()) {
+                    individual.push_back(std::move(junction));
+                }
+            }
+        }
+
+        Mesh merged = MeshBuilder::merge_meshes(individual);
+        if (merged.is_valid()) {
+            tile->road_meshes.push_back(std::move(merged));
         }
     }
 
-    // Build area meshes
-    tile->area_meshes.reserve(tile->areas.size());
-    for (const auto& area : tile->areas) {
-        Mesh mesh = MeshBuilder::build_area_mesh(area);
-        if (mesh.is_valid()) {
-            tile->area_meshes.push_back(std::move(mesh));
+    // Build individual building meshes, then merge into one
+    {
+        std::vector<Mesh> individual;
+        individual.reserve(tile->buildings.size());
+        for (const auto& building : tile->buildings) {
+            Mesh mesh = MeshBuilder::build_building_mesh(building);
+            if (mesh.is_valid()) {
+                individual.push_back(std::move(mesh));
+            }
+        }
+
+        Mesh merged = MeshBuilder::merge_meshes(individual);
+        if (merged.is_valid()) {
+            tile->building_meshes.push_back(std::move(merged));
+        }
+    }
+
+    // Build individual area meshes, then merge into one
+    {
+        std::vector<Mesh> individual;
+        individual.reserve(tile->areas.size());
+        for (const auto& area : tile->areas) {
+            Mesh mesh = MeshBuilder::build_area_mesh(area);
+            if (mesh.is_valid()) {
+                individual.push_back(std::move(mesh));
+            }
+        }
+
+        Mesh merged = MeshBuilder::merge_meshes(individual);
+        if (merged.is_valid()) {
+            tile->area_meshes.push_back(std::move(merged));
         }
     }
 
@@ -257,40 +281,63 @@ size_t TileManager::total_areas() const {
 TileManager::BuiltMeshes TileManager::build_tile_meshes_internal(const Tile& tile) {
     BuiltMeshes result;
 
-    // Build road meshes
-    result.road_meshes.reserve(tile.roads.size());
-    for (const auto& road : tile.roads) {
-        Mesh mesh = MeshBuilder::build_road_mesh(road);
-        if (mesh.is_valid()) {
-            result.road_meshes.push_back(std::move(mesh));
-        }
-    }
-
-    // Build junction meshes
-    if (!tile.roads.empty()) {
-        auto junctions = MeshBuilder::build_junction_meshes(tile.roads);
-        for (auto& junction : junctions) {
-            if (junction.is_valid()) {
-                result.road_meshes.push_back(std::move(junction));
+    // Build and merge road meshes into one
+    {
+        std::vector<Mesh> individual;
+        individual.reserve(tile.roads.size());
+        for (const auto& road : tile.roads) {
+            Mesh mesh = MeshBuilder::build_road_mesh(road);
+            if (mesh.is_valid()) {
+                individual.push_back(std::move(mesh));
             }
         }
-    }
 
-    // Build building meshes
-    result.building_meshes.reserve(tile.buildings.size());
-    for (const auto& building : tile.buildings) {
-        Mesh mesh = MeshBuilder::build_building_mesh(building);
-        if (mesh.is_valid()) {
-            result.building_meshes.push_back(std::move(mesh));
+        if (!tile.roads.empty()) {
+            auto junctions = MeshBuilder::build_junction_meshes(tile.roads);
+            for (auto& junction : junctions) {
+                if (junction.is_valid()) {
+                    individual.push_back(std::move(junction));
+                }
+            }
+        }
+
+        Mesh merged = MeshBuilder::merge_meshes(individual);
+        if (merged.is_valid()) {
+            result.road_meshes.push_back(std::move(merged));
         }
     }
 
-    // Build area meshes
-    result.area_meshes.reserve(tile.areas.size());
-    for (const auto& area : tile.areas) {
-        Mesh mesh = MeshBuilder::build_area_mesh(area);
-        if (mesh.is_valid()) {
-            result.area_meshes.push_back(std::move(mesh));
+    // Build and merge building meshes into one
+    {
+        std::vector<Mesh> individual;
+        individual.reserve(tile.buildings.size());
+        for (const auto& building : tile.buildings) {
+            Mesh mesh = MeshBuilder::build_building_mesh(building);
+            if (mesh.is_valid()) {
+                individual.push_back(std::move(mesh));
+            }
+        }
+
+        Mesh merged = MeshBuilder::merge_meshes(individual);
+        if (merged.is_valid()) {
+            result.building_meshes.push_back(std::move(merged));
+        }
+    }
+
+    // Build and merge area meshes into one
+    {
+        std::vector<Mesh> individual;
+        individual.reserve(tile.areas.size());
+        for (const auto& area : tile.areas) {
+            Mesh mesh = MeshBuilder::build_area_mesh(area);
+            if (mesh.is_valid()) {
+                individual.push_back(std::move(mesh));
+            }
+        }
+
+        Mesh merged = MeshBuilder::merge_meshes(individual);
+        if (merged.is_valid()) {
+            result.area_meshes.push_back(std::move(merged));
         }
     }
 

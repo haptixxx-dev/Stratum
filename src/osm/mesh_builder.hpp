@@ -32,6 +32,14 @@ public:
      */
     static std::vector<Mesh> build_junction_meshes(const std::vector<Road>& roads);
 
+    /**
+     * @brief Merge multiple meshes into a single mesh
+     *
+     * Combines all vertices and indices (with proper index offsetting) into
+     * one mesh to reduce draw calls. Per-vertex colors are preserved.
+     */
+    static Mesh merge_meshes(const std::vector<Mesh>& meshes);
+
 private:
 
 };

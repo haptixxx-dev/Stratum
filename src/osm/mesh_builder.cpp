@@ -735,4 +735,37 @@ std::vector<Mesh> MeshBuilder::build_junction_meshes(const std::vector<Road>& ro
     return junctions;
 }
 
+Mesh MeshBuilder::merge_meshes(const std::vector<Mesh>& meshes) {
+    if (meshes.empty()) return Mesh{};
+    if (meshes.size() == 1) return meshes[0];
+
+    // Pre-calculate total sizes for a single allocation
+    size_t total_verts = 0;
+    size_t total_indices = 0;
+    for (const auto& m : meshes) {
+        total_verts += m.vertices.size();
+        total_indices += m.indices.size();
+    }
+
+    Mesh merged;
+    merged.vertices.reserve(total_verts);
+    merged.indices.reserve(total_indices);
+
+    uint32_t base_vertex = 0;
+    for (const auto& m : meshes) {
+        // Append vertices directly
+        merged.vertices.insert(merged.vertices.end(), m.vertices.begin(), m.vertices.end());
+
+        // Append indices with offset
+        for (uint32_t idx : m.indices) {
+            merged.indices.push_back(idx + base_vertex);
+        }
+
+        base_vertex += static_cast<uint32_t>(m.vertices.size());
+    }
+
+    merged.compute_bounds();
+    return merged;
+}
+
 } // namespace stratum::osm
