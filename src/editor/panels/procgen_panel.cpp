@@ -49,25 +49,13 @@ void Editor::draw_chunked_terrain_ui() {
         ImGui::SliderInt("Chunk Resolution", &config.chunk_resolution, 16, 128);
         
         // Auto-fit to OSM bounds button
-        if (m_tile_manager.tile_count() > 0) {
+        if (m_quadtree.leaf_count() > 0) {
             if (ImGui::Button("Fit to OSM Data")) {
-                // Find bounds of all OSM tiles
-                // OSM tile bounds are in rendering coords: (x, y_height, -z_world)
-                glm::vec3 osm_min(std::numeric_limits<float>::max());
-                glm::vec3 osm_max(std::numeric_limits<float>::lowest());
-                
-                for (const auto& coord : m_tile_manager.get_all_tiles()) {
-                    const auto* tile = m_tile_manager.get_tile(coord);
-                    if (tile && tile->has_valid_bounds()) {
-                        osm_min = glm::min(osm_min, tile->bounds_min);
-                        osm_max = glm::max(osm_max, tile->bounds_max);
-                    }
-                }
-                
+                glm::vec3 osm_min, osm_max;
+                m_quadtree.get_bounds(osm_min, osm_max);
+
                 if (osm_min.x < osm_max.x) {
                     // Convert from rendering coords (x, y, -z) to terrain world coords (x, z)
-                    // In rendering: bounds_min.z is -max_world_z, bounds_max.z is -min_world_z
-                    // So world_z_min = -bounds_max.z, world_z_max = -bounds_min.z
                     float padding = config.chunk_size;
                     config.world_min = glm::vec2(osm_min.x - padding, -osm_max.z - padding);
                     config.world_max = glm::vec2(osm_max.x + padding, -osm_min.z + padding);
@@ -76,16 +64,8 @@ void Editor::draw_chunked_terrain_ui() {
             ImGui::SameLine();
             ImGui::TextDisabled("(?)");
             if (ImGui::IsItemHovered()) {
-                // Show current OSM bounds for debugging
-                glm::vec3 osm_min(std::numeric_limits<float>::max());
-                glm::vec3 osm_max(std::numeric_limits<float>::lowest());
-                for (const auto& coord : m_tile_manager.get_all_tiles()) {
-                    const auto* tile = m_tile_manager.get_tile(coord);
-                    if (tile && tile->has_valid_bounds()) {
-                        osm_min = glm::min(osm_min, tile->bounds_min);
-                        osm_max = glm::max(osm_max, tile->bounds_max);
-                    }
-                }
+                glm::vec3 osm_min, osm_max;
+                m_quadtree.get_bounds(osm_min, osm_max);
                 ImGui::SetTooltip("OSM bounds (render coords):\nMin: %.1f, %.1f, %.1f\nMax: %.1f, %.1f, %.1f",
                     osm_min.x, osm_min.y, osm_min.z, osm_max.x, osm_max.y, osm_max.z);
             }
@@ -337,20 +317,19 @@ void Editor::generate_chunked_terrain() {
     // Import OSM data for flattening if available
     const auto& osm_data = m_osm_parser.get_data();
     if (osm_data.stats.processed_roads > 0 || osm_data.stats.processed_buildings > 0) {
-        // Collect all OSM elements from tiles
+        // Collect all OSM elements from quadtree leaves
         std::vector<osm::Road> all_roads;
         std::vector<osm::Building> all_buildings;
         std::vector<osm::Area> all_areas;
-        
-        for (const auto& coord : m_tile_manager.get_all_tiles()) {
-            const auto* tile = m_tile_manager.get_tile(coord);
-            if (tile) {
-                all_roads.insert(all_roads.end(), tile->roads.begin(), tile->roads.end());
-                all_buildings.insert(all_buildings.end(), tile->buildings.begin(), tile->buildings.end());
-                all_areas.insert(all_areas.end(), tile->areas.begin(), tile->areas.end());
+
+        for (auto* leaf : m_quadtree.get_all_leaves()) {
+            if (leaf) {
+                all_roads.insert(all_roads.end(), leaf->roads.begin(), leaf->roads.end());
+                all_buildings.insert(all_buildings.end(), leaf->buildings.begin(), leaf->buildings.end());
+                all_areas.insert(all_areas.end(), leaf->areas.begin(), leaf->areas.end());
             }
         }
-        
+
         m_terrain_tile_manager.import_osm_data(all_roads, all_buildings, all_areas);
     }
     

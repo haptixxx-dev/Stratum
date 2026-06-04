@@ -38,26 +38,21 @@ void Editor::draw_osm_panel() {
         ImGui::Separator();
 
         // Navigation - Go to geometry
-        if (m_tile_manager.tile_count() > 0) {
+        if (m_quadtree.leaf_count() > 0) {
             if (ImGui::Button("Go to Geometry")) {
-                // Find first tile with valid bounds and teleport camera there
-                for (const auto& coord : m_tile_manager.get_all_tiles()) {
-                    const auto* tile = m_tile_manager.get_tile(coord);
-                    if (tile && tile->has_valid_bounds()) {
-                        glm::vec3 center = (tile->bounds_min + tile->bounds_max) * 0.5f;
-                        glm::vec3 cam_pos = center + glm::vec3(0.0f, 300.0f, 300.0f);
-                        m_camera.set_position(cam_pos);
-                        m_camera.set_target(center);
-                        
-                        // Disable culling temporarily to see everything
-                        m_use_distance_culling = false;
-                        m_use_tile_culling = false;
-                        break;
-                    }
-                }
+                glm::vec3 bounds_min, bounds_max;
+                m_quadtree.get_bounds(bounds_min, bounds_max);
+                glm::vec3 center = (bounds_min + bounds_max) * 0.5f;
+                glm::vec3 cam_pos = center + glm::vec3(0.0f, 300.0f, 300.0f);
+                m_camera.set_position(cam_pos);
+                m_camera.set_target(center);
+
+                // Disable culling temporarily to see everything
+                m_use_distance_culling = false;
+                m_use_tile_culling = false;
             }
             ImGui::SameLine();
-            ImGui::Text("(%zu tiles)", m_tile_manager.tile_count());
+            ImGui::Text("(%zu leaves)", m_quadtree.leaf_count());
         }
 
         ImGui::Separator();

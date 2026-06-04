@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <thread>
 
 namespace stratum {
 
@@ -307,16 +308,16 @@ void Editor::draw_viewport() {
         }
     }
 
-    // Poll for completed async tile builds
-    if (m_tile_manager.tile_count() > 0) {
-        size_t completed = m_tile_manager.poll_async_builds();
+    // Poll for completed async quadtree node builds
+    if (m_quadtree.leaf_count() > 0) {
+        size_t completed = m_quadtree.poll_async_builds();
         if (completed > 0) {
             m_batches_dirty = true;  // New meshes available, need to rebatch
         }
     }
 
     // Rebuild visible batches only when camera moves significantly or new meshes ready
-    if (m_tile_manager.tile_count() > 0 && (m_batches_dirty || check_camera_dirty())) {
+    if (m_quadtree.leaf_count() > 0 && (m_batches_dirty || check_camera_dirty())) {
         rebuild_visible_batches();
         m_batches_dirty = false;
     }
@@ -338,29 +339,29 @@ void Editor::draw_viewport() {
     Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,1,0), 2.0f, Im3d::Color(0, 255, 0));
     Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,0,1), 2.0f, Im3d::Color(0, 0, 255));
 
-    // Draw tile grid if enabled
-    if (m_show_tile_grid && m_tile_manager.tile_count() > 0) {
+    // Draw quadtree node boxes if enabled
+    if (m_show_tile_grid && m_quadtree.leaf_count() > 0) {
         Frustum frustum = m_camera.get_frustum();
-        for (const auto& coord : m_tile_manager.get_all_tiles()) {
-            const auto* tile = m_tile_manager.get_tile(coord);
-            if (!tile || !tile->has_valid_bounds()) continue;
+        for (auto* leaf : m_quadtree.get_all_leaves()) {
+            if (!leaf || !leaf->has_valid_bounds()) continue;
 
-            // Color based on state: green=visible+built, yellow=pending, red=culled
-            bool in_frustum = frustum.intersects_aabb(tile->bounds_min, tile->bounds_max);
+            // Color based on state and depth
+            bool in_frustum = frustum.intersects_aabb(leaf->bounds_min, leaf->bounds_max);
             Im3d::Color grid_color;
             if (!in_frustum) {
                 grid_color = Im3d::Color(255, 0, 0, 100);      // Red = culled
-            } else if (tile->meshes_pending) {
+            } else if (leaf->meshes_pending) {
                 grid_color = Im3d::Color(255, 200, 0, 200);    // Yellow = building
-            } else if (tile->meshes_built) {
-                grid_color = Im3d::Color(0, 255, 0, 200);      // Green = ready
+            } else if (leaf->meshes_built) {
+                // Color by depth: deeper = brighter green
+                int g = 100 + std::min(155, leaf->depth * 20);
+                grid_color = Im3d::Color(0, g, 0, 200);
             } else {
                 grid_color = Im3d::Color(100, 100, 100, 150);  // Gray = not yet queued
             }
 
-            // Draw tile bounding box edges
-            glm::vec3 mn = tile->bounds_min;
-            glm::vec3 mx = tile->bounds_max;
+            glm::vec3 mn = leaf->bounds_min;
+            glm::vec3 mx = leaf->bounds_max;
 
             // Bottom face
             Im3d::DrawLine(Im3d::Vec3(mn.x, mn.y, mn.z), Im3d::Vec3(mx.x, mn.y, mn.z), 1.5f, grid_color);
@@ -620,28 +621,14 @@ void Editor::draw_osm_panel() {
     // Culling controls
     ImGui::Checkbox("Frustum Culling", &m_use_tile_culling);
     ImGui::SameLine();
-    ImGui::Checkbox("Tile Grid", &m_show_tile_grid);
-    ImGui::SetNextItemWidth(120);
-    ImGui::SliderFloat("Tile Size", &m_tile_size, 50.0f, 2000.0f, "%.0f m");
-    if (ImGui::IsItemDeactivatedAfterEdit() && m_osm_parser.has_data()) {
-        rebuild_osm_meshes(); // Rebuild tiles with new size
+    ImGui::Checkbox("Node Grid", &m_show_tile_grid);
+    ImGui::Checkbox("Contribution Culling", &m_use_contribution_culling);
+    if (m_use_contribution_culling) {
+        ImGui::SetNextItemWidth(120);
+        ImGui::SliderFloat("Threshold (px)", &m_contribution_threshold, 1.0f, 20.0f, "%.1f");
     }
-    if (m_tile_manager.tile_count() > 0) {
-        // Count visible tiles using frustum
-        size_t visible_count = 0;
-        if (m_use_tile_culling) {
-            Frustum frustum = m_camera.get_frustum();
-            for (const auto& coord : m_tile_manager.get_all_tiles()) {
-                const auto* tile = m_tile_manager.get_tile(coord);
-                if (tile && tile->has_valid_bounds() &&
-                    frustum.intersects_aabb(tile->bounds_min, tile->bounds_max)) {
-                    visible_count++;
-                }
-            }
-        } else {
-            visible_count = m_tile_manager.tile_count();
-        }
-        ImGui::Text("(%zu/%zu tiles)", visible_count, m_tile_manager.tile_count());
+    if (m_quadtree.leaf_count() > 0) {
+        ImGui::Text("Leaves: %zu, Max Depth: %d", m_quadtree.leaf_count(), m_quadtree.max_depth());
     }
 
     ImGui::Separator();
@@ -814,7 +801,7 @@ void Editor::draw_osm_panel() {
         ImGui::Separator();
         if (ImGui::Button("Clear Data", ImVec2(-1, 0))) {
             m_osm_parser.clear();
-            m_tile_manager.clear();
+            m_quadtree.clear();
             m_building_meshes.clear();
             m_road_meshes.clear();
             m_area_meshes.clear();
@@ -947,38 +934,25 @@ void Editor::draw_render_settings() {
         ImGui::SliderFloat("View Radius", &m_view_radius, 500.0f, 20000.0f, "%.0f m");
     }
 
+    // Contribution culling
+    ImGui::Checkbox("Contribution Culling", &m_use_contribution_culling);
+    if (m_use_contribution_culling) {
+        ImGui::SetNextItemWidth(150);
+        ImGui::SliderFloat("Threshold (px)", &m_contribution_threshold, 1.0f, 20.0f, "%.1f");
+    }
+
     // Stats
-    if (m_tile_manager.tile_count() > 0) {
+    if (m_quadtree.leaf_count() > 0) {
         ImGui::Separator();
-        ImGui::Text("Statistics");
+        ImGui::Text("QuadTree Statistics");
 
-        size_t visible_count = 0;
-        size_t total_tris = 0;
-        Frustum frustum = m_camera.get_frustum();
-        glm::vec3 cam_pos = m_camera.get_position();
-        float radius_sq = m_view_radius * m_view_radius;
+        size_t total_tris = m_batched_area_tris.size() + m_batched_building_tris.size() + m_batched_road_tris.size();
 
-        for (const auto& coord : m_tile_manager.get_all_tiles()) {
-            const auto* tile = m_tile_manager.get_tile(coord);
-            if (!tile || !tile->has_valid_bounds()) continue;
-
-            bool visible = true;
-            if (m_use_tile_culling && !frustum.intersects_aabb(tile->bounds_min, tile->bounds_max)) {
-                visible = false;
-            }
-            if (visible && m_use_distance_culling) {
-                glm::vec3 tile_center = (tile->bounds_min + tile->bounds_max) * 0.5f;
-                float dist_sq = glm::dot(tile_center - cam_pos, tile_center - cam_pos);
-                if (dist_sq > radius_sq) visible = false;
-            }
-            if (visible) {
-                visible_count++;
-            }
-        }
-
-        total_tris = m_batched_area_tris.size() + m_batched_building_tris.size() + m_batched_road_tris.size();
-
-        ImGui::BulletText("Visible Tiles: %zu / %zu", visible_count, m_tile_manager.tile_count());
+        ImGui::BulletText("Leaves: %zu", m_quadtree.leaf_count());
+        ImGui::BulletText("Max Depth: %d", m_quadtree.max_depth());
+        ImGui::BulletText("Roads: %zu", m_quadtree.total_roads());
+        ImGui::BulletText("Buildings: %zu", m_quadtree.total_buildings());
+        ImGui::BulletText("Areas: %zu", m_quadtree.total_areas());
         ImGui::BulletText("Batched Triangles: %zu", total_tris);
     }
 
@@ -1118,42 +1092,27 @@ void Editor::rebuild_osm_meshes() {
 
     const auto& osm_data = m_osm_parser.get_data();
 
-    // Initialize tile manager
-    spdlog::info("Initializing tile manager...");
-    m_tile_manager.clear();
-    m_tile_manager.init(osm_data.bounds, m_tile_size);
-    m_tile_manager.assign_data(osm_data);
-    
-    // Meshes are now built lazily on-demand when tiles become visible
+    // Initialize quadtree
+    spdlog::info("Initializing quadtree...");
+    m_quadtree.clear();
+    m_quadtree.init(osm_data.bounds);
+    m_quadtree.assign_data(osm_data);
 
-    spdlog::info("Tile manager: {} tiles, {} roads, {} buildings, {} areas",
-                 m_tile_manager.tile_count(),
-                 m_tile_manager.total_roads(),
-                 m_tile_manager.total_buildings(),
-                 m_tile_manager.total_areas());
+    spdlog::info("QuadTree: {} leaves, {} roads, {} buildings, {} areas, max depth {}",
+                 m_quadtree.leaf_count(),
+                 m_quadtree.total_roads(),
+                 m_quadtree.total_buildings(),
+                 m_quadtree.total_areas(),
+                 m_quadtree.max_depth());
 
-    // Find center of first tile with actual geometry for camera positioning
-    glm::vec3 data_center(0.0f);
-    bool found_geometry = false;
-    
-    for (const auto& coord : m_tile_manager.get_all_tiles()) {
-        const auto* tile = m_tile_manager.get_tile(coord);
-        if (!tile) continue;
-        
-        // Use tile bounds center if we have valid bounds
-        if (tile->has_valid_bounds()) {
-            data_center = (tile->bounds_min + tile->bounds_max) * 0.5f;
-            found_geometry = true;
-            spdlog::info("Found tile at ({}, {}) with bounds: ({},{},{}) to ({},{},{})",
-                        coord.x, coord.y,
-                        tile->bounds_min.x, tile->bounds_min.y, tile->bounds_min.z,
-                        tile->bounds_max.x, tile->bounds_max.y, tile->bounds_max.z);
-            break;
-        }
-    }
+    // Find geometry center for camera positioning
+    glm::vec3 bounds_min, bounds_max;
+    m_quadtree.get_bounds(bounds_min, bounds_max);
+    bool found_geometry = (bounds_min.x < bounds_max.x || bounds_min.z < bounds_max.z);
+    glm::vec3 data_center = (bounds_min + bounds_max) * 0.5f;
 
     if (!found_geometry) {
-        spdlog::warn("No geometry found in any tile!");
+        spdlog::warn("No geometry found in quadtree!");
     }
 
     spdlog::info("Data center: ({}, {}, {})", data_center.x, data_center.y, data_center.z);
@@ -1168,19 +1127,60 @@ void Editor::rebuild_osm_meshes() {
         m_camera.set_target(data_center);
         m_camera.m_far = 50000.0f;
         m_camera.m_base_speed = 200.0f;
-        m_view_radius = 5000.0f;  // Start with larger view radius
+        m_view_radius = 5000.0f;
 
         spdlog::info("Camera at ({}, {}, {}) looking at ({}, {}, {})",
                      cam_pos.x, cam_pos.y, cam_pos.z,
                      data_center.x, data_center.y, data_center.z);
     }
 
-    // Enable culling for performance (camera is now positioned correctly)
+    // Force camera matrix recalculation so frustum matches new position
+    // (update() is normally called in draw_viewport, but we need it now for traversal)
+    m_camera.update(1.0f); // aspect doesn't matter much, just need valid frustum
+
+    // Enable culling for performance
     m_use_tile_culling = true;
     m_use_distance_culling = true;
-    m_batches_dirty = true;  // Force rebuild on next frame
+    m_use_contribution_culling = false; // disable initially — camera is far, nodes appear small
+    m_batches_dirty = true;
     m_last_camera_pos = m_camera.get_position();
     m_last_camera_dir = m_camera.get_forward();
+
+    // Build meshes synchronously for visible leaves so geometry appears immediately
+    {
+        Frustum frustum = m_camera.get_frustum();
+        glm::vec3 cam_pos = m_camera.get_position();
+        float radius_sq = m_view_radius * m_view_radius;
+        size_t built = 0;
+
+        m_quadtree.traverse_visible(
+            frustum.planes, cam_pos, m_view_radius,
+            600.0f, m_camera.m_fov, m_contribution_threshold,
+            true, true, false, // frustum + distance, no contribution cull
+            [&](osm::QuadTreeNode* node, float /*dist_sq*/) {
+                if (!node->meshes_built && !node->meshes_pending) {
+                    // Build synchronously for immediate display
+                    m_quadtree.queue_node_build_async(node);
+                    built++;
+                }
+            }
+        );
+
+        // Wait for all initial builds to complete
+        if (built > 0) {
+            spdlog::info("Waiting for {} initial node builds...", built);
+            size_t total_completed = 0;
+            while (total_completed < built) {
+                size_t c = m_quadtree.poll_async_builds();
+                total_completed += c;
+                if (c == 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            spdlog::info("Initial builds complete");
+        }
+    }
+
     rebuild_visible_batches();
 
     spdlog::info("Initial batch: {} area tris, {} building tris, {} road tris",
@@ -1215,21 +1215,6 @@ void Editor::rebuild_visible_batches() {
     m_batched_building_tris.clear();
     m_batched_road_tris.clear();
 
-    glm::vec3 cam_pos = m_camera.get_position();
-    float radius_sq = m_view_radius * m_view_radius;
-    Frustum frustum = m_camera.get_frustum();
-
-    // Helper to check if mesh is within view distance (XZ plane)
-    auto is_mesh_in_range = [&](const Mesh& mesh) -> bool {
-        if (!m_use_distance_culling) return true;
-        if (!mesh.bounds.is_valid()) return true;
-        
-        glm::vec3 mesh_center = mesh.bounds.center();
-        glm::vec3 diff = mesh_center - cam_pos;
-        float dist_sq = diff.x * diff.x + diff.z * diff.z;
-        return dist_sq <= radius_sq;
-    };
-
     // Helper to batch a mesh's triangles
     auto batch_mesh = [](const Mesh& mesh, std::vector<BatchedTriangle>& batch) {
         for (size_t i = 0; i < mesh.indices.size(); i += 3) {
@@ -1240,118 +1225,84 @@ void Editor::rebuild_visible_batches() {
         }
     };
 
-    // Process only visible tiles (tile-level frustum culling first)
-    for (const auto& coord : m_tile_manager.get_all_tiles()) {
-        auto* tile = m_tile_manager.get_tile(coord);
-        if (!tile || !tile->has_valid_bounds()) continue;
+    Frustum frustum = m_camera.get_frustum();
+    glm::vec3 cam_pos = m_camera.get_position();
 
-        // Tile-level frustum cull - skip entire tile if outside frustum
-        if (m_use_tile_culling && !frustum.intersects_aabb(tile->bounds_min, tile->bounds_max)) {
-            continue;
-        }
+    // Use quadtree traversal with hierarchical culling
+    m_quadtree.traverse_visible(
+        frustum.planes,
+        cam_pos,
+        m_view_radius,
+        600.0f, // approximate screen height
+        m_camera.m_fov,
+        m_contribution_threshold,
+        m_use_tile_culling,
+        m_use_distance_culling,
+        m_use_contribution_culling,
+        [&](osm::QuadTreeNode* node, float /*dist_sq*/) {
+            // Async lazy mesh building - queue if not built/pending
+            if (!node->meshes_built && !node->meshes_pending) {
+                m_quadtree.queue_node_build_async(node);
+                return;
+            }
 
-        // Async lazy mesh building - queue if not built/pending
-        if (!tile->meshes_built && !tile->meshes_pending) {
-            m_tile_manager.queue_tile_build_async(coord);
-            continue;  // Skip this tile until meshes are ready
-        }
+            // Skip nodes still being built
+            if (!node->meshes_built) return;
 
-        // Skip tiles still being built
-        if (!tile->meshes_built) {
-            continue;
-        }
-
-        // Tile is visible - batch all its meshes (skip per-mesh frustum check since tile passed)
-        for (const auto& mesh : tile->area_meshes) {
-            if (is_mesh_in_range(mesh)) {
+            // Node passed all culling — batch its meshes
+            for (const auto& mesh : node->area_meshes) {
                 batch_mesh(mesh, m_batched_area_tris);
             }
-        }
-        for (const auto& mesh : tile->building_meshes) {
-            if (is_mesh_in_range(mesh)) {
+            for (const auto& mesh : node->building_meshes) {
                 batch_mesh(mesh, m_batched_building_tris);
             }
-        }
-        for (const auto& mesh : tile->road_meshes) {
-            if (is_mesh_in_range(mesh)) {
+            for (const auto& mesh : node->road_meshes) {
                 batch_mesh(mesh, m_batched_road_tris);
             }
         }
-    }
+    );
 }
 
-void Editor::upload_tile_to_gpu(osm::Tile& tile, GPURenderer& renderer) {
-    if (tile.gpu_uploaded) return;
+void Editor::upload_node_to_gpu(osm::QuadTreeNode& node, GPURenderer& renderer) {
+    if (node.gpu_uploaded) return;
 
-    // Upload area meshes
-    tile.area_gpu_ids.clear();
-    for (const auto& mesh : tile.area_meshes) {
+    node.area_gpu_ids.clear();
+    for (const auto& mesh : node.area_meshes) {
         uint32_t id = renderer.upload_mesh(mesh);
-        tile.area_gpu_ids.push_back(id);
+        node.area_gpu_ids.push_back(id);
     }
 
-    // Upload road meshes
-    tile.road_gpu_ids.clear();
-    for (const auto& mesh : tile.road_meshes) {
+    node.road_gpu_ids.clear();
+    for (const auto& mesh : node.road_meshes) {
         uint32_t id = renderer.upload_mesh(mesh);
-        tile.road_gpu_ids.push_back(id);
+        node.road_gpu_ids.push_back(id);
     }
 
-    // Upload building meshes
-    tile.building_gpu_ids.clear();
-    for (const auto& mesh : tile.building_meshes) {
+    node.building_gpu_ids.clear();
+    for (const auto& mesh : node.building_meshes) {
         uint32_t id = renderer.upload_mesh(mesh);
-        tile.building_gpu_ids.push_back(id);
+        node.building_gpu_ids.push_back(id);
     }
 
-    tile.gpu_uploaded = true;
+    node.gpu_uploaded = true;
 }
 
-void Editor::release_tile_from_gpu(osm::Tile& tile, GPURenderer& renderer) {
-    if (!tile.gpu_uploaded) return;
+void Editor::release_node_from_gpu(osm::QuadTreeNode& node, GPURenderer& renderer) {
+    if (!node.gpu_uploaded) return;
 
-    for (uint32_t id : tile.area_gpu_ids) {
-        renderer.release_mesh(id);
-    }
-    tile.area_gpu_ids.clear();
+    for (uint32_t id : node.area_gpu_ids) renderer.release_mesh(id);
+    node.area_gpu_ids.clear();
 
-    for (uint32_t id : tile.road_gpu_ids) {
-        renderer.release_mesh(id);
-    }
-    tile.road_gpu_ids.clear();
+    for (uint32_t id : node.road_gpu_ids) renderer.release_mesh(id);
+    node.road_gpu_ids.clear();
 
-    for (uint32_t id : tile.building_gpu_ids) {
-        renderer.release_mesh(id);
-    }
-    tile.building_gpu_ids.clear();
+    for (uint32_t id : node.building_gpu_ids) renderer.release_mesh(id);
+    node.building_gpu_ids.clear();
 
-    tile.gpu_uploaded = false;
+    node.gpu_uploaded = false;
 }
 
 void Editor::render_3d(GPURenderer& renderer) {
-    // upload meshes
-    for (const auto& coord : m_tile_manager.get_all_tiles()) {
-        osm::Tile* tile = const_cast<osm::Tile*>(m_tile_manager.get_tile(coord));
-        if (tile && tile->meshes_built && !tile->gpu_uploaded) {
-            tile->area_gpu_ids.clear();
-            for (const auto& mesh : tile->area_meshes) {
-                uint32_t id = renderer.upload_mesh(mesh);
-                if (id) tile->area_gpu_ids.push_back(id);
-            }
-            tile->road_gpu_ids.clear();
-            for (const auto& mesh : tile->road_meshes) {
-                uint32_t id = renderer.upload_mesh(mesh);
-                if (id) tile->road_gpu_ids.push_back(id);
-            }
-            tile->building_gpu_ids.clear();
-            for (const auto& mesh : tile->building_meshes) {
-                uint32_t id = renderer.upload_mesh(mesh);
-                if (id) tile->building_gpu_ids.push_back(id);
-            }
-            tile->gpu_uploaded = true;
-        }
-    }
-
     // Set Viewport
     SDL_GPUViewport viewport;
     viewport.x = s_viewport_rect.x;
@@ -1375,40 +1326,47 @@ void Editor::render_3d(GPURenderer& renderer) {
     glm::mat4 view = m_camera.get_view();
     glm::mat4 proj = m_camera.get_projection();
     renderer.set_view_projection(view, proj);
-    
+
     // Set camera position for PBR lighting calculations
     glm::vec3 cam_pos = m_camera.get_position();
     renderer.set_camera_position(cam_pos);
 
     Frustum frustum = m_camera.get_frustum();
     glm::mat4 model(1.0f);
-    float radius_sq = m_view_radius * m_view_radius;
 
-    for (const auto& coord : m_tile_manager.get_all_tiles()) {
-        const osm::Tile* tile = m_tile_manager.get_tile(coord);
-        if (!tile || !tile->gpu_uploaded) continue;
+    // Use quadtree traversal for GPU rendering (front-to-back sorted)
+    m_quadtree.traverse_visible(
+        frustum.planes,
+        cam_pos,
+        m_view_radius,
+        viewport.h,
+        m_camera.m_fov,
+        m_contribution_threshold,
+        m_use_tile_culling,
+        m_use_distance_culling,
+        m_use_contribution_culling,
+        [&](osm::QuadTreeNode* node, float /*dist_sq*/) {
+            if (!node->meshes_built) return;
 
-        if (m_use_tile_culling && !frustum.intersects_aabb(tile->bounds_min, tile->bounds_max)) continue;
+            // Upload to GPU if needed
+            if (!node->gpu_uploaded) {
+                upload_node_to_gpu(*node, renderer);
+            }
 
-        // Distance culling at tile level
-        if (m_use_distance_culling) {
-            glm::vec3 tile_center = (tile->bounds_min + tile->bounds_max) * 0.5f;
-            float dist_sq = glm::dot(tile_center - cam_pos, tile_center - cam_pos);
-            if (dist_sq > radius_sq) continue;
+            if (m_render_areas) {
+                for (uint32_t id : node->area_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
+            }
+            if (m_render_roads) {
+                for (uint32_t id : node->road_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
+            }
+            if (m_render_buildings) {
+                for (uint32_t id : node->building_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
+            }
         }
-
-        if (m_render_areas) {
-            for (uint32_t id : tile->area_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
-        }
-        if (m_render_roads) {
-            for (uint32_t id : tile->road_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
-        }
-        if (m_render_buildings) {
-            for (uint32_t id : tile->building_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
-        }
-    }
+    );
 
     // Render procedural terrain
+    float radius_sq = m_view_radius * m_view_radius;
     if (m_use_chunked_terrain) {
         // Render chunked terrain
         if (m_render_terrain) {

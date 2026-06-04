@@ -53,6 +53,7 @@ add_library(stratum_core STATIC
     src/osm/coordinates.cpp
     src/osm/mesh_builder.cpp
     src/osm/tile_manager.cpp
+    src/osm/quadtree.cpp
 
     # Procedural Generation
     src/procgen/noise.cpp

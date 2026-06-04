@@ -5,6 +5,7 @@
 #include "osm/parser.hpp"
 #include "osm/mesh_builder.hpp"
 #include "osm/tile_manager.hpp"
+#include "osm/quadtree.hpp"
 #include "procgen/terrain_generator.hpp"
 #include "procgen/terrain_mesh_builder.hpp"
 #include "procgen/terrain_tile_manager.hpp"
@@ -106,14 +107,15 @@ private:
 
     void handle_window_resize();
 
-    // OSM Parser and Tile Manager
+    // OSM Parser and QuadTree
     osm::OSMParser m_osm_parser;
-    osm::TileManager m_tile_manager;
+    osm::QuadTree m_quadtree;
     std::string m_osm_import_path;
     bool m_use_tile_culling = true;
-    bool m_use_distance_culling = true;  // Cull tiles outside view radius
-    float m_view_radius = 2000.0f;       // Max distance from camera to render
-    float m_tile_size = 500.0f;
+    bool m_use_distance_culling = true;
+    bool m_use_contribution_culling = true;
+    float m_view_radius = 2000.0f;
+    float m_contribution_threshold = 4.0f;
 
     // Cached meshes for rendering (legacy - now managed by TileManager)
     std::vector<Mesh> m_building_meshes;
@@ -139,8 +141,8 @@ private:
     void rebuild_osm_meshes();
     void rebuild_visible_batches();
     bool check_camera_dirty();  // Returns true if camera moved enough to warrant rebuild
-    void upload_tile_to_gpu(osm::Tile& tile, GPURenderer& renderer);
-    void release_tile_from_gpu(osm::Tile& tile, GPURenderer& renderer);
+    void upload_node_to_gpu(osm::QuadTreeNode& node, GPURenderer& renderer);
+    void release_node_from_gpu(osm::QuadTreeNode& node, GPURenderer& renderer);
 
     // Procedural Generation (single terrain - legacy)
     procgen::TerrainGenerator m_terrain_generator;
