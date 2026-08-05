@@ -188,6 +188,15 @@ public:
     void begin_render_pass();
 
     /**
+     * @brief Begin a color-only render pass (NO depth attachment) for UI/overlay draws
+     * @note Loads the existing swapchain contents so the 3D pass output is preserved.
+     *       ImGui's SDL_GPU backend builds its pipeline with has_depth_stencil_target =
+     *       false, so drawing it into the depth-attached 3D pass is render-pass
+     *       incompatible (VUID-vkCmdDrawIndexed-renderPass-02684). This pass matches it.
+     */
+    void begin_ui_render_pass();
+
+    /**
      * @brief End the current render pass
      */
     void end_render_pass();
@@ -350,6 +359,18 @@ public:
     // === Scene state getters ===
     const SceneUniforms& get_scene_uniforms() const { return m_scene_uniforms; }
 
+    /**
+     * @brief Load a SPIR-V shader module from disk
+     * @param path Absolute path to a .spv file
+     * @param stage Vertex or fragment stage
+     * @param num_uniform_buffers Uniform buffer count declared by the shader
+     * @param num_storage_buffers Storage buffer count declared by the shader
+     * @return Shader handle, or nullptr on failure (caller owns it)
+     * @note Public so auxiliary backends (e.g. the Im3d backend) can reuse it.
+     */
+    SDL_GPUShader* load_shader(const char* path, SDL_GPUShaderStage stage,
+                                int num_uniform_buffers, int num_storage_buffers);
+
 private:
     bool create_pipelines();
     bool create_simple_pipelines();
@@ -357,8 +378,6 @@ private:
     bool load_shaders();
     bool load_simple_shaders();
     bool load_pbr_shaders();
-    SDL_GPUShader* load_shader(const char* path, SDL_GPUShaderStage stage, 
-                                int num_uniform_buffers, int num_storage_buffers);
     void create_msaa_textures();
     void release_msaa_textures();
     void release_pipelines();

@@ -17,22 +17,21 @@ namespace stratum {
 
 static ImVec4 s_viewport_rect;
 
-void Editor::render_im3d_callback() {
-    if (m_gpu_renderer) {
-        render_3d(*m_gpu_renderer);
-    }
-}
-
-static void DrawIm3D_Callback(const ImDrawList* parent_list, const ImDrawCmd* cmd) {
-    Editor* editor = static_cast<Editor*>(cmd->UserCallbackData);
-    if (editor) {
-        editor->render_im3d_callback();
-    }
-}
-
 void Editor::init() {
     spdlog::info("Editor initialized");
     Im3D_Init();
+}
+
+void Editor::set_renderer(GPURenderer* renderer) {
+    m_gpu_renderer = renderer;
+    if (renderer) {
+        // Non-fatal: on failure Im3d simply renders nothing.
+        Im3D_InitGPU(*renderer);
+    }
+}
+
+void Editor::im3d_end_frame_and_upload(GPURenderer& renderer) {
+    Im3D_EndFrameAndUpload(renderer);
 }
 
 void Editor::shutdown() {
@@ -47,6 +46,12 @@ void Editor::update() {
 }
 
 void Editor::render() {
+    // Invalidate the viewport rect every frame. draw_viewport() republishes it
+    // below, but only when the panel is actually drawn -- so if the Viewport is
+    // closed, this leaves it zeroed and render_3d() bails out instead of
+    // rendering the whole 3D scene into a stale rect.
+    s_viewport_rect = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+
     // Global keyboard shortcuts
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         if (m_quit_callback) m_quit_callback();
@@ -92,6 +97,9 @@ void Editor::setup_dockspace() {
     window_flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse;
     window_flags |= ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
     window_flags |= ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
+    // The 3D scene is now drawn in an earlier render pass. Without NoBackground the
+    // dockspace host window would paint over it.
+    window_flags |= ImGuiWindowFlags_NoBackground;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
@@ -127,6 +135,11 @@ void Editor::setup_dockspace() {
         ImGui::DockBuilderFinish(dockspace_id);
     }
 
+    // NOTE: deliberately NOT ImGuiDockNodeFlags_PassthruCentralNode. That flag only
+    // punches a transparent hole when the central node is EMPTY (imgui.cpp:19068);
+    // the "Viewport" window is docked into the central node, so instead it would fill
+    // the whole dockspace with ImGuiCol_WindowBg and paint over the 3D render pass.
+    // Transparency here comes from ImGuiWindowFlags_NoBackground on the Viewport window.
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
 
     draw_menu_bar();
@@ -273,7 +286,8 @@ void Editor::draw_menu_bar() {
 
 void Editor::draw_viewport() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::Begin("Viewport");
+    // NoBackground: the 3D pass has already drawn the scene into the swapchain
+    ImGui::Begin("Viewport", nullptr, ImGuiWindowFlags_NoBackground);
 
     m_viewport_focused = ImGui::IsWindowFocused();
     m_viewport_hovered = ImGui::IsWindowHovered();
@@ -335,9 +349,11 @@ void Editor::draw_viewport() {
     }
     
     // Draw Origin Axis
-    Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(1,0,0), 2.0f, Im3d::Color(255, 0, 0));
-    Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,1,0), 2.0f, Im3d::Color(0, 255, 0));
-    Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,0,1), 2.0f, Im3d::Color(0, 0, 255));
+    // Use the packed 0xRRGGBBAA constants: Im3d::Color(int,int,int) resolves to the
+    // FLOAT constructor (components in 0..1), so Color(255,0,0) overflows to near-black.
+    Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(1,0,0), 2.0f, Im3d::Color_Red);
+    Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,1,0), 2.0f, Im3d::Color_Green);
+    Im3d::DrawLine(Im3d::Vec3(0,0,0), Im3d::Vec3(0,0,1), 2.0f, Im3d::Color_Blue);
 
     // Draw quadtree node boxes if enabled
     if (m_show_tile_grid && m_quadtree.leaf_count() > 0) {
@@ -348,16 +364,17 @@ void Editor::draw_viewport() {
             // Color based on state and depth
             bool in_frustum = frustum.intersects_aabb(leaf->bounds_min, leaf->bounds_max);
             Im3d::Color grid_color;
+            // NOTE: Im3d::Color takes FLOAT components in 0..1, not 0..255 bytes.
             if (!in_frustum) {
-                grid_color = Im3d::Color(255, 0, 0, 100);      // Red = culled
+                grid_color = Im3d::Color(1.0f, 0.0f, 0.0f, 0.39f);   // Red = culled
             } else if (leaf->meshes_pending) {
-                grid_color = Im3d::Color(255, 200, 0, 200);    // Yellow = building
+                grid_color = Im3d::Color(1.0f, 0.78f, 0.0f, 0.78f);  // Yellow = building
             } else if (leaf->meshes_built) {
                 // Color by depth: deeper = brighter green
-                int g = 100 + std::min(155, leaf->depth * 20);
-                grid_color = Im3d::Color(0, g, 0, 200);
+                float g = (100.0f + std::min(155, leaf->depth * 20)) / 255.0f;
+                grid_color = Im3d::Color(0.0f, g, 0.0f, 0.78f);
             } else {
-                grid_color = Im3d::Color(100, 100, 100, 150);  // Gray = not yet queued
+                grid_color = Im3d::Color(0.39f, 0.39f, 0.39f, 0.59f); // Gray = not yet queued
             }
 
             glm::vec3 mn = leaf->bounds_min;
@@ -384,7 +401,7 @@ void Editor::draw_viewport() {
     }
 
     // Draw Area Meshes - pre-batched for performance (draw first, at bottom layer)
-    if (m_render_areas && !m_batched_area_tris.empty()) {
+    if (m_im3d_debug_geometry && m_render_areas && !m_batched_area_tris.empty()) {
         Im3d::BeginTriangles();
         for (const auto& tri : m_batched_area_tris) {
             Im3d::Color color(tri.color.r, tri.color.g, tri.color.b, tri.color.a);
@@ -396,7 +413,7 @@ void Editor::draw_viewport() {
     }
 
     // Draw Road Meshes - pre-batched for performance (draw second, over areas)
-    if (m_render_roads && !m_batched_road_tris.empty()) {
+    if (m_im3d_debug_geometry && m_render_roads && !m_batched_road_tris.empty()) {
         Im3d::BeginTriangles();
         for (const auto& tri : m_batched_road_tris) {
             Im3d::Color color(tri.color.r, tri.color.g, tri.color.b, tri.color.a);
@@ -408,7 +425,7 @@ void Editor::draw_viewport() {
     }
 
     // Draw Building Meshes - pre-batched for performance (draw last, on top)
-    if (m_render_buildings && !m_batched_building_tris.empty()) {
+    if (m_im3d_debug_geometry && m_render_buildings && !m_batched_building_tris.empty()) {
         Im3d::BeginTriangles();
         for (const auto& tri : m_batched_building_tris) {
             Im3d::Color color(tri.color.r, tri.color.g, tri.color.b, tri.color.a);
@@ -432,15 +449,11 @@ void Editor::draw_viewport() {
     );
     */
 
-    // Render Im3D via callback
-
-    draw_list->AddCallback(DrawIm3D_Callback, this);
-    
-    // Reset callback (optional but good practice)
-    draw_list->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+    // 3D content (including Im3D) is rendered by Application::render() in its own
+    // depth-attached render pass, before ImGui's depth-less pass draws over it.
 
     // Overlay Text
-    const char* text_overlay = "3D Viewport (Im3D + SDL3)";
+    const char* text_overlay = "3D Viewport";
     draw_list->AddText(ImVec2(pos.x + 10, pos.y + 10), IM_COL32(200, 200, 200, 255), text_overlay);
 
     // Toolbar overlay
@@ -1303,6 +1316,14 @@ void Editor::release_node_from_gpu(osm::QuadTreeNode& node, GPURenderer& rendere
 }
 
 void Editor::render_3d(GPURenderer& renderer) {
+    // s_viewport_rect is only written while the Viewport panel is drawing. This
+    // function is now called unconditionally from Application::render(), so bail
+    // out if the panel is closed/collapsed - a zero-size viewport or scissor is a
+    // Vulkan validation error.
+    if (s_viewport_rect.z < 1.0f || s_viewport_rect.w < 1.0f) {
+        return;
+    }
+
     // Set Viewport
     SDL_GPUViewport viewport;
     viewport.x = s_viewport_rect.x;
@@ -1417,6 +1438,10 @@ void Editor::render_3d(GPURenderer& renderer) {
             renderer.draw_mesh(m_water_gpu_id, model, glm::vec4(1.0f));
         }
     }
+
+    // Im3d debug geometry last, so it depth-tests against the opaque scene above.
+    // Inherits the viewport and scissor already set at the top of this function.
+    Im3D_Render(renderer, m_camera.get_view_projection(), viewport.w, viewport.h);
 }
 
 } // namespace stratum

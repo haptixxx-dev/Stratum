@@ -150,17 +150,23 @@ void Application::render() {
         return;  // Window minimized or error
     }
 
+    // --- Copy-pass phase: NO render pass may be active here ---
+
+    // End the Im3d frame and upload its draw lists (opens a copy pass)
+    m_editor.im3d_end_frame_and_upload(m_gpu_renderer);
+
     // Prepare ImGui draw data BEFORE render pass
     ImGui_ImplSDLGPU3_PrepareDrawData(draw_data, m_gpu_renderer.get_command_buffer());
 
-    // Begin render pass
+    // --- Pass 1: 3D scene, WITH depth attachment ---
     m_gpu_renderer.begin_render_pass();
+    m_editor.render_3d(m_gpu_renderer);
+    m_gpu_renderer.end_render_pass();
 
-    // Render 3D content - NOW handled via ImGui callback in viewport
-    // m_editor.render_3d(m_gpu_renderer);
-
-    // Render ImGui on top
-
+    // --- Pass 2: ImGui, NO depth attachment ---
+    // ImGui's pipeline is built with has_depth_stencil_target = false, so it must
+    // not be drawn into the depth-attached pass above.
+    m_gpu_renderer.begin_ui_render_pass();
     ImGui_ImplSDLGPU3_RenderDrawData(draw_data,
                                       m_gpu_renderer.get_command_buffer(),
                                       m_gpu_renderer.get_render_pass());

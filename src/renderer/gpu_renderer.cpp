@@ -808,6 +808,37 @@ void GPURenderer::begin_render_pass() {
     SDL_SetGPUViewport(m_render_pass, &viewport);
 }
 
+void GPURenderer::begin_ui_render_pass() {
+    if (!m_cmd_buffer || !m_swapchain_texture) return;
+
+    // Defensively close any pass still open
+    end_render_pass();
+
+    SDL_GPUColorTargetInfo color_target{};
+    // Always the resolved 1-sample swapchain image, never the MSAA color texture:
+    // the 3D pass already resolved into it, and ImGui is initialized at SAMPLECOUNT_1.
+    color_target.texture = m_swapchain_texture;
+    color_target.mip_level = 0;
+    color_target.layer_or_depth_plane = 0;
+    color_target.load_op = SDL_GPU_LOADOP_LOAD;    // Preserve the 3D image drawn by the previous pass
+    color_target.store_op = SDL_GPU_STOREOP_STORE;
+    color_target.resolve_texture = nullptr;
+    // Cycling would hand back a different backing allocation and silently discard
+    // the 3D image that LOADOP_LOAD exists to preserve.
+    color_target.cycle = false;
+
+    // nullptr depth target => pDepthStencilAttachment is VK_ATTACHMENT_UNUSED,
+    // which is what ImGui's pipeline was created against.
+    m_render_pass = SDL_BeginGPURenderPass(m_cmd_buffer, &color_target, 1, nullptr);
+    if (!m_render_pass) {
+        spdlog::error("Failed to begin UI render pass: {}", SDL_GetError());
+        return;
+    }
+
+    // Deliberately no SDL_SetGPUViewport here - ImGui's SetupRenderState establishes
+    // its own full-framebuffer viewport and scissor inside RenderDrawData.
+}
+
 void GPURenderer::end_render_pass() {
     if (m_render_pass) {
         SDL_EndGPURenderPass(m_render_pass);

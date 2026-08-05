@@ -30,9 +30,20 @@ public:
 
     void set_quit_callback(std::function<void()> callback) { m_quit_callback = callback; }
     void set_window_handle(void* window) { m_window_handle = window; }
-    void set_renderer(GPURenderer* renderer) { m_gpu_renderer = renderer; }
+
+    /**
+     * @brief Attach the GPU renderer and create renderer-dependent resources
+     * @note Out-of-line because it also initializes the Im3d GPU backend, which
+     *       cannot happen in init() - that runs before the renderer is attached.
+     */
+    void set_renderer(GPURenderer* renderer);
+
+    /**
+     * @brief End the Im3d frame and upload its geometry
+     * @note Must be called with NO render pass active (it opens a copy pass).
+     */
+    void im3d_end_frame_and_upload(GPURenderer& renderer);
     void set_msaa_change_callback(std::function<void(int)> callback) { m_msaa_change_callback = callback; }
-    void render_im3d_callback();
 
     bool is_viewport_focused() const { return m_viewport_focused; }
     bool is_viewport_hovered() const { return m_viewport_hovered; }
@@ -76,6 +87,10 @@ private:
     bool m_render_roads = true;
     bool m_render_buildings = true;
     bool m_show_tile_grid = false;
+    // Re-submit the batched OSM geometry through Im3d as debug triangles. Off by
+    // default: render_3d() already draws the same quadtree geometry as GPU meshes,
+    // so enabling this double-draws the whole scene.
+    bool m_im3d_debug_geometry = false;
 
     // Console log
     ImGuiTextBuffer m_console_buffer;
