@@ -172,7 +172,6 @@ There's a couple xd
 | | [lz4](https://github.com/lz4/lz4) | BSD-2-Clause |
 | Editor | [ImGuizmo](https://github.com/CedricGuillemet/ImGuizmo) | MIT |
 | | [im3d](https://github.com/john-chapman/im3d) | MIT |
-| | [ImGuiFileDialog](https://github.com/aiekick/ImGuiFileDialog) | MIT |
 | | [imnodes](https://github.com/Nelarius/imnodes) | MIT |
 | | [ImGuiColorTextEdit](https://github.com/BalazsJako/ImGuiColorTextEdit) | MIT |
 | Scene | [EnTT](https://github.com/skypjack/entt) | MIT |

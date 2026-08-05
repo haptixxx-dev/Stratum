@@ -6,7 +6,6 @@
 #include <imgui_internal.h>
 #include <spdlog/spdlog.h>
 #include <SDL3/SDL.h>
-#include <ImGuiFileDialog/ImGuiFileDialog.h>
 #include <map>
 #include <cstring>
 #include <cmath>
@@ -72,6 +71,10 @@ void Editor::render() {
     // Advance any in-flight OSM import. Must run before the panels draw so the
     // progress bar reflects this frame's state.
     poll_osm_import();
+
+    // Apply a native file-dialog result on the main thread; the SDL callback that
+    // produced it may have run on another one.
+    poll_file_dialog();
 
     setup_dockspace();
 
@@ -693,33 +696,15 @@ void Editor::draw_osm_panel() {
 
     ImGui::Separator();
 
-    // File path input
-    static char filepath[512] = "";
-    ImGui::InputText("File Path", filepath, sizeof(filepath));
+    // File path input. Kept alongside the picker so a path can still be pasted or
+    // typed, which is also the fallback if the platform has no dialog available.
+    ImGui::InputText("File Path", m_osm_filepath, sizeof(m_osm_filepath));
     ImGui::SameLine();
-    if (ImGui::Button("Browse...")) {
-        IGFD::FileDialogConfig fdConfig;
-        fdConfig.path = ".";
-        fdConfig.flags = ImGuiFileDialogFlags_Modal;
-        ImGuiFileDialog::Instance()->OpenDialog(
-            "ChooseOSMFile",
-            "Choose OSM File",
-            ".osm,.pbf,.osm.bz2,.osm.gz",
-            fdConfig
-        );
+    ImGui::BeginDisabled(m_file_pick.pending);
+    if (ImGui::Button(m_file_pick.pending ? "Browsing..." : "Browse...")) {
+        open_osm_file_dialog();
     }
-
-    // File dialog display
-    ImVec2 maxSize = ImVec2(800, 600);
-    ImVec2 minSize = ImVec2(400, 300);
-    if (ImGuiFileDialog::Instance()->Display("ChooseOSMFile", ImGuiWindowFlags_NoCollapse, minSize, maxSize)) {
-        if (ImGuiFileDialog::Instance()->IsOk()) {
-            std::string selectedPath = ImGuiFileDialog::Instance()->GetFilePathName();
-            strncpy(filepath, selectedPath.c_str(), sizeof(filepath) - 1);
-            filepath[sizeof(filepath) - 1] = '\0';
-        }
-        ImGuiFileDialog::Instance()->Close();
-    }
+    ImGui::EndDisabled();
 
     // Import button with status feedback
     static std::string import_status;
@@ -731,13 +716,13 @@ void Editor::draw_osm_panel() {
 
     ImGui::BeginDisabled(importing);
     if (ImGui::Button("Import OSM File", ImVec2(-1, 0))) {
-        if (strlen(filepath) == 0) {
+        if (strlen(m_osm_filepath) == 0) {
             import_status = "Please enter a file path first";
             import_error = true;
         } else {
             import_status.clear();
             import_error = false;
-            begin_osm_import(filepath, config);
+            begin_osm_import(m_osm_filepath, config);
         }
     }
     ImGui::EndDisabled();
@@ -1181,6 +1166,78 @@ void Editor::handle_window_resize() {
         } else {
             m_resize_edge = RESIZE_NONE;
         }
+    }
+}
+
+void Editor::open_osm_file_dialog() {
+    if (m_file_pick.pending) return;  // a dialog is already up
+
+    // Must outlive the call: SDL requires the filter array stay valid until the
+    // callback fires, and this function returns immediately.
+    static const SDL_DialogFileFilter kFilters[] = {
+        { "OpenStreetMap data", "osm;pbf;osm.bz2;osm.gz" },
+        { "OSM XML",            "osm" },
+        { "OSM PBF",            "pbf" },
+        { "All files",          "*" },
+    };
+
+    m_file_pick.pending = true;
+
+    SDL_ShowOpenFileDialog(
+        [](void* userdata, const char* const* filelist, int /*filter*/) {
+            // May run on a different thread than the main loop, so do nothing here
+            // except record the outcome. poll_file_dialog() applies it.
+            auto* self = static_cast<Editor*>(userdata);
+            std::lock_guard<std::mutex> lock(self->m_file_pick.mutex);
+            self->m_file_pick.has_result = true;
+            self->m_file_pick.path.clear();
+            self->m_file_pick.error.clear();
+
+            if (!filelist) {
+                const char* err = SDL_GetError();
+                self->m_file_pick.error = (err && *err) ? err : "file dialog failed";
+            } else if (filelist[0]) {
+                self->m_file_pick.path = filelist[0];  // single-select
+            }
+            // filelist non-null with a null first entry means the user cancelled;
+            // both strings stay empty and the UI simply does nothing.
+        },
+        this,
+        static_cast<SDL_Window*>(m_window_handle),  // parent, for modality
+        kFilters,
+        static_cast<int>(SDL_arraysize(kFilters)),
+        nullptr,   // start in the platform's default location
+        false);    // single selection
+}
+
+void Editor::poll_file_dialog() {
+    std::string path, error;
+    {
+        std::lock_guard<std::mutex> lock(m_file_pick.mutex);
+        if (!m_file_pick.has_result) return;
+        m_file_pick.has_result = false;
+        m_file_pick.pending = false;
+        path = std::move(m_file_pick.path);
+        error = std::move(m_file_pick.error);
+        m_file_pick.path.clear();
+        m_file_pick.error.clear();
+    }
+
+    if (!error.empty()) {
+        // Most likely on Linux with no XDG desktop portal and no zenity/kdialog.
+        // The path field is still there to type into, so this is not fatal.
+        spdlog::error("File dialog unavailable: {}", error);
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "[OSM] File dialog unavailable (%s) - type a path instead\n", error.c_str());
+        m_console_buffer.append(msg);
+        m_console_scroll_to_bottom = true;
+        return;
+    }
+
+    if (!path.empty()) {
+        std::snprintf(m_osm_filepath, sizeof(m_osm_filepath), "%s", path.c_str());
+        spdlog::info("Selected OSM file: {}", path);
     }
 }
 

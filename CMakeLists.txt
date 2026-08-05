@@ -168,7 +168,6 @@ target_link_libraries(stratum_editor_lib PUBLIC
     # Editor
     ImGuizmo
     im3d
-    ImGuiFileDialog
     imnodes
 )
 

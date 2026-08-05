@@ -196,6 +196,23 @@ private:
     std::vector<osm::QuadTreeNode*> m_import_pending_nodes;
     size_t m_import_nodes_total = 0;
 
+    // ── Native file picker ──────────────────────────────────────────────────
+    // SDL_ShowOpenFileDialog is asynchronous and its callback may run on another
+    // thread, so the result is parked here under a mutex and picked up by the UI
+    // on the next frame rather than touching ImGui state from the callback.
+    struct FilePickResult {
+        std::mutex mutex;
+        std::string path;        ///< Chosen file, empty if cancelled
+        std::string error;       ///< Non-empty if the dialog itself failed
+        bool has_result = false; ///< A callback landed and has not been consumed
+        bool pending = false;    ///< A dialog is currently open
+    };
+    FilePickResult m_file_pick;
+    char m_osm_filepath[512] = "";
+
+    void open_osm_file_dialog();
+    void poll_file_dialog();
+
     void begin_osm_import(const std::string& filepath, const osm::ParserConfig& config);
     void poll_osm_import();
     void begin_mesh_rebuild();

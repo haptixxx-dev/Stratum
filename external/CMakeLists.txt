@@ -57,10 +57,14 @@ add_library(im3d STATIC ${EXTERNAL_DIR}/im3d/im3d.cpp)
 target_include_directories(im3d PUBLIC ${EXTERNAL_DIR}/im3d)
 
 # ───────────────────────────────────────────────────────────────────
-# IMGUI FILE DIALOG
+# IMGUI FILE DIALOG - not built
 # ───────────────────────────────────────────────────────────────────
-add_subdirectory(ImGuiFileDialog)
-target_link_libraries(ImGuiFileDialog PUBLIC imgui)
+# File picking now goes through SDL_ShowOpenFileDialog, which uses the
+# platform's own dialog (XDG portal or zenity on Linux, the common dialog on
+# Windows, NSOpenPanel on macOS). The submodule is left in place; re-add these
+# two lines to bring it back.
+#   add_subdirectory(ImGuiFileDialog)
+#   target_link_libraries(ImGuiFileDialog PUBLIC imgui)
 
 # ───────────────────────────────────────────────────────────────────
 # IMNODES (node editor)
