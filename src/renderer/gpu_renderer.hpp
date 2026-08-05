@@ -417,6 +417,12 @@ private:
     SDL_GPUTexture* m_depth_texture = nullptr;
     uint32_t m_swapchain_width = 0;
     uint32_t m_swapchain_height = 0;
+    // Allocated size of m_depth_texture, which is >= the swapchain size and is
+    // rounded up so that a resize drag does not reallocate it every frame. The
+    // Vulkan backend sizes the framebuffer as the min over all attachments
+    // (SDL_gpu_vulkan.c:7768-7801), so an oversized depth target is harmless.
+    uint32_t m_depth_alloc_width = 0;
+    uint32_t m_depth_alloc_height = 0;
 
     // Matrices
     glm::mat4 m_view{1.0f};

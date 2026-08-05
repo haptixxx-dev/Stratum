@@ -6,6 +6,7 @@
 #include "renderer/gpu_renderer.hpp"
 #include "renderer/mesh.hpp"
 #include <spdlog/spdlog.h>
+#include <algorithm>
 #include <fstream>
 #include <filesystem>
 
@@ -69,6 +70,8 @@ bool GPURenderer::init(SDL_Window* window) {
         shutdown();
         return false;
     }
+    m_depth_alloc_width = m_swapchain_width;
+    m_depth_alloc_height = m_swapchain_height;
 
     // Load shaders and create pipelines
     if (!load_shaders()) {
@@ -113,6 +116,10 @@ void GPURenderer::shutdown() {
         SDL_ReleaseGPUTexture(m_device, m_depth_texture);
         m_depth_texture = nullptr;
     }
+    // Must clear alongside the texture, or a re-init would believe it still has an
+    // allocation of that size and never create one.
+    m_depth_alloc_width = 0;
+    m_depth_alloc_height = 0;
 
     // Release window claim and destroy device
     if (m_window) {
@@ -712,37 +719,59 @@ bool GPURenderer::begin_frame() {
         return false;
     }
 
-    // Handle resize - recreate depth texture if size changed
+    // Handle resize
     if (new_width != m_swapchain_width || new_height != m_swapchain_height) {
         m_swapchain_width = new_width;
         m_swapchain_height = new_height;
 
-        // Release old depth texture
-        if (m_depth_texture) {
-            SDL_ReleaseGPUTexture(m_device, m_depth_texture);
-            m_depth_texture = nullptr;
+        // Only reallocate the depth texture when the window outgrows it. A manual
+        // resize drag changes the swapchain size on almost every frame, and a
+        // release+create of a full-res D32 target costs ~570us each time (~3.4% of
+        // a 60fps frame) -- paying that per frame is a large part of the stutter.
+        // Rounding up means a drag crosses an allocation boundary rarely, and
+        // shrinking never reallocates at all.
+        if (m_swapchain_width > m_depth_alloc_width || m_swapchain_height > m_depth_alloc_height) {
+            constexpr uint32_t GRANULARITY = 256;
+            const auto round_up = [](uint32_t v) {
+                return ((v + GRANULARITY - 1) / GRANULARITY) * GRANULARITY;
+            };
+            // Never shrink: max() against the current allocation keeps a wide-then-tall
+            // drag from thrashing between two sizes.
+            const uint32_t alloc_w = std::max(m_depth_alloc_width, round_up(m_swapchain_width));
+            const uint32_t alloc_h = std::max(m_depth_alloc_height, round_up(m_swapchain_height));
+
+            if (m_depth_texture) {
+                SDL_ReleaseGPUTexture(m_device, m_depth_texture);
+                m_depth_texture = nullptr;
+            }
+
+            SDL_GPUTextureCreateInfo depth_info{};
+            depth_info.type = SDL_GPU_TEXTURETYPE_2D;
+            depth_info.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+            depth_info.width = alloc_w;
+            depth_info.height = alloc_h;
+            depth_info.layer_count_or_depth = 1;
+            depth_info.num_levels = 1;
+            depth_info.sample_count = SDL_GPU_SAMPLECOUNT_1;
+            depth_info.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+
+            m_depth_texture = SDL_CreateGPUTexture(m_device, &depth_info);
+            if (!m_depth_texture) {
+                spdlog::error("Failed to recreate depth texture: {}", SDL_GetError());
+                m_depth_alloc_width = 0;
+                m_depth_alloc_height = 0;
+                SDL_CancelGPUCommandBuffer(m_cmd_buffer);
+                m_cmd_buffer = nullptr;
+                return false;
+            }
+
+            m_depth_alloc_width = alloc_w;
+            m_depth_alloc_height = alloc_h;
+            spdlog::debug("Depth target allocated {}x{}", alloc_w, alloc_h);
         }
 
-        // Create new depth texture
-        SDL_GPUTextureCreateInfo depth_info{};
-        depth_info.type = SDL_GPU_TEXTURETYPE_2D;
-        depth_info.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
-        depth_info.width = m_swapchain_width;
-        depth_info.height = m_swapchain_height;
-        depth_info.layer_count_or_depth = 1;
-        depth_info.num_levels = 1;
-        depth_info.sample_count = SDL_GPU_SAMPLECOUNT_1;
-        depth_info.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
-
-        m_depth_texture = SDL_CreateGPUTexture(m_device, &depth_info);
-        if (!m_depth_texture) {
-            spdlog::error("Failed to recreate depth texture: {}", SDL_GetError());
-            SDL_CancelGPUCommandBuffer(m_cmd_buffer);
-            m_cmd_buffer = nullptr;
-            return false;
-        }
-
-        // Recreate MSAA textures if enabled
+        // MSAA textures are resolve targets, so they must track the swapchain size
+        // exactly and cannot use the oversized-allocation trick above.
         if (m_sample_count != SDL_GPU_SAMPLECOUNT_1) {
             create_msaa_textures();
         }

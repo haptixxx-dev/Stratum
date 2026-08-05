@@ -119,8 +119,16 @@ private:
     ResizeEdge m_resize_edge = RESIZE_NONE;
     int m_resize_start_w = 0;
     int m_resize_start_h = 0;
+    // Drag origin in GLOBAL (desktop) coordinates. Window-relative coordinates
+    // shift underneath the cursor as the window moves, which feeds back into the
+    // delta and makes left/top edge drags oscillate.
+    float m_resize_start_global_x = 0.0f;
+    float m_resize_start_global_y = 0.0f;
+
+    bool m_fullscreen = false;
 
     void handle_window_resize();
+    void toggle_fullscreen();
 
     // OSM Parser and QuadTree
     osm::OSMParser m_osm_parser;

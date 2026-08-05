@@ -53,8 +53,17 @@ void Editor::render() {
     s_viewport_rect = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
 
     // Global keyboard shortcuts
+    if (ImGui::IsKeyPressed(ImGuiKey_F11)) {
+        toggle_fullscreen();
+    }
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-        if (m_quit_callback) m_quit_callback();
+        // Escape leaves fullscreen first; quitting outright is a nasty surprise
+        // when the window is covering the whole screen.
+        if (m_fullscreen) {
+            toggle_fullscreen();
+        } else if (m_quit_callback) {
+            m_quit_callback();
+        }
     }
 
     // Handle window resizing from edges
@@ -219,6 +228,10 @@ void Editor::draw_menu_bar() {
         }
 
         if (ImGui::BeginMenu("View")) {
+            if (ImGui::MenuItem("Fullscreen", "F11", m_fullscreen)) {
+                toggle_fullscreen();
+            }
+            ImGui::Separator();
             ImGui::MenuItem("Viewport", nullptr, &m_show_viewport);
             ImGui::MenuItem("Scene Hierarchy", nullptr, &m_show_scene_hierarchy);
             ImGui::MenuItem("Properties", nullptr, &m_show_properties);
@@ -273,6 +286,13 @@ void Editor::draw_menu_bar() {
             if (m_window_handle) {
                 SDL_MinimizeWindow(static_cast<SDL_Window*>(m_window_handle));
             }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(m_fullscreen ? " \xe2\x9d\x90 " : " \xe2\x9b\xb6 ")) {
+            toggle_fullscreen();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(m_fullscreen ? "Exit fullscreen (F11)" : "Fullscreen (F11)");
         }
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
@@ -972,8 +992,34 @@ void Editor::draw_render_settings() {
     ImGui::End();
 }
 
+void Editor::toggle_fullscreen() {
+    if (!m_window_handle) return;
+
+    SDL_Window* window = static_cast<SDL_Window*>(m_window_handle);
+    m_fullscreen = !m_fullscreen;
+
+    if (!SDL_SetWindowFullscreen(window, m_fullscreen)) {
+        spdlog::error("Failed to toggle fullscreen: {}", SDL_GetError());
+        m_fullscreen = !m_fullscreen;  // Roll back; the window did not change
+        return;
+    }
+
+    // Any edge drag in progress refers to the pre-toggle geometry.
+    m_resize_edge = RESIZE_NONE;
+    m_dragging_window = false;
+
+    spdlog::info("Fullscreen {}", m_fullscreen ? "enabled" : "disabled");
+}
+
 void Editor::handle_window_resize() {
     if (!m_window_handle) return;
+
+    // The window has no border to drag in fullscreen, and resizing out from under
+    // the fullscreen state fights the window manager.
+    if (m_fullscreen) {
+        m_resize_edge = RESIZE_NONE;
+        return;
+    }
 
     SDL_Window* window = static_cast<SDL_Window*>(m_window_handle);
     ImVec2 mouse = ImGui::GetMousePos();
@@ -1031,6 +1077,7 @@ void Editor::handle_window_resize() {
     if (hover_edge != RESIZE_NONE && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
         m_resize_edge = hover_edge;
         m_drag_start_mouse = mouse;
+        SDL_GetGlobalMouseState(&m_resize_start_global_x, &m_resize_start_global_y);
         m_drag_start_window_x = win_x;
         m_drag_start_window_y = win_y;
         m_resize_start_w = win_w;
@@ -1040,8 +1087,14 @@ void Editor::handle_window_resize() {
     // Handle active resize
     if (m_resize_edge != RESIZE_NONE) {
         if (ImGui::IsMouseDown(0)) {
-            float dx = mouse.x - m_drag_start_mouse.x;
-            float dy = mouse.y - m_drag_start_mouse.y;
+            // Measure the drag against the desktop, not the window. ImGui's mouse
+            // position is window-relative, so when a left/top drag moves the window
+            // origin the reported position shifts too -- the delta then partly
+            // cancels itself and the edge stutters instead of tracking the cursor.
+            float gx, gy;
+            SDL_GetGlobalMouseState(&gx, &gy);
+            float dx = gx - m_resize_start_global_x;
+            float dy = gy - m_resize_start_global_y;
 
             int new_x = m_drag_start_window_x;
             int new_y = m_drag_start_window_y;
@@ -1087,8 +1140,17 @@ void Editor::handle_window_resize() {
                     break;
             }
 
-            SDL_SetWindowPosition(window, new_x, new_y);
-            SDL_SetWindowSize(window, new_w, new_h);
+            // Only talk to the window manager when something actually changed.
+            // These are round-trips to the WM/compositor, and calling both of them
+            // unconditionally every frame for the whole duration of a drag was the
+            // main source of the resize lag -- it cost a pair of round-trips per
+            // frame even while the cursor was completely still.
+            if (new_x != win_x || new_y != win_y) {
+                SDL_SetWindowPosition(window, new_x, new_y);
+            }
+            if (new_w != win_w || new_h != win_h) {
+                SDL_SetWindowSize(window, new_w, new_h);
+            }
         } else {
             m_resize_edge = RESIZE_NONE;
         }
