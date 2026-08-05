@@ -2,7 +2,9 @@
 set -euo pipefail
 SESSION="stratum-features"
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
-WT_DIR="$BASE_DIR/Worktrees"
+# Keep worktrees OUTSIDE the repo. Pointing this inside BASE_DIR got the
+# worktree dirs committed as stray gitlinks by an unrelated `git add`.
+WT_DIR="${STRATUM_WT_DIR:-$(dirname "$BASE_DIR")/Stratum-Worktrees}"
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -s "$SESSION" -n "entity-selection"
 tmux send-keys -t "$SESSION:entity-selection" \

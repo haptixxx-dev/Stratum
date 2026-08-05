@@ -38,3 +38,6 @@ docs/generated/
 # Keep compile_commands for clangd
 !build/compile_commands.json
 imgui.ini
+
+# Parallel-agent git worktrees (see launch-features.sh)
+Worktrees/
