@@ -91,6 +91,10 @@ public:
     float get_current_speed() const { return m_base_speed * m_speed_multiplier; }
 
 private:
+    /// Clamp pitch, then derive m_forward/m_right/m_up from m_yaw and m_pitch.
+    /// The single source of truth for orientation - call this after touching the
+    /// Euler angles, never recompute the basis by hand.
+    void update_orientation_from_angles();
     void recalculate_view();
     void recalculate_projection(float aspect_ratio);
 

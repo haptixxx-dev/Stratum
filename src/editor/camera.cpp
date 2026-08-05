@@ -8,19 +8,47 @@
 namespace stratum {
 
 Camera::Camera() {
+    // Derive the basis from m_yaw/m_pitch before the first view matrix. Without
+    // this the camera starts with the default m_forward of (0,0,-1) -- level --
+    // while m_pitch claims -25 degrees, and the two only reconcile once the user
+    // right-drags, because that was the sole place the basis got recomputed.
+    update_orientation_from_angles();
     recalculate_view();
 }
 
-void Camera::set_target(const glm::vec3& target) {
-    m_forward = glm::normalize(target - m_position);
+void Camera::update_orientation_from_angles() {
+    m_pitch = std::clamp(m_pitch, -89.0f, 89.0f);
+
+    glm::vec3 front;
+    front.x = cos(glm::radians(m_yaw)) * cos(glm::radians(m_pitch));
+    front.y = sin(glm::radians(m_pitch));
+    front.z = sin(glm::radians(m_yaw)) * cos(glm::radians(m_pitch));
+
+    m_forward = glm::normalize(front);
     m_right = glm::normalize(glm::cross(m_forward, glm::vec3(0, 1, 0)));
     m_up = glm::normalize(glm::cross(m_right, m_forward));
-    
-    // Recalculate pitch/yaw from forward vector
-    m_pitch = glm::degrees(asin(m_forward.y));
-    m_yaw = glm::degrees(atan2(m_forward.z, m_forward.x));
-    
+
     m_dirty = true;
+}
+
+void Camera::set_target(const glm::vec3& target) {
+    const glm::vec3 to_target = target - m_position;
+    if (glm::length(to_target) < 1e-6f) {
+        return;  // Degenerate: normalize() would produce NaNs and wreck the view matrix
+    }
+
+    // Derive the angles from the requested direction, then rebuild the basis from
+    // them, so the angles and the basis cannot disagree.
+    const glm::vec3 dir = glm::normalize(to_target);
+    m_pitch = glm::degrees(asin(std::clamp(dir.y, -1.0f, 1.0f)));
+    m_yaw = glm::degrees(atan2(dir.z, dir.x));
+
+    update_orientation_from_angles();
+
+    // handle_input() accumulates from m_yaw_old/m_pitch_old, so leaving them stale
+    // here would make the first right-drag snap back to the previous orientation.
+    m_yaw_old = m_yaw;
+    m_pitch_old = m_pitch;
 }
 
 void Camera::update(float aspect_ratio) {
@@ -90,22 +118,12 @@ void Camera::handle_input(float dt) {
         m_yaw = m_yaw_old + xrel * m_sensitivity;
         m_pitch = m_pitch_old - yrel * m_sensitivity;
 
+        update_orientation_from_angles();
+
+        // Store the clamped pitch, so dragging past the pole does not build up
+        // an invisible offset that has to be dragged back off.
         m_yaw_old = m_yaw;
         m_pitch_old = m_pitch;
-
-        // Clamp pitch
-        m_pitch = std::clamp(m_pitch, -89.0f, 89.0f);
-
-        // Update vectors
-        glm::vec3 front;
-        front.x = cos(glm::radians(m_yaw)) * cos(glm::radians(m_pitch));
-        front.y = sin(glm::radians(m_pitch));
-        front.z = sin(glm::radians(m_yaw)) * cos(glm::radians(m_pitch));
-        m_forward = glm::normalize(front);
-        m_right = glm::normalize(glm::cross(m_forward, glm::vec3(0, 1, 0)));
-        m_up = glm::normalize(glm::cross(m_right, m_forward));
-        
-        m_dirty = true;
     }
 }
 
