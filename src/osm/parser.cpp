@@ -206,16 +206,26 @@ bool OSMParser::parse(const std::filesystem::path& filepath) {
         // Now process the raw data into our structures
         auto process_start = Clock::now();
 
-        report_progress(ParseProgress::Stage::ConvertingCoords, "Converting coordinates...");
+        // Everything past the file read is a fixed sequence, so report it as
+        // step N of PROCESS_STEPS. That gives callers a determinate progress bar
+        // for this half; the streaming read above has no known total, and reports
+        // current=0 so a UI can show an indeterminate bar instead of a stuck 0%.
+        constexpr size_t PROCESS_STEPS = 5;
+
+        report_progress(ParseProgress::Stage::ConvertingCoords, "Converting coordinates...",
+                        1, PROCESS_STEPS);
         convert_coordinates();
 
-        report_progress(ParseProgress::Stage::ProcessingRoads, "Processing roads...");
+        report_progress(ParseProgress::Stage::ProcessingRoads, "Processing roads...",
+                        2, PROCESS_STEPS);
         process_roads();
 
-        report_progress(ParseProgress::Stage::ProcessingBuildings, "Processing buildings...");
+        report_progress(ParseProgress::Stage::ProcessingBuildings, "Processing buildings...",
+                        3, PROCESS_STEPS);
         process_buildings();
 
-        report_progress(ParseProgress::Stage::ProcessingAreas, "Processing areas...");
+        report_progress(ParseProgress::Stage::ProcessingAreas, "Processing areas...",
+                        4, PROCESS_STEPS);
         process_areas();
 
         auto process_end = Clock::now();
@@ -226,7 +236,7 @@ bool OSMParser::parse(const std::filesystem::path& filepath) {
         m_data.stats.processed_buildings = m_data.buildings.size();
         m_data.stats.processed_areas = m_data.areas.size();
 
-        report_progress(ParseProgress::Stage::Complete, "Parsing complete");
+        report_progress(ParseProgress::Stage::Complete, "Parsing complete", 5, 5);
 
         m_has_data = true;
         return true;

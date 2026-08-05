@@ -2,6 +2,11 @@
 
 #include <imgui.h>
 #include <functional>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 #include "osm/parser.hpp"
 #include "osm/mesh_builder.hpp"
 #include "osm/tile_manager.hpp"
@@ -161,7 +166,39 @@ private:
     float m_dirty_threshold_pos = 10.0f;   // Rebuild if camera moves this far
     float m_dirty_threshold_rot = 0.1f;    // Rebuild if camera rotates this much (dot product)
 
-    void rebuild_osm_meshes();
+    // ── Async OSM import ────────────────────────────────────────────────────
+    // Parsing runs on a worker thread; everything that touches the quadtree, the
+    // camera or GPU resources stays on the main thread. Progress is surfaced as a
+    // three-stage bar: parse -> spatial index -> mesh build.
+    enum class ImportStage { Idle, Parsing, Indexing, BuildingMeshes, Done, Failed };
+
+    struct OSMImportJob {
+        // Owns its own parser so the worker never touches Editor::m_osm_parser,
+        // which the UI reads every frame. Moved into place once parsing succeeds.
+        std::unique_ptr<osm::OSMParser> parser;
+        std::string filepath;
+
+        std::mutex mutex;             ///< Guards `progress` (written on the worker)
+        osm::ParseProgress progress;
+
+        // MUST be declared last. Members destruct in reverse declaration order, and
+        // ~future on an std::async future blocks until the worker finishes. Declared
+        // last means it is destroyed first, so the worker is joined while `parser`
+        // and `filepath` are still alive. Move it earlier and a job destroyed
+        // mid-parse is a use-after-free.
+        std::future<bool> future;
+    };
+
+    std::unique_ptr<OSMImportJob> m_import_job;
+    ImportStage m_import_stage = ImportStage::Idle;
+    std::string m_import_message;
+    float m_import_fraction = 0.0f;
+    std::vector<osm::QuadTreeNode*> m_import_pending_nodes;
+    size_t m_import_nodes_total = 0;
+
+    void begin_osm_import(const std::string& filepath, const osm::ParserConfig& config);
+    void poll_osm_import();
+    void begin_mesh_rebuild();
     void rebuild_visible_batches();
     bool check_camera_dirty();  // Returns true if camera moved enough to warrant rebuild
     void upload_node_to_gpu(osm::QuadTreeNode& node, GPURenderer& renderer);

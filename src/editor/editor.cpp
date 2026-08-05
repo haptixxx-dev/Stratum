@@ -11,7 +11,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
-#include <thread>
+#include <chrono>
 
 namespace stratum {
 
@@ -68,6 +68,10 @@ void Editor::render() {
 
     // Handle window resizing from edges
     handle_window_resize();
+
+    // Advance any in-flight OSM import. Must run before the panels draw so the
+    // progress bar reflects this frame's state.
+    poll_osm_import();
 
     setup_dockspace();
 
@@ -721,42 +725,53 @@ void Editor::draw_osm_panel() {
     static std::string import_status;
     static bool import_error = false;
 
+    const bool importing = (m_import_stage == ImportStage::Parsing ||
+                            m_import_stage == ImportStage::Indexing ||
+                            m_import_stage == ImportStage::BuildingMeshes);
+
+    ImGui::BeginDisabled(importing);
     if (ImGui::Button("Import OSM File", ImVec2(-1, 0))) {
         if (strlen(filepath) == 0) {
             import_status = "Please enter a file path first";
             import_error = true;
         } else {
-            import_status = "Parsing...";
+            import_status.clear();
             import_error = false;
-
-            m_osm_parser.set_config(config);
-            if (m_osm_parser.parse(filepath)) {
-                m_osm_parser.log_statistics();
-                m_osm_parser.log_sample_data();
-
-                // Build meshes from OSM data
-                rebuild_osm_meshes();
-
-                // Log to console
-                const auto& data = m_osm_parser.get_data();
-                char msg[256];
-                snprintf(msg, sizeof(msg), "[OSM] Loaded: %zu roads, %zu buildings, %zu areas\n",
-                        data.roads.size(), data.buildings.size(), data.areas.size());
-                m_console_buffer.append(msg);
-                m_console_scroll_to_bottom = true;
-
-                import_status = "Import successful!";
-                import_error = false;
-            } else {
-                char msg[512];
-                snprintf(msg, sizeof(msg), "[OSM] Error: %s\n", m_osm_parser.get_error().c_str());
-                m_console_buffer.append(msg);
-                m_console_scroll_to_bottom = true;
-
-                import_status = m_osm_parser.get_error();
-                import_error = true;
-            }
+            begin_osm_import(filepath, config);
         }
+    }
+    ImGui::EndDisabled();
+
+    // Progress, driven by poll_osm_import()
+    if (importing) {
+        const char* stage_label =
+            m_import_stage == ImportStage::Parsing        ? "1/3 Parsing" :
+            m_import_stage == ImportStage::Indexing       ? "2/3 Spatial index" :
+                                                            "3/3 Building meshes";
+
+        // The parser reports item counts only for some stages, so a zero fraction
+        // means "unknown", not "nothing done" -- show an indeterminate bar rather
+        // than one frozen at 0%.
+        if (m_import_fraction > 0.0f) {
+            ImGui::ProgressBar(m_import_fraction, ImVec2(-1, 0));
+        } else {
+            const float t = fmodf((float)ImGui::GetTime() * 0.8f, 1.0f);
+            ImGui::ProgressBar(-1.0f * t, ImVec2(-1, 0), "working...");
+        }
+        ImGui::Text("%s", stage_label);
+        if (!m_import_message.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("- %s", m_import_message.c_str());
+        }
+        if (m_import_stage == ImportStage::BuildingMeshes && m_import_nodes_total > 0) {
+            ImGui::Text("Nodes: %zu / %zu",
+                        (size_t)(m_import_fraction * m_import_nodes_total + 0.5f),
+                        m_import_nodes_total);
+        }
+    } else if (m_import_stage == ImportStage::Failed) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", m_import_message.c_str());
+    } else if (m_import_stage == ImportStage::Done) {
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", m_import_message.c_str());
     }
 
     // Show status message
@@ -836,7 +851,14 @@ void Editor::draw_osm_panel() {
         }
 
         ImGui::Separator();
+        // Clearing mid-import would drop the quadtree nodes that m_import_pending_nodes
+        // still points at, and poll_osm_import() would then read freed memory.
+        ImGui::BeginDisabled(importing);
         if (ImGui::Button("Clear Data", ImVec2(-1, 0))) {
+            m_import_stage = ImportStage::Idle;
+            m_import_pending_nodes.clear();
+            m_import_nodes_total = 0;
+            m_import_message.clear();
             m_osm_parser.clear();
             m_quadtree.clear();
             m_building_meshes.clear();
@@ -846,6 +868,7 @@ void Editor::draw_osm_panel() {
             m_batched_road_tris.clear();
             m_batched_area_tris.clear();
         }
+        ImGui::EndDisabled();
     }
 
     ImGui::End();
@@ -1161,7 +1184,131 @@ void Editor::handle_window_resize() {
     }
 }
 
-void Editor::rebuild_osm_meshes() {
+void Editor::begin_osm_import(const std::string& filepath, const osm::ParserConfig& config) {
+    if (m_import_job) {
+        spdlog::warn("An OSM import is already running");
+        return;
+    }
+
+    auto job = std::make_unique<OSMImportJob>();
+    job->filepath = filepath;
+    job->parser = std::make_unique<osm::OSMParser>();
+    job->parser->set_config(config);
+
+    // The callback fires on the worker thread. Snapshot under the mutex; the UI
+    // reads the same field on the main thread.
+    OSMImportJob* j = job.get();
+    job->parser->set_progress_callback([j](const osm::ParseProgress& p) {
+        std::lock_guard<std::mutex> lock(j->mutex);
+        j->progress = p;
+    });
+
+    // Safe to capture `j`: the job is only destroyed after its future is ready,
+    // and ~OSMImportJob joins the worker before releasing anything it touches.
+    job->future = std::async(std::launch::async, [j]() {
+        return j->parser->parse(j->filepath);
+    });
+
+    m_import_job = std::move(job);
+    m_import_stage = ImportStage::Parsing;
+    m_import_message = "Parsing...";
+    m_import_fraction = 0.0f;
+    m_import_nodes_total = 0;
+    m_import_pending_nodes.clear();
+
+    spdlog::info("Started async OSM import: {}", filepath);
+}
+
+void Editor::poll_osm_import() {
+    if (m_import_job) {
+        // ── Stage 1: parsing on the worker ──
+        {
+            std::lock_guard<std::mutex> lock(m_import_job->mutex);
+            const auto& p = m_import_job->progress;
+            if (!p.message.empty()) m_import_message = p.message;
+            m_import_fraction = p.percentage() / 100.0f;
+        }
+
+        if (m_import_job->future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            return;  // still parsing; the UI keeps animating
+        }
+
+        const bool ok = m_import_job->future.get();
+        if (!ok) {
+            const std::string err = m_import_job->parser->get_error();
+            m_import_job.reset();
+            m_import_stage = ImportStage::Failed;
+            m_import_message = err;
+
+            char msg[512];
+            snprintf(msg, sizeof(msg), "[OSM] Error: %s\n", err.c_str());
+            m_console_buffer.append(msg);
+            m_console_scroll_to_bottom = true;
+            spdlog::error("OSM import failed: {}", err);
+            return;
+        }
+
+        // Hand the parsed data over on the main thread, then release the job.
+        m_osm_parser = std::move(*m_import_job->parser);
+        m_import_job.reset();
+
+        m_osm_parser.log_statistics();
+        m_osm_parser.log_sample_data();
+
+        // ── Stage 2: spatial index ──
+        // Blocking, but far cheaper than parsing, and it mutates the quadtree that
+        // render_3d walks every frame, so it has to stay on the main thread.
+        m_import_stage = ImportStage::Indexing;
+        m_import_message = "Building spatial index...";
+        m_import_fraction = 0.0f;
+
+        begin_mesh_rebuild();
+
+        m_import_stage = ImportStage::BuildingMeshes;
+        m_import_message = "Building meshes...";
+        return;
+    }
+
+    if (m_import_stage != ImportStage::BuildingMeshes) {
+        return;
+    }
+
+    // ── Stage 3: drain the async node builds ──
+    // Also polled by render_3d, but do it here too so progress advances even when
+    // the Viewport panel is closed.
+    m_quadtree.poll_async_builds();
+
+    size_t done = 0;
+    for (const auto* node : m_import_pending_nodes) {
+        if (node->meshes_built) ++done;
+    }
+
+    m_import_fraction = m_import_nodes_total > 0
+        ? static_cast<float>(done) / static_cast<float>(m_import_nodes_total)
+        : 1.0f;
+
+    if (done < m_import_nodes_total) {
+        return;
+    }
+
+    // ── Complete ──
+    m_import_pending_nodes.clear();
+    rebuild_visible_batches();
+
+    const auto& data = m_osm_parser.get_data();
+    char msg[256];
+    snprintf(msg, sizeof(msg), "[OSM] Loaded: %zu roads, %zu buildings, %zu areas\n",
+             data.roads.size(), data.buildings.size(), data.areas.size());
+    m_console_buffer.append(msg);
+    m_console_scroll_to_bottom = true;
+
+    m_import_stage = ImportStage::Done;
+    m_import_fraction = 1.0f;
+    m_import_message = "Import successful";
+    spdlog::info("OSM import complete");
+}
+
+void Editor::begin_mesh_rebuild() {
     m_building_meshes.clear();
     m_road_meshes.clear();
     m_area_meshes.clear();
@@ -1225,45 +1372,29 @@ void Editor::rebuild_osm_meshes() {
     m_last_camera_pos = m_camera.get_position();
     m_last_camera_dir = m_camera.get_forward();
 
-    // Build meshes synchronously for visible leaves so geometry appears immediately
-    {
-        Frustum frustum = m_camera.get_frustum();
-        glm::vec3 cam_pos = m_camera.get_position();
-        float radius_sq = m_view_radius * m_view_radius;
-        size_t built = 0;
+    // Queue the initially-visible leaves. These builds are already asynchronous;
+    // poll_osm_import() drains them across frames and reports progress. Blocking
+    // here on a spin-wait used to freeze the UI for the whole build.
+    m_import_pending_nodes.clear();
 
-        m_quadtree.traverse_visible(
-            frustum.planes, cam_pos, m_view_radius,
-            600.0f, m_camera.m_fov, m_contribution_threshold,
-            true, true, false, // frustum + distance, no contribution cull
-            [&](osm::QuadTreeNode* node, float /*dist_sq*/) {
-                if (!node->meshes_built && !node->meshes_pending) {
-                    // Build synchronously for immediate display
-                    m_quadtree.queue_node_build_async(node);
-                    built++;
+    Frustum frustum = m_camera.get_frustum();
+    glm::vec3 cam_pos = m_camera.get_position();
+
+    m_quadtree.traverse_visible(
+        frustum.planes, cam_pos, m_view_radius,
+        600.0f, m_camera.m_fov, m_contribution_threshold,
+        true, true, false, // frustum + distance, no contribution cull
+        [&](osm::QuadTreeNode* node, float /*dist_sq*/) {
+            if (!node->meshes_built && !node->meshes_pending) {
+                if (m_quadtree.queue_node_build_async(node)) {
+                    m_import_pending_nodes.push_back(node);
                 }
             }
-        );
-
-        // Wait for all initial builds to complete
-        if (built > 0) {
-            spdlog::info("Waiting for {} initial node builds...", built);
-            size_t total_completed = 0;
-            while (total_completed < built) {
-                size_t c = m_quadtree.poll_async_builds();
-                total_completed += c;
-                if (c == 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
-            }
-            spdlog::info("Initial builds complete");
         }
-    }
+    );
 
-    rebuild_visible_batches();
-
-    spdlog::info("Initial batch: {} area tris, {} building tris, {} road tris",
-                 m_batched_area_tris.size(), m_batched_building_tris.size(), m_batched_road_tris.size());
+    m_import_nodes_total = m_import_pending_nodes.size();
+    spdlog::info("Queued {} initial node builds", m_import_nodes_total);
 }
 
 bool Editor::check_camera_dirty() {
