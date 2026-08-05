@@ -355,17 +355,10 @@ void Editor::draw_viewport() {
 
     // Poll for completed async quadtree node builds
     if (m_quadtree.leaf_count() > 0) {
-        size_t completed = m_quadtree.poll_async_builds();
-        if (completed > 0) {
-            m_batches_dirty = true;  // New meshes available, need to rebatch
-        }
+        m_quadtree.poll_async_builds();
     }
-
-    // Rebuild visible batches only when camera moves significantly or new meshes ready
-    if (m_quadtree.leaf_count() > 0 && (m_batches_dirty || check_camera_dirty())) {
-        rebuild_visible_batches();
-        m_batches_dirty = false;
-    }
+    // Streaming (queueing builds for newly-visible nodes) now rides on the
+    // traversal render_3d already performs, so there is no second traversal here.
 
     // Im3D Frame
     Im3D_NewFrame(dt, m_camera, viewport_size.x, viewport_size.y, m_viewport_focused);
@@ -431,41 +424,8 @@ void Editor::draw_viewport() {
         }
     }
 
-    // Draw Area Meshes - pre-batched for performance (draw first, at bottom layer)
-    if (m_im3d_debug_geometry && m_render_areas && !m_batched_area_tris.empty()) {
-        Im3d::BeginTriangles();
-        for (const auto& tri : m_batched_area_tris) {
-            Im3d::Color color(tri.color.r, tri.color.g, tri.color.b, tri.color.a);
-            Im3d::Vertex(Im3d::Vec3(tri.p0.x, tri.p0.y, tri.p0.z), color);
-            Im3d::Vertex(Im3d::Vec3(tri.p1.x, tri.p1.y, tri.p1.z), color);
-            Im3d::Vertex(Im3d::Vec3(tri.p2.x, tri.p2.y, tri.p2.z), color);
-        }
-        Im3d::End();
-    }
 
-    // Draw Road Meshes - pre-batched for performance (draw second, over areas)
-    if (m_im3d_debug_geometry && m_render_roads && !m_batched_road_tris.empty()) {
-        Im3d::BeginTriangles();
-        for (const auto& tri : m_batched_road_tris) {
-            Im3d::Color color(tri.color.r, tri.color.g, tri.color.b, tri.color.a);
-            Im3d::Vertex(Im3d::Vec3(tri.p0.x, tri.p0.y, tri.p0.z), color);
-            Im3d::Vertex(Im3d::Vec3(tri.p1.x, tri.p1.y, tri.p1.z), color);
-            Im3d::Vertex(Im3d::Vec3(tri.p2.x, tri.p2.y, tri.p2.z), color);
-        }
-        Im3d::End();
-    }
 
-    // Draw Building Meshes - pre-batched for performance (draw last, on top)
-    if (m_im3d_debug_geometry && m_render_buildings && !m_batched_building_tris.empty()) {
-        Im3d::BeginTriangles();
-        for (const auto& tri : m_batched_building_tris) {
-            Im3d::Color color(tri.color.r, tri.color.g, tri.color.b, tri.color.a);
-            Im3d::Vertex(Im3d::Vec3(tri.p0.x, tri.p0.y, tri.p0.z), color);
-            Im3d::Vertex(Im3d::Vec3(tri.p1.x, tri.p1.y, tri.p1.z), color);
-            Im3d::Vertex(Im3d::Vec3(tri.p2.x, tri.p2.y, tri.p2.z), color);
-        }
-        Im3d::End();
-    }
 
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
@@ -849,9 +809,6 @@ void Editor::draw_osm_panel() {
             m_building_meshes.clear();
             m_road_meshes.clear();
             m_area_meshes.clear();
-            m_batched_building_tris.clear();
-            m_batched_road_tris.clear();
-            m_batched_area_tris.clear();
         }
         ImGui::EndDisabled();
     }
@@ -991,14 +948,17 @@ void Editor::draw_render_settings() {
         ImGui::Separator();
         ImGui::Text("QuadTree Statistics");
 
-        size_t total_tris = m_batched_area_tris.size() + m_batched_building_tris.size() + m_batched_road_tris.size();
 
         ImGui::BulletText("Leaves: %zu", m_quadtree.leaf_count());
         ImGui::BulletText("Max Depth: %d", m_quadtree.max_depth());
         ImGui::BulletText("Roads: %zu", m_quadtree.total_roads());
         ImGui::BulletText("Buildings: %zu", m_quadtree.total_buildings());
         ImGui::BulletText("Areas: %zu", m_quadtree.total_areas());
-        ImGui::BulletText("Batched Triangles: %zu", total_tris);
+        if (m_gpu_renderer) {
+            const auto stats = m_gpu_renderer->get_frame_stats();
+            ImGui::BulletText("Draw calls: %u", stats.draw_calls);
+            ImGui::BulletText("Triangles drawn: %u", stats.triangles);
+        }
     }
 
     ImGui::End();
@@ -1350,7 +1310,6 @@ void Editor::poll_osm_import() {
 
     // ── Complete ──
     m_import_pending_nodes.clear();
-    rebuild_visible_batches();
 
     const auto& data = m_osm_parser.get_data();
     char msg[256];
@@ -1369,9 +1328,6 @@ void Editor::begin_mesh_rebuild() {
     m_building_meshes.clear();
     m_road_meshes.clear();
     m_area_meshes.clear();
-    m_batched_building_tris.clear();
-    m_batched_road_tris.clear();
-    m_batched_area_tris.clear();
 
     const auto& osm_data = m_osm_parser.get_data();
 
@@ -1452,9 +1408,6 @@ void Editor::begin_mesh_rebuild() {
     m_use_tile_culling = true;
     m_use_distance_culling = true;
     m_use_contribution_culling = false; // disable initially — camera is far, nodes appear small
-    m_batches_dirty = true;
-    m_last_camera_pos = m_camera.get_position();
-    m_last_camera_dir = m_camera.get_forward();
 
     // Queue the initially-visible leaves. These builds are already asynchronous;
     // poll_osm_import() drains them across frames and reports progress. Blocking
@@ -1481,81 +1434,7 @@ void Editor::begin_mesh_rebuild() {
     spdlog::info("Queued {} initial node builds", m_import_nodes_total);
 }
 
-bool Editor::check_camera_dirty() {
-    glm::vec3 cam_pos = m_camera.get_position();
-    glm::vec3 cam_dir = m_camera.get_forward();
 
-    // Check if position changed enough
-    float dist_sq = glm::dot(cam_pos - m_last_camera_pos, cam_pos - m_last_camera_pos);
-    if (dist_sq > m_dirty_threshold_pos * m_dirty_threshold_pos) {
-        m_last_camera_pos = cam_pos;
-        m_last_camera_dir = cam_dir;
-        return true;
-    }
-
-    // Check if rotation changed enough (using dot product)
-    float dot = glm::dot(cam_dir, m_last_camera_dir);
-    if (dot < 1.0f - m_dirty_threshold_rot) {
-        m_last_camera_pos = cam_pos;
-        m_last_camera_dir = cam_dir;
-        return true;
-    }
-
-    return false;
-}
-
-void Editor::rebuild_visible_batches() {
-    m_batched_area_tris.clear();
-    m_batched_building_tris.clear();
-    m_batched_road_tris.clear();
-
-    // Helper to batch a mesh's triangles
-    auto batch_mesh = [](const Mesh& mesh, std::vector<BatchedTriangle>& batch) {
-        for (size_t i = 0; i < mesh.indices.size(); i += 3) {
-            const auto& v0 = mesh.vertices[mesh.indices[i]];
-            const auto& v1 = mesh.vertices[mesh.indices[i + 1]];
-            const auto& v2 = mesh.vertices[mesh.indices[i + 2]];
-            batch.push_back({v0.position, v1.position, v2.position, v0.color});
-        }
-    };
-
-    Frustum frustum = m_camera.get_frustum();
-    glm::vec3 cam_pos = m_camera.get_position();
-
-    // Use quadtree traversal with hierarchical culling
-    m_quadtree.traverse_visible(
-        frustum.planes,
-        cam_pos,
-        m_view_radius,
-        600.0f, // approximate screen height
-        m_camera.m_fov,
-        m_contribution_threshold,
-        m_use_tile_culling,
-        m_use_distance_culling,
-        m_use_contribution_culling,
-        [&](osm::QuadTreeNode* node, float /*dist_sq*/) {
-            // Async lazy mesh building - queue if not built/pending
-            if (!node->meshes_built && !node->meshes_pending) {
-                m_quadtree.queue_node_build_async(node);
-                return;
-            }
-
-            // Skip nodes still being built
-            if (!node->meshes_built) return;
-
-            // Node passed all culling — batch its meshes
-            for (const auto& mesh : node->area_meshes) {
-                batch_mesh(mesh, m_batched_area_tris);
-            }
-            for (const auto& mesh : node->building_meshes) {
-                batch_mesh(mesh, m_batched_building_tris);
-            }
-            for (const auto& mesh : node->road_meshes) {
-                batch_mesh(mesh, m_batched_road_tris);
-            }
-        }
-    );
-}
 
 void Editor::upload_node_to_gpu(osm::QuadTreeNode& node, GPURenderer& renderer) {
     if (node.gpu_uploaded) return;
@@ -1648,7 +1527,15 @@ void Editor::render_3d(GPURenderer& renderer) {
         m_use_distance_culling,
         m_use_contribution_culling,
         [&](osm::QuadTreeNode* node, float /*dist_sq*/) {
-            if (!node->meshes_built) return;
+            // Stream: a node that just became visible gets its mesh build queued
+            // here. This traversal is the only one per frame, so it has to do the
+            // queueing that rebuild_visible_batches() used to.
+            if (!node->meshes_built) {
+                if (!node->meshes_pending) {
+                    m_quadtree.queue_node_build_async(node);
+                }
+                return;
+            }
 
             // Upload to GPU if needed
             if (!node->gpu_uploaded) {

@@ -577,8 +577,11 @@ uint32_t GPURenderer::upload_mesh(const Mesh& mesh) {
         }
     }
 
-    // Map transfer buffer and copy data
-    void* mapped = SDL_MapGPUTransferBuffer(m_device, m_transfer_buffer, false);
+    // cycle = true: if a previous upload is still reading this transfer buffer,
+    // SDL rotates to another internal allocation instead of us having to wait for
+    // the GPU to drain. This is what makes the SDL_WaitForGPUIdle below
+    // unnecessary -- see the note at the submit.
+    void* mapped = SDL_MapGPUTransferBuffer(m_device, m_transfer_buffer, true);
     if (!mapped) {
         spdlog::error("Failed to map transfer buffer: {}", SDL_GetError());
         return 0;
@@ -652,10 +655,13 @@ uint32_t GPURenderer::upload_mesh(const Mesh& mesh) {
 
     SDL_EndGPUCopyPass(copy_pass);
     SDL_SubmitGPUCommandBuffer(cmd);
-    
-    // Wait for the upload to complete before reusing the transfer buffer
-    // This ensures the GPU has finished reading from the transfer buffer
-    SDL_WaitForGPUIdle(m_device);
+
+    // Deliberately NOT SDL_WaitForGPUIdle here. This is called from inside
+    // render_3d's traversal for every node that has just become visible, so a
+    // full pipeline flush per mesh meant thousands of stalls on import and a
+    // fresh stall for every node streamed in while the camera moves. Mapping
+    // with cycle = true above already guarantees we never write to memory the
+    // GPU is still reading.
 
     // Store and return ID
     uint32_t mesh_id = m_next_mesh_id++;
@@ -881,6 +887,10 @@ void GPURenderer::end_frame() {
     // End render pass if still active
     end_render_pass();
 
+    // Publish this frame's counters and start the next frame's at zero.
+    m_frame_stats_last = m_frame_stats;
+    m_frame_stats = FrameStats{};
+
     SDL_SubmitGPUCommandBuffer(m_cmd_buffer);
     m_cmd_buffer = nullptr;
     m_swapchain_texture = nullptr;
@@ -923,6 +933,14 @@ void GPURenderer::bind_mesh_pipeline() {
 
     if (pipeline) {
         SDL_BindGPUGraphicsPipeline(m_render_pass, pipeline);
+
+        // Push the frame-constant scene uniforms once here rather than per draw.
+        // SDL_GPU uniform pushes are bound state that persists across subsequent
+        // draws, so one push covers every mesh drawn with this pipeline.
+        if (m_current_shader_mode == ShaderMode::PBR && m_pbr_pipeline) {
+            SDL_PushGPUFragmentUniformData(m_cmd_buffer, 0, &m_scene_uniforms,
+                                           sizeof(m_scene_uniforms));
+        }
     }
 }
 
@@ -1087,9 +1105,9 @@ void GPURenderer::draw_mesh(uint32_t mesh_id, const glm::mat4& model,
         uniforms.camera_position = glm::vec4(m_camera_position, SDL_GetTicks() / 1000.0f);
 
         SDL_PushGPUVertexUniformData(m_cmd_buffer, 0, &uniforms, sizeof(uniforms));
-
-        // Push scene uniforms to fragment shader (set 2, binding 0)
-        SDL_PushGPUFragmentUniformData(m_cmd_buffer, 0, &m_scene_uniforms, sizeof(m_scene_uniforms));
+        // Scene uniforms are frame-constant and are pushed once in
+        // bind_mesh_pipeline(). Pushing them per draw cost a full SceneUniforms
+        // copy on every one of the thousands of draws a city-scale scene issues.
     } else {
         // Simple shader uniform layout: { mvp, model, color_tint }
         MeshUniforms uniforms{};
@@ -1113,9 +1131,12 @@ void GPURenderer::draw_mesh(uint32_t mesh_id, const glm::mat4& model,
         index_binding.offset = 0;
         SDL_BindGPUIndexBuffer(m_render_pass, &index_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
         SDL_DrawGPUIndexedPrimitives(m_render_pass, mesh.index_count, 1, 0, 0, 0);
+        m_frame_stats.triangles += mesh.index_count / 3;
     } else {
         SDL_DrawGPUPrimitives(m_render_pass, mesh.vertex_count, 1, 0, 0);
+        m_frame_stats.triangles += mesh.vertex_count / 3;
     }
+    ++m_frame_stats.draw_calls;
 }
 
 void GPURenderer::draw_mesh_immediate(const Mesh& mesh, const glm::mat4& model) {

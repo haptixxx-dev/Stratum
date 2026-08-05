@@ -249,6 +249,15 @@ public:
      */
     void bind_mesh_pipeline();
 
+    /// Per-frame draw statistics, for the stats panel and for judging changes.
+    struct FrameStats {
+        uint32_t draw_calls = 0;
+        uint32_t triangles = 0;
+    };
+    /// Stats for the last COMPLETED frame. The UI panels draw before render_3d,
+    /// so reporting the in-progress frame would always show zero.
+    FrameStats get_frame_stats() const { return m_frame_stats_last; }
+
     /**
      * @brief Set the fill mode for mesh rendering
      * @param mode Solid or Wireframe
@@ -423,6 +432,9 @@ private:
     // (SDL_gpu_vulkan.c:7768-7801), so an oversized depth target is harmless.
     uint32_t m_depth_alloc_width = 0;
     uint32_t m_depth_alloc_height = 0;
+
+    FrameStats m_frame_stats;       ///< Accumulated over the frame in progress
+    FrameStats m_frame_stats_last;  ///< Completed frame, what get_frame_stats reports
 
     // Matrices
     glm::mat4 m_view{1.0f};
