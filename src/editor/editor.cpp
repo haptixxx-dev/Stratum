@@ -288,7 +288,11 @@ void Editor::draw_menu_bar() {
             }
         }
         ImGui::SameLine();
-        if (ImGui::Button(m_fullscreen ? " \xe2\x9d\x90 " : " \xe2\x9b\xb6 ")) {
+        // ASCII only: the default ImGui font (ProggyClean, via AddFontDefault in
+        // application.cpp) carries no glyphs beyond Basic Latin, so a Unicode
+        // fullscreen symbol renders as the missing-glyph box. Same 3-character
+        // width as the other title-bar buttons so nothing shifts when it toggles.
+        if (ImGui::Button(m_fullscreen ? "] [" : "[ ]")) {
             toggle_fullscreen();
         }
         if (ImGui::IsItemHovered()) {
