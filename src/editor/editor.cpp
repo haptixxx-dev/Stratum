@@ -1321,7 +1321,8 @@ void Editor::begin_mesh_rebuild() {
     // Initialize quadtree
     spdlog::info("Initializing quadtree...");
     m_quadtree.clear();
-    m_quadtree.init(osm_data.bounds);
+    // Sized from the features, not osm_data.bounds -- see QuadTree::init(ParsedOSMData).
+    m_quadtree.init(osm_data);
     m_quadtree.assign_data(osm_data);
 
     spdlog::info("QuadTree: {} leaves, {} roads, {} buildings, {} areas, max depth {}",
@@ -1344,20 +1345,40 @@ void Editor::begin_mesh_rebuild() {
     spdlog::info("Data center: ({}, {}, {})", data_center.x, data_center.y, data_center.z);
 
     // Center camera on data FIRST (before culling uses camera position)
-    if (found_geometry) {
-        float view_height = 300.0f;
-        float view_distance = 300.0f;
-        glm::vec3 cam_pos = data_center + glm::vec3(0.0f, view_height, view_distance);
+    glm::vec3 focus_centre;
+    float focus_radius = 0.0f;
+    const bool have_focus = m_quadtree.get_focus(focus_centre, focus_radius);
+
+    if (have_focus) {
+        // Frame where the features actually are, not the centre of their bounding
+        // box. Those differ wildly for an Overpass export, whose box is stretched
+        // by the nodes it pulls in for ways crossing the query area.
+        data_center = focus_centre;
+
+        // Scale to the data. The old fixed 300m/5000m numbers meant a large import
+        // put the camera thousands of metres from anything, so distance culling
+        // rejected every node, nothing was ever queued, and the viewport stayed
+        // empty with no error shown.
+        const float view_distance = std::clamp(focus_radius, 300.0f, 8000.0f);
+        glm::vec3 cam_pos = data_center + glm::vec3(0.0f, view_distance * 0.8f, view_distance);
 
         m_camera.set_position(cam_pos);
         m_camera.set_target(data_center);
-        m_camera.m_far = 50000.0f;
-        m_camera.m_base_speed = 200.0f;
-        m_view_radius = 5000.0f;
+        m_camera.m_far = std::max(50000.0f, focus_radius * 4.0f);
+        m_camera.m_base_speed = std::clamp(focus_radius * 0.1f, 200.0f, 5000.0f);
+        // Must reach past the camera's own distance from the data, or distance
+        // culling rejects everything before it can be built. Bounded so a huge
+        // import does not try to mesh the whole dataset at once -- the remainder
+        // streams in as the camera moves.
+        m_view_radius = std::clamp(view_distance * 3.0f, 5000.0f, 30000.0f);
 
-        spdlog::info("Camera at ({}, {}, {}) looking at ({}, {}, {})",
+        spdlog::info("Camera at ({:.0f}, {:.0f}, {:.0f}) looking at ({:.0f}, {:.0f}, {:.0f}), "
+                     "focus radius {:.0f}m, view radius {:.0f}m",
                      cam_pos.x, cam_pos.y, cam_pos.z,
-                     data_center.x, data_center.y, data_center.z);
+                     data_center.x, data_center.y, data_center.z,
+                     focus_radius, m_view_radius);
+    } else if (found_geometry) {
+        spdlog::warn("No populated quadtree leaves; leaving the camera where it is");
     }
 
     // Force camera matrix recalculation so frustum matches new position

@@ -72,7 +72,19 @@ class QuadTree {
 public:
     QuadTree() = default;
 
+    /// Size the root from the raw geographic bounds, centred on the projection
+    /// origin. Only correct when the bounds tightly enclose the imported features.
     void init(const BoundingBox& bounds);
+
+    /// Size the root from the local-space extent of the features that will
+    /// actually be stored, centred on them.
+    ///
+    /// Prefer this. ParsedOSMData::bounds is expanded by every raw node, including
+    /// the ones Overpass pulls in because a way or relation references them, which
+    /// can be hundreds of kilometres outside the queried area. Sizing the root from
+    /// those bounds pushes the real geometry into a corner far from the origin and
+    /// leaves MAX_DEPTH unable to subdivide down to a useful leaf size.
+    void init(const ParsedOSMData& data);
     void clear();
     void assign_data(const ParsedOSMData& data);
 
@@ -98,6 +110,16 @@ public:
     // Accessors
     std::vector<QuadTreeNode*> get_all_leaves();
     void get_bounds(glm::vec3& out_min, glm::vec3& out_max) const;
+
+    /// Where the data actually is: the centroid of populated leaves, weighted by
+    /// feature count, with the radius that encloses most of that mass.
+    ///
+    /// Use this for framing rather than the centre of get_bounds(). A handful of
+    /// far-flung features stretches the bounding box enormously -- an Overpass
+    /// export of Dublin can span 123km with its box centre out in the Atlantic --
+    /// but weighting by feature count puts the focus on the bulk of the geometry.
+    /// Returns false if there is no populated leaf.
+    bool get_focus(glm::vec3& out_centre, float& out_radius);
     size_t leaf_count() const;
     size_t total_roads() const;
     size_t total_buildings() const;

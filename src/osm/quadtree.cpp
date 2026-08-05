@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 #include <cmath>
 #include <algorithm>
+#include <limits>
 
 namespace stratum::osm {
 
@@ -32,6 +33,100 @@ void QuadTree::init(const BoundingBox& bounds) {
     compute_3d_bounds(m_root.get());
 
     spdlog::info("QuadTree: Initialized root node, half_size={:.0f}m", half);
+}
+
+void QuadTree::init(const ParsedOSMData& data) {
+    clear();
+
+    glm::dvec2 mn(std::numeric_limits<double>::max());
+    glm::dvec2 mx(std::numeric_limits<double>::lowest());
+    bool any = false;
+
+    const auto accumulate = [&](const std::vector<glm::dvec2>& pts) {
+        for (const auto& p : pts) {
+            mn = glm::min(mn, p);
+            mx = glm::max(mx, p);
+            any = true;
+        }
+    };
+
+    for (const auto& r : data.roads) accumulate(r.polyline);
+    for (const auto& b : data.buildings) {
+        accumulate(b.footprint);
+        for (const auto& h : b.holes) accumulate(h);
+    }
+    for (const auto& a : data.areas) {
+        accumulate(a.polygon);
+        for (const auto& h : a.holes) accumulate(h);
+    }
+
+    if (!any) {
+        spdlog::warn("QuadTree: no feature geometry, cannot initialize");
+        return;
+    }
+
+    const glm::dvec2 centre = (mn + mx) * 0.5;
+    // Square root node, with a small margin so features exactly on the boundary
+    // still land inside it.
+    double half = std::max(mx.x - mn.x, mx.y - mn.y) * 0.5 * 1.01;
+    half = std::max(half, QuadTreeConfig::MIN_NODE_SIZE);
+
+    m_root = std::make_unique<QuadTreeNode>();
+    m_root->center = centre;
+    m_root->half_size = half;
+    m_root->node_id = m_next_id++;
+    m_root->depth = 0;
+    compute_3d_bounds(m_root.get());
+
+    spdlog::info("QuadTree: root centred on ({:.0f}, {:.0f}), half_size={:.0f}m "
+                 "(feature extent {:.0f} x {:.0f}m)",
+                 centre.x, centre.y, half, mx.x - mn.x, mx.y - mn.y);
+}
+
+bool QuadTree::get_focus(glm::vec3& out_centre, float& out_radius) {
+    std::vector<QuadTreeNode*> leaves;
+    collect_leaves(m_root.get(), leaves);
+
+    // Feature-count-weighted mean of leaf centres.
+    glm::dvec3 accum(0.0);
+    double total = 0.0;
+    for (const auto* leaf : leaves) {
+        const double w = static_cast<double>(leaf->feature_count());
+        if (w <= 0.0) continue;
+        const glm::vec3 c = (leaf->bounds_min + leaf->bounds_max) * 0.5f;
+        accum += glm::dvec3(c) * w;
+        total += w;
+    }
+    if (total <= 0.0) return false;
+
+    const glm::dvec3 centre = accum / total;
+    out_centre = glm::vec3(centre);
+
+    // Radius covering the bulk of the mass: grow outward until most features are
+    // enclosed, so a few distant strays cannot drag the framing out to the horizon.
+    constexpr double MASS_FRACTION = 0.9;
+
+    std::vector<std::pair<double, double>> by_distance;  // (distance, weight)
+    by_distance.reserve(leaves.size());
+    for (const auto* leaf : leaves) {
+        const double w = static_cast<double>(leaf->feature_count());
+        if (w <= 0.0) continue;
+        const glm::vec3 c = (leaf->bounds_min + leaf->bounds_max) * 0.5f;
+        const glm::dvec3 d = glm::dvec3(c) - centre;
+        by_distance.emplace_back(std::sqrt(d.x * d.x + d.z * d.z), w);
+    }
+    std::sort(by_distance.begin(), by_distance.end());
+
+    double running = 0.0;
+    double radius = 0.0;
+    for (const auto& [dist, w] : by_distance) {
+        running += w;
+        radius = dist;
+        if (running >= total * MASS_FRACTION) break;
+    }
+
+    out_radius = static_cast<float>(std::max(radius, QuadTreeConfig::MIN_NODE_SIZE));
+    return true;
 }
 
 void QuadTree::clear() {
@@ -332,12 +427,24 @@ void QuadTree::traverse_recursive(
         return;
     }
 
-    // 2. Distance cull (XZ plane distance to node center)
+    // Centre distance, used for front-to-back sorting and for the contribution
+    // estimate below.
     glm::vec3 node_center_3d = (node->bounds_min + node->bounds_max) * 0.5f;
     glm::vec3 diff = node_center_3d - cam_pos;
     float dist_sq = diff.x * diff.x + diff.z * diff.z; // XZ plane
 
-    if (use_distance && dist_sq > radius_sq) {
+    // 2. Distance cull, measured to the NEAREST POINT of the node's XZ footprint.
+    //
+    // Testing the centre instead prunes the entire subtree of any internal node
+    // whose midpoint sits beyond the radius, even when the node's extent reaches
+    // the camera -- and internal nodes are large. On a 123km import that rejected
+    // every node at depth 1, so nothing was ever built and the viewport stayed
+    // empty even though thousands of leaves were within the view radius.
+    const float near_dx = cam_pos.x - std::clamp(cam_pos.x, node->bounds_min.x, node->bounds_max.x);
+    const float near_dz = cam_pos.z - std::clamp(cam_pos.z, node->bounds_min.z, node->bounds_max.z);
+    const float nearest_sq = near_dx * near_dx + near_dz * near_dz;
+
+    if (use_distance && nearest_sq > radius_sq) {
         return;
     }
 
