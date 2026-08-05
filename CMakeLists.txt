@@ -87,6 +87,13 @@ target_include_directories(stratum_core PUBLIC
     ${EXTERNAL_DIR}
 )
 
+# Vulkan clips depth to [0,1]; GLM defaults to OpenGL's [-1,1]. Without this,
+# glm::perspective wastes half the depth range and clips geometry nearer than
+# ~2x the near plane. PUBLIC and set here rather than per-file because every
+# translation unit that builds or consumes a projection matrix must agree --
+# a mismatch is an ODR violation with no diagnostic.
+target_compile_definitions(stratum_core PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE)
+
 target_link_libraries(stratum_core PUBLIC
     # Math
     glm::glm

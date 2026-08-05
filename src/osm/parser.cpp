@@ -228,6 +228,10 @@ bool OSMParser::parse(const std::filesystem::path& filepath) {
                         4, PROCESS_STEPS);
         process_areas();
 
+        // Must run after all three process_* passes, since it moves the geometry
+        // they produced.
+        recenter_on_features();
+
         auto process_end = Clock::now();
         m_data.stats.process_time_ms = std::chrono::duration<double, std::milli>(
             process_end - process_start).count();
@@ -246,6 +250,59 @@ bool OSMParser::parse(const std::filesystem::path& filepath) {
         spdlog::error("OSM Parser error: {}", m_error);
         return false;
     }
+}
+
+void OSMParser::recenter_on_features() {
+    // Mean over feature vertices, not the bounding-box centre: the mean is
+    // dominated by the bulk of the geometry, so a handful of distant strays
+    // cannot drag the origin away from where the data actually is.
+    glm::dvec2 sum(0.0);
+    size_t count = 0;
+
+    const auto accumulate = [&](const std::vector<glm::dvec2>& pts) {
+        for (const auto& p : pts) { sum += p; ++count; }
+    };
+    for (const auto& r : m_data.roads) accumulate(r.polyline);
+    for (const auto& b : m_data.buildings) {
+        accumulate(b.footprint);
+        for (const auto& h : b.holes) accumulate(h);
+    }
+    for (const auto& a : m_data.areas) {
+        accumulate(a.polygon);
+        for (const auto& h : a.holes) accumulate(h);
+    }
+
+    if (count == 0) return;
+
+    const glm::dvec2 centre = sum / static_cast<double>(count);
+    if (glm::length(centre) < 1.0) return;  // already centred, nothing to gain
+
+    const auto shift = [&](std::vector<glm::dvec2>& pts) {
+        for (auto& p : pts) p -= centre;
+    };
+    for (auto& r : m_data.roads) shift(r.polyline);
+    for (auto& b : m_data.buildings) {
+        shift(b.footprint);
+        for (auto& h : b.holes) shift(h);
+    }
+    for (auto& a : m_data.areas) {
+        shift(a.polygon);
+        for (auto& h : a.holes) shift(h);
+    }
+
+    // local = mercator - origin_mercator, so moving local by -centre is exactly
+    // moving the origin by +centre.
+    const glm::dvec2 new_origin_mercator =
+        m_converter.get_coord_system().origin_mercator + centre;
+    // Returns (lat, lon), which is the order set_origin takes.
+    const glm::dvec2 new_origin_latlon =
+        CoordinateConverter::mercator_to_wgs84(new_origin_mercator.x, new_origin_mercator.y);
+
+    m_converter.set_origin(new_origin_latlon.x, new_origin_latlon.y);
+    m_data.coord_system = m_converter.get_coord_system();
+
+    spdlog::info("OSM Parser: recentred origin by ({:.0f}, {:.0f})m to ({:.5f}, {:.5f})",
+                 centre.x, centre.y, new_origin_latlon.x, new_origin_latlon.y);
 }
 
 void OSMParser::convert_coordinates() {

@@ -236,6 +236,17 @@ private:
     void process_areas();
     void convert_coordinates();
 
+    /// Shift all processed feature geometry so its centre of mass sits at the
+    /// local origin, and move coord_system to match.
+    ///
+    /// convert_coordinates() puts the origin at the centre of ParsedOSMData::bounds,
+    /// which every raw node widens -- including the ones Overpass emits for ways
+    /// crossing the query area. On a Dublin export that leaves the actual geometry
+    /// ~480km from the origin, where float32 quantises positions to ~6cm: coplanar
+    /// surfaces collapse into each other and z-fight, and the view matrix jitters
+    /// visibly as the camera rotates. Recentring restores millimetre precision.
+    void recenter_on_features();
+
     // Classification helpers
     [[nodiscard]] static RoadType classify_road(const TagMap& tags);
     [[nodiscard]] static BuildingType classify_building(const TagMap& tags);

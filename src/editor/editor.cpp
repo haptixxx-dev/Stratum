@@ -1364,7 +1364,13 @@ void Editor::begin_mesh_rebuild() {
 
         m_camera.set_position(cam_pos);
         m_camera.set_target(data_center);
-        m_camera.m_far = std::max(50000.0f, focus_radius * 4.0f);
+        // Depth precision is governed by far/near, so keep that ratio sane rather
+        // than pairing a 0.1m near plane with a far plane tens of km out -- that
+        // combination puts almost the whole depth buffer in the first few metres
+        // and leaves coplanar roads, landuse and building footprints z-fighting.
+        // Only draw as far as nodes are actually built, plus headroom.
+        m_camera.m_far = std::clamp(view_distance * 6.0f, 20000.0f, 80000.0f);
+        m_camera.m_near = std::clamp(m_camera.m_far / 20000.0f, 0.1f, 5.0f);
         m_camera.m_base_speed = std::clamp(focus_radius * 0.1f, 200.0f, 5000.0f);
         // Must reach past the camera's own distance from the data, or distance
         // culling rejects everything before it can be built. Bounded so a huge

@@ -135,7 +135,7 @@ bool create_pipeline_for(GPURenderer& renderer, int type) {
     rasterizer.enable_depth_clip = true;
 
     SDL_GPUDepthStencilState depth_stencil{};
-    depth_stencil.compare_op = SDL_GPU_COMPAREOP_LESS;
+    depth_stencil.compare_op = SDL_GPU_COMPAREOP_GREATER;  // reverse-Z
     depth_stencil.enable_depth_test = true;    // occlude behind buildings/terrain
     depth_stencil.enable_depth_write = false;  // translucent overlay must not write depth
     depth_stencil.enable_stencil_test = false;

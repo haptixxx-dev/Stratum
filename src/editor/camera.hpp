@@ -27,10 +27,13 @@ struct Frustum {
         // Top
         planes[3] = glm::vec4(vp[0][3] - vp[0][1], vp[1][3] - vp[1][1],
                               vp[2][3] - vp[2][1], vp[3][3] - vp[3][1]);
-        // Near
-        planes[4] = glm::vec4(vp[0][3] + vp[0][2], vp[1][3] + vp[1][2],
-                              vp[2][3] + vp[2][2], vp[3][3] + vp[3][2]);
-        // Far
+        // Depth planes use the Vulkan clip condition 0 <= z_clip <= w_clip, NOT
+        // OpenGL's -w <= z <= w. The row2-alone plane is the z >= 0 half-space;
+        // writing it as row3 + row2 (the OpenGL form) yields a plane that does not
+        // bound the frustum at all, so culling silently keeps or drops the wrong
+        // nodes. Which of the two is "near" and which is "far" swaps under
+        // reverse-Z, but for culling only the pair matters.
+        planes[4] = glm::vec4(vp[0][2], vp[1][2], vp[2][2], vp[3][2]);
         planes[5] = glm::vec4(vp[0][3] - vp[0][2], vp[1][3] - vp[1][2],
                               vp[2][3] - vp[2][2], vp[3][3] - vp[3][2]);
 

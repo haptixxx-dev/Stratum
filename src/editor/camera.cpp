@@ -134,7 +134,18 @@ void Camera::recalculate_view() {
 }
 
 void Camera::recalculate_projection(float aspect_ratio) {
-    m_projection = glm::perspective(glm::radians(m_fov), aspect_ratio, m_near, m_far);
+    // Reverse-Z: near and far are passed swapped, so the near plane maps to depth
+    // 1.0 and the far plane to 0.0. Paired with the D32_FLOAT depth target this
+    // spends float mantissa where it is needed instead of collapsing everything
+    // beyond a few hundred metres into a handful of representable values.
+    //
+    // With the conventional mapping, depth at 8km resolved to about 3 metres, so
+    // the 1-3cm separations MeshBuilder gives roads, landuse and building
+    // footprints could not be represented and they z-fought into speckle.
+    //
+    // Requires GLM_FORCE_DEPTH_ZERO_TO_ONE (set in CMakeLists), depth clears to
+    // 0.0, and a GREATER depth compare on every pipeline.
+    m_projection = glm::perspective(glm::radians(m_fov), aspect_ratio, m_far, m_near);
     m_view_projection = m_projection * m_view;
 }
 

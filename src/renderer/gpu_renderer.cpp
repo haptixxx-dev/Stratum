@@ -356,7 +356,7 @@ bool GPURenderer::create_simple_pipelines() {
 
     // Depth stencil state
     SDL_GPUDepthStencilState depth_stencil{};
-    depth_stencil.compare_op = SDL_GPU_COMPAREOP_LESS;
+    depth_stencil.compare_op = SDL_GPU_COMPAREOP_GREATER;  // reverse-Z
     depth_stencil.enable_depth_test = true;
     depth_stencil.enable_depth_write = true;
     depth_stencil.enable_stencil_test = false;
@@ -478,7 +478,7 @@ bool GPURenderer::create_pbr_pipelines() {
 
     // Depth stencil state
     SDL_GPUDepthStencilState depth_stencil{};
-    depth_stencil.compare_op = SDL_GPU_COMPAREOP_LESS;
+    depth_stencil.compare_op = SDL_GPU_COMPAREOP_GREATER;  // reverse-Z
     depth_stencil.enable_depth_test = true;
     depth_stencil.enable_depth_write = true;
     depth_stencil.enable_stencil_test = false;
@@ -803,7 +803,7 @@ void GPURenderer::begin_render_pass() {
 
     // Depth target for 3D rendering
     SDL_GPUDepthStencilTargetInfo depth_target{};
-    depth_target.clear_depth = 1.0f;
+    depth_target.clear_depth = 0.0f;  // reverse-Z: 0 is the far plane
     depth_target.load_op = SDL_GPU_LOADOP_CLEAR;
     depth_target.store_op = SDL_GPU_STOREOP_DONT_CARE;  // Don't need to preserve depth
     depth_target.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
