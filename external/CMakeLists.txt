@@ -143,6 +143,9 @@ set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_INSTALL OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+# Vendored assimp's bundled pugixml trips -Werror=uninitialized on GCC >= 15.
+# We do not develop assimp here, so do not gate our build on its warnings.
+set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 # Disable importers you don't need to speed up build
 set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
@@ -181,6 +184,9 @@ set(KTX_FEATURE_TESTS OFF CACHE BOOL "" FORCE)
 set(KTX_FEATURE_TOOLS OFF CACHE BOOL "" FORCE)
 set(KTX_FEATURE_LOADTEST_APPS OFF CACHE BOOL "" FORCE)
 set(KTX_FEATURE_DOC OFF CACHE BOOL "" FORCE)
+# KTX's bundled astc-encoder defaults ASTCENC_WERROR=ON and KTX never overrides it.
+# Same rationale as assimp above: we don't develop it, don't gate our build on it.
+set(ASTCENC_WERROR OFF CACHE BOOL "" FORCE)
 add_subdirectory(KTX-Software)
 
 # ───────────────────────────────────────────────────────────────────
