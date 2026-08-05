@@ -19,6 +19,7 @@ option(STRATUM_ENABLE_TRACY "Enable Tracy profiler" ON)
 option(STRATUM_ENABLE_PYTHON "Enable Python scripting" ON)
 option(STRATUM_BUILD_TESTS "Build tests" OFF)
 option(STRATUM_BUILD_DOCS "Build documentation with Doxygen" OFF)
+option(STRATUM_USE_LLD "Link with LLD instead of the default linker" OFF)
 
 # ═══════════════════════════════════════════════════════════════════
 # GLOBAL SETTINGS
@@ -26,6 +27,25 @@ option(STRATUM_BUILD_DOCS "Build documentation with Doxygen" OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+
+# ═══════════════════════════════════════════════════════════════════
+# LINKER
+# ═══════════════════════════════════════════════════════════════════
+# Opt-in, and deliberately not CMAKE_LINKER_TYPE: that is CMake 3.29+ and is
+# silently ignored below it, while this project's floor is 3.24. LLD works with
+# both GCC and Clang, so the linker choice stays independent of the compiler.
+# The compiler itself cannot be set here at all -- it must be known before
+# project(), so pass -DCMAKE_CXX_COMPILER=clang++ at configure time.
+if(STRATUM_USE_LLD AND NOT MSVC)
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "-fuse-ld=lld" STRATUM_HAVE_LLD)
+    if(STRATUM_HAVE_LLD)
+        add_link_options(-fuse-ld=lld)
+        message(STATUS "Linker: LLD")
+    else()
+        message(WARNING "STRATUM_USE_LLD is ON but -fuse-ld=lld does not work; using the default linker")
+    endif()
+endif()
 
 # ═══════════════════════════════════════════════════════════════════
 # EXTERNAL DIRECTORY
@@ -168,7 +188,11 @@ target_link_libraries(stratum PRIVATE stratum_editor_lib)
 # ═══════════════════════════════════════════════════════════════════
 install(TARGETS stratum RUNTIME DESTINATION bin)
 install(DIRECTORY assets/ DESTINATION share/stratum/assets)
-install(DIRECTORY scripts/ DESTINATION share/stratum/scripts)
+# scripts/ does not exist yet (Python scripting is not wired up). Installing a
+# missing directory is a hard error, so only install it if it is actually there.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/scripts)
+    install(DIRECTORY scripts/ DESTINATION share/stratum/scripts)
+endif()
 
 # ═══════════════════════════════════════════════════════════════════
 # DOCUMENTATION (Doxygen)

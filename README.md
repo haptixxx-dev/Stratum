@@ -79,10 +79,45 @@ NB: Python scripting will *eventually*(tm) be always on
 | `STRATUM_ENABLE_PYTHON` | `ON` | Enable Python scripting |
 | `STRATUM_BUILD_TESTS` | `OFF` | Build test suite |
 | `STRATUM_BUILD_DOCS` | `OFF` | Build Doxygen documentation |
+| `STRATUM_USE_LLD` | `OFF` | Link with LLD instead of the default linker |
 
 ```bash
 cmake -B build -DSTRATUM_ENABLE_TRACY=OFF -DSTRATUM_ENABLE_PYTHON=ON
 ```
+
+### Building with Clang
+
+Clang is meaningfully faster than GCC here. Measured on a 16-thread machine,
+clean builds from an empty build directory:
+
+| Toolchain | Clean build | Binary |
+| --------- | ----------- | ------ |
+| GCC 16.1.1 + default ld | 144s | 8.5 MB |
+| Clang 22.1.8 + LLD | 112s | 7.5 MB |
+
+The compiler has to be chosen before `project()` runs, so it cannot be a
+`STRATUM_*` option — pass it at configure time into its own build directory:
+
+```bash
+cmake -S . -B build-clang -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DSTRATUM_USE_LLD=ON
+```
+
+Notes:
+
+- The ~22% saving is almost entirely Clang's front end, not the linker. This
+  build has few link edges and most are `ar` archive creation, so LLD is worth
+  turning on only because it is free — expect milliseconds, not seconds.
+  `STRATUM_USE_LLD` works with GCC too.
+- **mold is not worth installing for this project.** Its advantage over LLD is
+  in link time, which is not where the time goes here.
+- The single biggest win is **ccache** (`pacman -S ccache`), not the compiler:
+  roughly 845 of 885 objects are vendored dependencies that never change but get
+  rebuilt from scratch whenever the build directory is wiped.
+  Add `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache`.
+- Keep a GCC build dir around. GCC 16 caught two real problems in vendored
+  dependencies that Clang did not, and CI builds with GCC.
 
 ### Building Documentation
 
