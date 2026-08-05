@@ -101,24 +101,15 @@ add_library(stratum_editor_lib STATIC
     # Core
     src/core/application.cpp
     src/core/window.cpp
-    src/core/input.cpp
 
     # Renderer
-    src/renderer/gpu_device.cpp
     src/renderer/gpu_renderer.cpp
-    src/renderer/pipeline.cpp
-    src/renderer/mesh.cpp
-    src/renderer/texture.cpp
 
     # Editor
     src/editor/editor.cpp
     src/editor/camera.cpp
     src/editor/im3d_impl.cpp
-    src/editor/panels/viewport_panel.cpp
-    src/editor/panels/scene_panel.cpp
-    src/editor/panels/properties_panel.cpp
     src/editor/panels/procgen_panel.cpp
-    src/editor/gizmos.cpp
 )
 
 target_include_directories(stratum_editor_lib PUBLIC
