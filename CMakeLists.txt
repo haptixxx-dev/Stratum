@@ -117,7 +117,6 @@ add_library(stratum_editor_lib STATIC
     src/editor/panels/viewport_panel.cpp
     src/editor/panels/scene_panel.cpp
     src/editor/panels/properties_panel.cpp
-    src/editor/panels/osm_panel.cpp
     src/editor/panels/procgen_panel.cpp
     src/editor/gizmos.cpp
 )
