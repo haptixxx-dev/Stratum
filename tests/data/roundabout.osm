@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  roundabout.osm - a six-node closed ring tagged junction=roundabout, with three
+  approach roads.
+
+  The ring way 4000 starts and ends at node 401. Nodes 401, 403 and 405 are shared
+  with an approach way; nodes 402, 404 and 406 are ring-only shape points.
+
+  Expected: the ring splits into exactly three edges (401->403, 403->405,
+  405->401), every one flagged is_roundabout, forming a closed cycle. Each of the
+  three approach nodes has degree 3: two ring arms plus one approach arm.
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.34070" minlon="-6.26280" maxlat="53.34150" maxlon="-6.26120"/>
+
+  <!-- Ring, radius ~10 m about 53.34100 / -6.26200 -->
+  <node id="401" version="1" lat="53.341090" lon="-6.262000"/>
+  <node id="402" version="1" lat="53.341045" lon="-6.261870"/>
+  <node id="403" version="1" lat="53.340955" lon="-6.261870"/>
+  <node id="404" version="1" lat="53.340910" lon="-6.262000"/>
+  <node id="405" version="1" lat="53.340955" lon="-6.262130"/>
+  <node id="406" version="1" lat="53.341045" lon="-6.262130"/>
+
+  <!-- Approach ends -->
+  <node id="411" version="1" lat="53.341450" lon="-6.262000"/>
+  <node id="421" version="1" lat="53.340775" lon="-6.261350"/>
+  <node id="431" version="1" lat="53.340775" lon="-6.262650"/>
+
+  <way id="4000" version="1">
+    <nd ref="401"/>
+    <nd ref="402"/>
+    <nd ref="403"/>
+    <nd ref="404"/>
+    <nd ref="405"/>
+    <nd ref="406"/>
+    <nd ref="401"/>
+    <tag k="highway" v="tertiary"/>
+    <tag k="junction" v="roundabout"/>
+    <tag k="oneway" v="yes"/>
+    <tag k="lanes" v="1"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+
+  <way id="4010" version="1">
+    <nd ref="411"/>
+    <nd ref="401"/>
+    <tag k="highway" v="tertiary"/>
+    <tag k="name" v="North Approach"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+
+  <way id="4020" version="1">
+    <nd ref="403"/>
+    <nd ref="421"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="South East Approach"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+
+  <way id="4030" version="1">
+    <nd ref="405"/>
+    <nd ref="431"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="South West Approach"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+</osm>

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  motorway_link.osm - a slip road merging onto a motorway.
+
+  Way 5000 is the motorway mainline. Way 5010 is the ramp; it ends at node 503,
+  which is interior to the mainline, so the mainline splits there.
+
+  Expected: every edge of way 5010 is flagged is_link, no edge of way 5000 is, and
+  node 503 has degree 3.
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.34440" minlon="-6.27220" maxlat="53.34510" maxlon="-6.26730"/>
+
+  <node id="501" version="1" lat="53.34500" lon="-6.27200"/>
+  <node id="502" version="1" lat="53.34500" lon="-6.27050"/>
+  <node id="503" version="1" lat="53.34500" lon="-6.26900"/>
+  <node id="504" version="1" lat="53.34500" lon="-6.26750"/>
+
+  <node id="511" version="1" lat="53.34455" lon="-6.27020"/>
+  <node id="512" version="1" lat="53.34478" lon="-6.26950"/>
+
+  <way id="5000" version="1">
+    <nd ref="501"/>
+    <nd ref="502"/>
+    <nd ref="503"/>
+    <nd ref="504"/>
+    <tag k="highway" v="motorway"/>
+    <tag k="ref" v="M50"/>
+    <tag k="oneway" v="yes"/>
+    <tag k="lanes" v="3"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="maxspeed" v="100"/>
+    <tag k="sidewalk" v="no"/>
+  </way>
+
+  <way id="5010" version="1">
+    <nd ref="511"/>
+    <nd ref="512"/>
+    <nd ref="503"/>
+    <tag k="highway" v="motorway_link"/>
+    <tag k="oneway" v="yes"/>
+    <tag k="lanes" v="1"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="no"/>
+  </way>
+</osm>

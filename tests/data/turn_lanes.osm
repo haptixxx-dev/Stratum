@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  turn_lanes.osm - a signalled junction with a tagged turn:lanes approach.
+
+  Node block 12xx, way block 120xx. Own patch around 53.3340 N, 6.2800 W.
+
+  Way 12000 "Clonskeagh Road" is the APPROACH. It is one way eastbound, three
+  lanes, tagged
+
+      turn:lanes = left|through|through;right
+
+  which is three pipe separated entries for three lanes, ordered LEFT to RIGHT in
+  the direction of travel. The entry count matching the approaching lane count is
+  the whole point: build_approach_markings() emits no arrows at all when it does
+  not, so a fixture with a mismatch would test nothing about placement. The
+  mismatch itself is covered synthetically in tests/road/test_markings.cpp.
+
+  The approach is one way, so its entire lane group is the FORWARD group whatever
+  MarkingConfig::left_hand_traffic says. That keeps the arrow ORDER test
+  independent of the traffic convention, which is tested on its own elsewhere.
+
+  Node 1203 is tagged highway=traffic_signals and carries four arms, so
+  GraphNode::has_signals is true there and build_approach_markings() must pick
+  MarkingSprite::StopLine rather than MarkingSprite::GiveWayTriangles.
+
+  The approach is 133 m long. MarkingConfig places the stop line 1 m back from the
+  trim station and the arrows a further 25 m back, so both land well inside the
+  edge even after the junction solver has trimmed it.
+
+  Expected:
+    * exactly three arrows on way 12000 approached at its `to` end
+    * ordered left to right across the direction of travel they are
+      ArrowLeft, ArrowStraight, ArrowStraightRight
+    * one stop line quad per approaching lane, sprite MarkingSprite::StopLine
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.33340" minlon="-6.28210" maxlat="53.33460" maxlon="-6.27890"/>
+
+  <node id="1201" version="1" lat="53.33400" lon="-6.28200"/>
+  <node id="1202" version="1" lat="53.33400" lon="-6.28100"/>
+  <node id="1203" version="1" lat="53.33400" lon="-6.28000">
+    <tag k="highway" v="traffic_signals"/>
+    <tag k="crossing" v="traffic_signals"/>
+  </node>
+  <node id="1204" version="1" lat="53.33400" lon="-6.27900"/>
+  <node id="1205" version="1" lat="53.33450" lon="-6.28000"/>
+  <node id="1206" version="1" lat="53.33350" lon="-6.28000"/>
+
+  <way id="12000" version="1">
+    <nd ref="1201"/>
+    <nd ref="1202"/>
+    <nd ref="1203"/>
+    <tag k="highway" v="primary"/>
+    <tag k="name" v="Clonskeagh Road"/>
+    <tag k="oneway" v="yes"/>
+    <tag k="lanes" v="3"/>
+    <tag k="turn:lanes" v="left|through|through;right"/>
+    <tag k="maxspeed" v="50"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="12010" version="1">
+    <nd ref="1203"/>
+    <nd ref="1204"/>
+    <tag k="highway" v="primary"/>
+    <tag k="name" v="Clonskeagh Road"/>
+    <tag k="oneway" v="yes"/>
+    <tag k="lanes" v="2"/>
+    <tag k="maxspeed" v="50"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="12020" version="1">
+    <nd ref="1203"/>
+    <nd ref="1205"/>
+    <tag k="highway" v="secondary"/>
+    <tag k="name" v="Roebuck Road"/>
+    <tag k="lanes" v="2"/>
+    <tag k="maxspeed" v="50"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="12030" version="1">
+    <nd ref="1203"/>
+    <nd ref="1206"/>
+    <tag k="highway" v="secondary"/>
+    <tag k="name" v="Farranboley Lane"/>
+    <tag k="lanes" v="2"/>
+    <tag k="maxspeed" v="50"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+</osm>

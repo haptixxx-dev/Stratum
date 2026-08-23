@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  tunnel.osm - a road passing under a ridge, tagged the way a mapper tags it.
+
+  Node block 15xx, way block 150xx. Own patch around 53.3400 N, 6.2795 W.
+
+  Three ways, one road. Way 15000 is the western approach at grade, way 15010 is
+  the covered section tagged tunnel=yes layer=-1, and way 15020 is the eastern
+  approach. Splitting the way at the portals is exactly how a tunnel is tagged:
+  the tunnel=* tag applies to the covered stretch and to nothing else.
+
+  Nodes 1502 and 1503 are the two portals. Each is an endpoint of every way that
+  touches it, so RoadGraph keeps it as ONE node of degree 2 rather than splitting
+  it per layer: the layer=-1 here describes one continuous road passing under
+  something, not a grade separation. That is the same rule bridge_abutment.osm
+  pins from the other side, and it is what keeps the tunnel attached to its
+  approaches so the elevation solver can drop them together.
+
+  The covered section is 200 m long and the approaches are 133 m each. The ridge
+  itself is NOT in this file. There is no terrain in an .osm extract, so the test
+  supplies a HeightSampler shaped around the parsed geometry, which is also the
+  only way to place a ridge relative to coordinates the parser has recentred.
+  See tests/road/p5_p6_fixtures.hpp, ridge_sampler().
+
+  The ridge is deliberately SHORTER than the covered way: the hill covers about
+  four fifths of the edge, so the road runs in the open for a stretch at each
+  end. That is the ordinary case and it is the one the portal rule turns on. A
+  tunnel=* way starts on open ground and only enters the hillside some way along,
+  so the portal has to be FOUND, at the station where the road surface first
+  passes TunnelConfig::min_portal_cover below the terrain, and not assumed to be
+  the end of the edge.
+
+  MIND THE UNITS. OSMParser projects through EPSG:3857 Web Mercator with no
+  latitude correction, so one local unit is one true metre divided by
+  cos(latitude), which is 1.6744 at 53.34 N. The covered way spans 0.003 degrees
+  of longitude, which is 199 true metres and about 334 LOCAL units, and 334 is
+  the number every distance in the tests is expressed in. The ridge is therefore
+  sized as a FRACTION of the parsed edge length rather than in metres, so it
+  cannot drift out of proportion if the fixture is ever moved.
+
+  THE ELEVATION SOLVER DOES NOT PRODUCE THIS SHAPE, and the tests say so. Step 4
+  of RoadElevationSolver drops a tunnel edge until EVERY one of its stations is
+  ElevationConfig::tunnel_depth below the terrain, taking the maximum demand over
+  the whole edge, so a solved tunnel is 8 m under the ground at its own ends too
+  and never surfaces inside its own span. Under that solve no portal is ever
+  emitted at either end. The portal tests therefore supply station heights of
+  their own; see tests/road/test_structures.cpp, which states the conflict and
+  names the test to delete if the solver is changed.
+
+  Expected:
+    * exactly one GraphEdge with is_tunnel set, from way 15010
+    * nodes 1502 and 1503 are single GraphNodes of degree 2, and
+      RoadGraph::Stats::layer_split_nodes is 0
+    * against ridge_sampler() with a road held at the approach level, exactly two
+      portals, each well inside its end of the tunnel edge rather than at the end
+    * against a flat terrain at road level, no portal: nothing is buried
+    * against a road held far below a flat terrain, no portal either: both ends
+      are already buried and a headwall there is a wall across the middle of the
+      tunnel
+    * with no terrain sampler at all, nothing is emitted
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.33960" minlon="-6.28310" maxlat="53.34040" maxlon="-6.27590"/>
+
+  <node id="1501" version="1" lat="53.34000" lon="-6.28300"/>
+  <node id="1502" version="1" lat="53.34000" lon="-6.28100"/>
+  <node id="1503" version="1" lat="53.34000" lon="-6.27800"/>
+  <node id="1504" version="1" lat="53.34000" lon="-6.27600"/>
+
+  <way id="15000" version="1">
+    <nd ref="1501"/>
+    <nd ref="1502"/>
+    <tag k="highway" v="secondary"/>
+    <tag k="name" v="Killiney Hill Road"/>
+    <tag k="lanes" v="2"/>
+    <tag k="maxspeed" v="60"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+
+  <way id="15010" version="1">
+    <nd ref="1502"/>
+    <nd ref="1503"/>
+    <tag k="highway" v="secondary"/>
+    <tag k="name" v="Killiney Hill Road"/>
+    <tag k="tunnel" v="yes"/>
+    <tag k="layer" v="-1"/>
+    <tag k="lanes" v="2"/>
+    <tag k="maxspeed" v="60"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+
+  <way id="15020" version="1">
+    <nd ref="1503"/>
+    <nd ref="1504"/>
+    <tag k="highway" v="secondary"/>
+    <tag k="name" v="Killiney Hill Road"/>
+    <tag k="lanes" v="2"/>
+    <tag k="maxspeed" v="60"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+</osm>

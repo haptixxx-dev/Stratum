@@ -27,6 +27,11 @@ Thumbs.db
 # ═══════════════════════════════════════════════════════════════════
 *.osm
 *.pbf
+# ...except the hand-authored test fixtures, which ARE source. Without this
+# negation the golden-file suites cannot run on a fresh clone: the .osm files
+# they parse are excluded by the rule above, which is meant for downloaded
+# extracts sitting in the working tree.
+!tests/data/*.osm
 data/cache/
 data/exports/
 

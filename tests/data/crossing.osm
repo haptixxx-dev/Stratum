@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  crossing.osm - the two OSM shapes a pedestrian crossing is mapped as.
+
+  Node block 10xx, way block 100xx. Own patch around 53.3296 N, 6.2800 W.
+
+  SHAPE 1, way 10000 "Rathdown Road". A residential street with node 1003 tagged
+  highway=crossing. Node 1003 is INTERIOR to the way and is referenced by no other
+  way, so it never becomes a GraphNode: it stays a plain polyline vertex. The
+  crossing therefore has to be located by walking GraphEdge::node_ids and taking
+  the arclength of that vertex, which is the reliable shape.
+
+  SHAPE 2, way 10020 "Rathdown Park crossing". A highway=footway footway=crossing
+  way running over way 10010 "Rathdown Grove" and sharing node 1012 with it. The
+  footway is deliberately SKEW: it runs about 53 degrees off the carriageway
+  rather than square across it, which is the ordinary state of a desire-line
+  crossing and is what an implementation that only accepts a perpendicular
+  crossing way would silently discard.
+
+  Node 1012 is NOT tagged highway=crossing. The doubly-mapped case, where one
+  physical crossing carries both shapes at once, is deliberately absent: it would
+  make the expected crossing count ambiguous here, because node 1012 splits way
+  10010 into two GraphEdges and the two shapes could legitimately land on either.
+
+  The two carriageways run parallel about 45 m apart, which is far outside
+  DedupConfig::max_offset, so nothing in this fixture is a sidewalk-dedup case.
+
+  Expected:
+    - exactly one Crossing on way 10000, at_junction false, node kInvalidId,
+      arclength at node 1003 (the midpoint, ~66 m along)
+    - exactly one Crossing on way 10010, node == the GraphNode built from 1012
+    - no Crossing attached to way 10020 itself: a footway edge carries no Lane
+      strip and is skipped
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.32930" minlon="-6.28110" maxlat="53.33010" maxlon="-6.27890"/>
+
+  <!-- Way 10000: crossing mapped as a NODE interior to the carriageway. -->
+  <node id="1001" version="1" lat="53.33000" lon="-6.28100"/>
+  <node id="1002" version="1" lat="53.33000" lon="-6.28050"/>
+  <node id="1003" version="1" lat="53.33000" lon="-6.28000">
+    <tag k="highway" v="crossing"/>
+    <tag k="crossing" v="marked"/>
+    <tag k="crossing:markings" v="zebra"/>
+    <tag k="tactile_paving" v="yes"/>
+  </node>
+  <node id="1004" version="1" lat="53.33000" lon="-6.27950"/>
+  <node id="1005" version="1" lat="53.33000" lon="-6.27900"/>
+
+  <!-- Way 10010: crossing mapped as a WAY. Node 1012 is shared, untagged. -->
+  <node id="1011" version="1" lat="53.32960" lon="-6.28100"/>
+  <node id="1012" version="1" lat="53.32960" lon="-6.28000"/>
+  <node id="1013" version="1" lat="53.32960" lon="-6.27900"/>
+
+  <!-- Way 10020: the skew footway. 1021 is south-west of 1012, 1022 north-east. -->
+  <node id="1021" version="1" lat="53.32940" lon="-6.28030"/>
+  <node id="1022" version="1" lat="53.32980" lon="-6.27980"/>
+
+  <way id="10000" version="1">
+    <nd ref="1001"/>
+    <nd ref="1002"/>
+    <nd ref="1003"/>
+    <nd ref="1004"/>
+    <nd ref="1005"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Rathdown Road"/>
+    <tag k="lanes" v="2"/>
+    <tag k="maxspeed" v="50"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="10010" version="1">
+    <nd ref="1011"/>
+    <nd ref="1012"/>
+    <nd ref="1013"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Rathdown Grove"/>
+    <tag k="lanes" v="2"/>
+    <tag k="maxspeed" v="50"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="10020" version="1">
+    <nd ref="1021"/>
+    <nd ref="1012"/>
+    <nd ref="1022"/>
+    <tag k="highway" v="footway"/>
+    <tag k="footway" v="crossing"/>
+    <tag k="crossing" v="unmarked"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+</osm>

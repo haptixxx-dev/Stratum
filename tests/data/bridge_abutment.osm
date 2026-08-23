@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  bridge_abutment.osm - the standard OSM bridge encoding, which must stay connected.
+
+  One continuous primary road cut into three ways: an approach at layer 0, a
+  bridge deck at layer 1, and a second approach back at layer 0. Nodes 902 and 903
+  are the abutments, where the deck meets its approach. Every way ENDS on them;
+  none passes through.
+
+  This is the inverse of bridge_over.osm. There the shared node is interior to both
+  ways and the differing layer means the ways never meet, so the node splits. Here
+  the differing layer describes one road climbing onto a deck, so splitting the
+  node would disconnect every bridge in an extract from its approaches and report
+  four dead ends where the road is continuous.
+
+  Expected: nodes 902 and 903 are one GraphNode each, of degree 2.
+  Stats::layer_split_nodes == 0, no junction, and exactly two dead ends at the far
+  ends 901 and 904.
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.34880" minlon="-6.25000" maxlat="53.34920" maxlon="-6.24800"/>
+
+  <node id="901" version="1" lat="53.34900" lon="-6.24980"/>
+  <node id="902" version="1" lat="53.34900" lon="-6.24940"/>
+  <node id="903" version="1" lat="53.34900" lon="-6.24860"/>
+  <node id="904" version="1" lat="53.34900" lon="-6.24820"/>
+
+  <way id="9000" version="1">
+    <nd ref="901"/>
+    <nd ref="902"/>
+    <tag k="highway" v="primary"/>
+    <tag k="name" v="Liffey Quay"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+
+  <way id="9010" version="1">
+    <nd ref="902"/>
+    <nd ref="903"/>
+    <tag k="highway" v="primary"/>
+    <tag k="name" v="Liffey Quay"/>
+    <tag k="bridge" v="yes"/>
+    <tag k="layer" v="1"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+
+  <way id="9020" version="1">
+    <nd ref="903"/>
+    <nd ref="904"/>
+    <tag k="highway" v="primary"/>
+    <tag k="name" v="Liffey Quay"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+</osm>
