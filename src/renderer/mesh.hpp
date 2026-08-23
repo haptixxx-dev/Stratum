@@ -4,6 +4,7 @@
 #include <limits>
 #include <cmath>
 #include <cstdint>
+#include <algorithm>
 #include <glm/glm.hpp>
 
 namespace stratum {
@@ -101,6 +102,52 @@ struct SubMesh {
     uint32_t index_offset = 0;                      ///< First index of the range
     uint32_t index_count = 0;                       ///< Number of indices in the range
     MaterialId material = MaterialId::Default;      ///< Material slot for the range
+
+    /**
+     * @brief Which variant of @ref material this range wants
+     *
+     * MaterialId is a coarse slot: "this is carriageway", "this is kerb". It cannot
+     * say *which* carriageway, and OSM knows the difference -- surface=asphalt,
+     * surface=cobblestone and surface=gravel are all a driveable running surface but
+     * three different-looking ones, and the same is true of building facades and
+     * amenity furniture.
+     *
+     * The variant is that second axis. Zero always means "the slot's default", so
+     * every producer written before this field existed stays correct. Non-zero values
+     * are assigned by the tag-to-style mapping in osm/road/road_style.hpp and resolved
+     * against a material library by the renderer.
+     *
+     * Deliberately a plain integer rather than an enum: the set of variants is data,
+     * derived from whatever tags an extract happens to carry, and must be extensible
+     * without recompiling the mesh layer.
+     *
+     * @note (material, variant) together are the lookup key. A variant is only
+     *       meaningful within its slot -- variant 3 of Asphalt and variant 3 of
+     *       Sidewalk are unrelated.
+     */
+    uint16_t variant = 0;
+};
+
+/**
+ * @brief The (slot, variant) pair that identifies one concrete material
+ *
+ * Shared vocabulary between the geometry side, which derives it from OSM tags, and
+ * the renderer, which resolves it to textures and PBR parameters. Kept here rather
+ * than in either of those, so neither owns it and both can depend on it.
+ */
+struct MaterialKey {
+    MaterialId material = MaterialId::Default;
+    uint16_t   variant = 0;
+
+    bool operator==(const MaterialKey& o) const {
+        return material == o.material && variant == o.variant;
+    }
+    bool operator!=(const MaterialKey& o) const { return !(*this == o); }
+
+    /// Packed form, for use as a map key or a shader-visible index.
+    [[nodiscard]] uint32_t packed() const {
+        return (static_cast<uint32_t>(material) << 16) | variant;
+    }
 };
 
 class Mesh {
@@ -157,6 +204,15 @@ public:
      * @note Does nothing when @p other has no vertices or no indices.
      */
     void append(const Mesh& other, MaterialId material);
+
+    /**
+     * @brief Append under a full (slot, variant) key
+     *
+     * Identical to the MaterialId overload except that the trailing-range merge
+     * requires the variant to match too. Two ranges that share a slot but differ in
+     * variant are different materials and must stay separate.
+     */
+    void append(const Mesh& other, MaterialKey key);
 
     /**
      * @brief Reorder the index buffer so each material occupies exactly one range
@@ -344,7 +400,7 @@ inline std::vector<SubMesh> Mesh::effective_submeshes() const {
  * pre-existing implicit range is materialized before the first tagged append so
  * that older geometry is never silently absorbed into the new material.
  */
-inline void Mesh::append(const Mesh& other, MaterialId material) {
+inline void Mesh::append(const Mesh& other, MaterialKey key) {
     if (other.vertices.empty() || other.indices.empty()) {
         return;
     }
@@ -353,7 +409,7 @@ inline void Mesh::append(const Mesh& other, MaterialId material) {
     // Copy once and recurse; this path is not expected to be hot.
     if (&other == this) {
         const Mesh copy = other;
-        append(copy, material);
+        append(copy, key);
         return;
     }
 
@@ -378,11 +434,16 @@ inline void Mesh::append(const Mesh& other, MaterialId material) {
     }
 
     const uint32_t appended = static_cast<uint32_t>(other.indices.size());
-    if (!submeshes.empty() && submeshes.back().material == material) {
+    if (!submeshes.empty() && submeshes.back().material == key.material
+        && submeshes.back().variant == key.variant) {
         submeshes.back().index_count += appended;
     } else {
-        submeshes.push_back(SubMesh{ index_start, appended, material });
+        submeshes.push_back(SubMesh{ index_start, appended, key.material, key.variant });
     }
+}
+
+inline void Mesh::append(const Mesh& other, MaterialId material) {
+    append(other, MaterialKey{ material, 0 });
 }
 
 /**
@@ -402,40 +463,70 @@ inline void Mesh::sort_submeshes_by_material() {
         return;
     }
 
-    const size_t material_count = static_cast<size_t>(MaterialId::Count);
     const size_t triangle_count = indices.size() / 3u;
 
-    // Per-triangle material, so gaps between ranges keep their geometry as
-    // Default instead of being dropped.
-    std::vector<uint8_t> triangle_material(triangle_count, static_cast<uint8_t>(MaterialId::Default));
+    // Per-triangle key. Gaps between ranges keep their geometry as the Default slot
+    // rather than being dropped.
+    //
+    // Keyed on the PACKED (slot, variant) pair, not the slot alone: two ranges that
+    // share a slot but differ in variant are different materials, and collapsing them
+    // here would silently merge an asphalt carriageway with a cobblestone one.
+    std::vector<uint32_t> triangle_key(triangle_count, MaterialKey{}.packed());
     for (const auto& sub : submeshes) {
-        const size_t first = sub.index_offset / 3u;
-        const size_t last = (static_cast<size_t>(sub.index_offset) + sub.index_count) / 3u;
-        const uint8_t slot = static_cast<uint8_t>(sub.material);
-        if (slot >= material_count) {
+        if (static_cast<size_t>(sub.material) >= static_cast<size_t>(MaterialId::Count)) {
             continue;
         }
+        const size_t first = sub.index_offset / 3u;
+        const size_t last = (static_cast<size_t>(sub.index_offset) + sub.index_count) / 3u;
+        const uint32_t key = MaterialKey{ sub.material, sub.variant }.packed();
         for (size_t t = first; t < last && t < triangle_count; ++t) {
-            triangle_material[t] = slot;
+            triangle_key[t] = key;
         }
     }
 
-    // Counting sort keyed on the material slot: stable, single pass, O(n).
-    std::vector<uint32_t> counts(material_count, 0u);
-    for (uint8_t slot : triangle_material) {
-        ++counts[slot];
+    // Compact the keys actually present. The variant axis is data-driven and sparse,
+    // so a bucket per possible key is not an option; there are only ever a handful of
+    // distinct materials in one mesh.
+    std::vector<uint32_t> distinct(triangle_key);
+    std::sort(distinct.begin(), distinct.end());
+    distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+
+    const size_t bucket_count = distinct.size();
+    if (bucket_count <= 1u) {
+        // One material: the ranges already tile the buffer contiguously. Rewrite the
+        // range list so it is exactly one entry and leave the indices untouched.
+        submeshes.clear();
+        if (!indices.empty() && !distinct.empty()) {
+            submeshes.push_back(SubMesh{
+                0u, static_cast<uint32_t>(indices.size()),
+                static_cast<MaterialId>(distinct[0] >> 16),
+                static_cast<uint16_t>(distinct[0] & 0xFFFFu)
+            });
+        }
+        return;
     }
 
-    std::vector<uint32_t> cursor(material_count, 0u);
+    auto bucket_of = [&distinct](uint32_t key) -> size_t {
+        return static_cast<size_t>(
+            std::lower_bound(distinct.begin(), distinct.end(), key) - distinct.begin());
+    };
+
+    // Counting sort over the compacted buckets: stable, single pass, O(n).
+    std::vector<uint32_t> counts(bucket_count, 0u);
+    for (uint32_t key : triangle_key) {
+        ++counts[bucket_of(key)];
+    }
+
+    std::vector<uint32_t> cursor(bucket_count, 0u);
     uint32_t running = 0u;
-    for (size_t m = 0; m < material_count; ++m) {
+    for (size_t m = 0; m < bucket_count; ++m) {
         cursor[m] = running;
         running += counts[m];
     }
 
     std::vector<uint32_t> sorted(indices.size());
     for (size_t t = 0; t < triangle_count; ++t) {
-        const uint32_t dst = cursor[triangle_material[t]]++;
+        const uint32_t dst = cursor[bucket_of(triangle_key[t])]++;
         sorted[dst * 3u + 0u] = indices[t * 3u + 0u];
         sorted[dst * 3u + 1u] = indices[t * 3u + 1u];
         sorted[dst * 3u + 2u] = indices[t * 3u + 2u];
@@ -444,12 +535,16 @@ inline void Mesh::sort_submeshes_by_material() {
 
     submeshes.clear();
     uint32_t offset = 0u;
-    for (size_t m = 0; m < material_count; ++m) {
+    for (size_t m = 0; m < bucket_count; ++m) {
         if (counts[m] == 0u) {
             continue;
         }
         const uint32_t range_indices = counts[m] * 3u;
-        submeshes.push_back(SubMesh{ offset, range_indices, static_cast<MaterialId>(m) });
+        submeshes.push_back(SubMesh{
+            offset, range_indices,
+            static_cast<MaterialId>(distinct[m] >> 16),
+            static_cast<uint16_t>(distinct[m] & 0xFFFFu)
+        });
         offset += range_indices;
     }
 }
