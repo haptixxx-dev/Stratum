@@ -10,7 +10,14 @@ void Editor::draw_procgen_panel() {
     if (ImGui::Begin("Procedural Generation", &m_show_procgen_panel)) {
         
         // Mode selection
-        ImGui::Checkbox("Use Chunked Terrain", &m_use_chunked_terrain);
+        if (ImGui::Checkbox("Use Chunked Terrain", &m_use_chunked_terrain)) {
+            // The legacy path has no carve hook, so make_terrain_height_sampler()
+            // returns null while it is selected. Switching modes therefore changes
+            // the surface the roads belong on, exactly as generating terrain does,
+            // and leaves the solve stale in both directions: elevated roads over a
+            // legacy terrain nothing carved, or flat roads over carved chunks.
+            maybe_rebuild_roads_for_terrain();
+        }
         ImGui::SameLine();
         ImGui::TextDisabled("(?)");
         if (ImGui::IsItemHovered()) {
@@ -146,6 +153,14 @@ void Editor::draw_chunked_terrain_ui() {
     if (m_terrain_tile_manager.chunk_count() > 0) {
         if (ImGui::Button("Clear All Chunks", ImVec2(-1, 0))) {
             clear_chunked_terrain();
+            // The roads were solved against chunks that no longer exist, so they
+            // are now a network hanging in the air. Re-solve them flat. This call
+            // belongs here and NOT inside clear_chunked_terrain(), which
+            // generate_chunked_terrain() calls first thing: a rebuild launched
+            // there would still be in flight when generate_chunked_terrain()
+            // reaches its own maybe_rebuild_roads_for_terrain(), that second call
+            // would be refused, and the roads would stay flat under new terrain.
+            maybe_rebuild_roads_for_terrain();
         }
     }
 
@@ -313,6 +328,17 @@ void Editor::generate_chunked_terrain() {
     
     // Initialize the terrain tile manager
     m_terrain_tile_manager.init(m_terrain_tile_config);
+
+    // Road carve data survives clear() and init(), which is what makes
+    // "regenerate terrain from the same settings" keep its carved corridors. It
+    // is only stale when the SURFACE changed, and then it holds heights solved
+    // against terrain that no longer exists. Drop it before the new chunks are
+    // made, so they are never carved to a profile that is about to be replaced.
+    // The chunk map is empty at this point, so this costs nothing.
+    if (m_terrain_tile_manager.has_road_carve_data() &&
+        terrain_surface_fingerprint(m_terrain_tile_config.terrain) != m_road_terrain_fingerprint) {
+        m_terrain_tile_manager.clear_road_carve_data();
+    }
     
     // Import OSM data for flattening if available
     const auto& osm_data = m_osm_parser.get_data();
@@ -333,11 +359,25 @@ void Editor::generate_chunked_terrain() {
         m_terrain_tile_manager.import_osm_data(all_roads, all_buildings, all_areas);
     }
     
-    // Generate all chunks
+    // Generate all chunks. Any road carve data already installed survives
+    // clear() and init(), so chunks generated here are carved as they are made --
+    // that is the "OSM imported first" ordering, and it needs nothing else.
     m_terrain_tile_manager.generate_all_chunks();
     
     // Build meshes
     m_terrain_tile_manager.build_all_meshes();
+
+    // The other ordering, and the case where the terrain settings changed: the
+    // road network was solved against a surface that is not the one now on
+    // screen -- or, if roads were imported before any terrain existed, against
+    // no surface at all. Re-solve it asynchronously through the staged import
+    // path, which also produces the carve data this terrain needs.
+    //
+    // Chunks generated just above are then regenerated once the carve lands.
+    // That is a deliberate double pass: it puts terrain on screen immediately
+    // instead of after the road solve, and a chunk regeneration is required
+    // anyway whenever terrain already existed at import time.
+    maybe_rebuild_roads_for_terrain();
 }
 
 void Editor::clear_chunked_terrain() {
@@ -345,17 +385,20 @@ void Editor::clear_chunked_terrain() {
     if (m_gpu_renderer) {
         for (const auto& coord : m_terrain_tile_manager.get_all_chunks()) {
             auto* chunk = m_terrain_tile_manager.get_chunk(coord);
-            if (chunk && chunk->gpu_uploaded) {
-                if (chunk->terrain_gpu_id != 0) {
-                    m_gpu_renderer->release_mesh(chunk->terrain_gpu_id);
-                }
-                if (chunk->water_gpu_id != 0) {
-                    m_gpu_renderer->release_mesh(chunk->water_gpu_id);
-                }
+            // Deliberately not guarded on gpu_uploaded: a chunk that lost one of
+            // its two meshes to eviction has the flag cleared while still holding
+            // the other, and the guard this replaced would have stranded it.
+            if (chunk) {
+                release_tracked_mesh(*m_gpu_renderer, chunk->terrain_gpu_id);
+                release_tracked_mesh(*m_gpu_renderer, chunk->water_gpu_id);
+                chunk->gpu_uploaded = false;
             }
         }
     }
     
+    // Deliberately NOT clear_road_carve_data(). The carve describes the imported
+    // roads, not the terrain, and dropping it here would silently un-carve every
+    // road the next time terrain is generated from an unchanged config.
     m_terrain_tile_manager.clear();
 }
 
@@ -372,9 +415,14 @@ void Editor::generate_terrain() {
     // Build terrain mesh
     m_terrain_mesh = procgen::TerrainMeshBuilder::build_terrain_mesh(m_terrain_heightmap, m_terrain_mesh_config);
 
-    // Upload to GPU
+    // Upload to GPU. Pinned: there is exactly one legacy terrain, the user
+    // generated it deliberately, and nothing streams it back in -- an eviction
+    // would simply make it vanish until Generate was pressed again.
+    MeshOwner pinned;
+    pinned.kind = MeshOwner::Kind::Pinned;
+
     if (m_gpu_renderer && m_terrain_mesh.is_valid()) {
-        m_terrain_gpu_id = m_gpu_renderer->upload_mesh(m_terrain_mesh);
+        m_terrain_gpu_id = upload_tracked_mesh(*m_gpu_renderer, m_terrain_mesh, pinned);
     }
 
     // Generate water mesh if requested
@@ -385,21 +433,15 @@ void Editor::generate_terrain() {
             m_terrain_mesh_config.water_color
         );
         if (m_water_mesh.is_valid()) {
-            m_water_gpu_id = m_gpu_renderer->upload_mesh(m_water_mesh);
+            m_water_gpu_id = upload_tracked_mesh(*m_gpu_renderer, m_water_mesh, pinned);
         }
     }
 }
 
 void Editor::clear_terrain() {
     if (m_gpu_renderer) {
-        if (m_terrain_gpu_id != 0) {
-            m_gpu_renderer->release_mesh(m_terrain_gpu_id);
-            m_terrain_gpu_id = 0;
-        }
-        if (m_water_gpu_id != 0) {
-            m_gpu_renderer->release_mesh(m_water_gpu_id);
-            m_water_gpu_id = 0;
-        }
+        release_tracked_mesh(*m_gpu_renderer, m_terrain_gpu_id);
+        release_tracked_mesh(*m_gpu_renderer, m_water_gpu_id);
     }
     m_terrain_mesh.clear();
     m_water_mesh.clear();

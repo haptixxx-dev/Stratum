@@ -72,12 +72,41 @@ add_library(stratum_core STATIC
     src/osm/parser.cpp
     src/osm/coordinates.cpp
     src/osm/mesh_builder.cpp
-    src/osm/tile_manager.cpp
     src/osm/quadtree.cpp
+
+    # OSM road network
+    src/osm/road/road_graph.cpp
+    src/osm/road/road_profile.cpp
+    src/osm/road/centerline.cpp
+    src/osm/road/corridor.cpp
+    src/osm/road/road_elevation.cpp
+    src/osm/road/junction_trim.cpp
+    src/osm/road/junction_polygon.cpp
+    src/osm/road/junction_curb.cpp
+    src/osm/road/junction_special.cpp
+    src/osm/road/junction_builder.cpp
+
+    # P5 detail features
+    src/osm/road/sidewalk_dedup.cpp
+    src/osm/road/marking_atlas.cpp
+    src/osm/road/markings.cpp
+    src/osm/road/crossings.cpp
+
+    # P6 structures
+    src/osm/road/bridge_builder.cpp
+    src/osm/road/tunnel_builder.cpp
+
+    src/osm/road/road_network_builder.cpp
+
+    # P7 game-ready output
+    src/osm/road/mesh_optimize.cpp
+    src/osm/road/collision_mesh.cpp
+    src/osm/road/road_export.cpp
 
     # Procedural Generation
     src/procgen/noise.cpp
     src/procgen/terrain_generator.cpp
+    src/procgen/terrain_carve.cpp
     src/procgen/terrain_mesh_builder.cpp
     src/procgen/terrain_tile_manager.cpp
 )
@@ -132,6 +161,7 @@ add_library(stratum_editor_lib STATIC
 
     # Renderer
     src/renderer/gpu_renderer.cpp
+    src/renderer/gpu_buffer_pool.cpp
 
     # Editor
     src/editor/editor.cpp
@@ -188,6 +218,16 @@ endif()
 # ═══════════════════════════════════════════════════════════════════
 add_executable(stratum src/main.cpp)
 target_link_libraries(stratum PRIVATE stratum_editor_lib)
+
+# ═══════════════════════════════════════════════════════════════════
+# TESTS
+# ═══════════════════════════════════════════════════════════════════
+# enable_testing() must live in the top-level file: ctest only discovers tests
+# registered below a directory where it was enabled at or above the top level.
+if(STRATUM_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
 
 # ═══════════════════════════════════════════════════════════════════
 # INSTALL

@@ -11,6 +11,11 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <utility>
 
 namespace stratum {
 
@@ -26,6 +31,14 @@ void Editor::set_renderer(GPURenderer* renderer) {
     if (renderer) {
         // Non-fatal: on failure Im3d simply renders nothing.
         Im3D_InitGPU(*renderer);
+
+        // The renderer owns the budget and the eviction mechanism; the editor owns
+        // the answers to "how far away is this?" and "your handle is gone". Without
+        // both installed the renderer refuses to evict at all, because evicting
+        // without a distance discards the road under the camera as readily as one
+        // on the horizon.
+        renderer->set_mesh_distance_fn([this](uint32_t id) { return mesh_distance_to_camera(id); });
+        renderer->set_mesh_evicted_fn([this](uint32_t id) { on_mesh_evicted(id); });
     }
 }
 
@@ -75,6 +88,10 @@ void Editor::render() {
     // Apply a native file-dialog result on the main thread; the SDL callback that
     // produced it may have run on another one.
     poll_file_dialog();
+    poll_export_dir_dialog();
+
+    // Advance an in-flight export. Same rule as the import: before the panels draw.
+    poll_road_export();
 
     setup_dockspace();
 
@@ -99,6 +116,7 @@ void Editor::render() {
     if (m_show_osm_panel) draw_osm_panel();
     if (m_show_procgen_panel) draw_procgen_panel();
     if (m_show_render_settings) draw_render_settings();
+    if (m_show_memory_panel) draw_memory_panel();
 }
 
 void Editor::setup_dockspace() {
@@ -246,6 +264,7 @@ void Editor::draw_menu_bar() {
             ImGui::MenuItem("OSM Panel", nullptr, &m_show_osm_panel);
             ImGui::MenuItem("Procgen Panel", nullptr, &m_show_procgen_panel);
             ImGui::MenuItem("Render Settings", nullptr, &m_show_render_settings);
+            ImGui::MenuItem("GPU Memory", nullptr, &m_show_memory_panel);
             ImGui::Separator();
             ImGui::MenuItem("ImGui Demo", nullptr, &m_show_demo_window);
             ImGui::MenuItem("Style Editor", nullptr, &m_show_style_editor);
@@ -654,6 +673,71 @@ void Editor::draw_osm_panel() {
     ImGui::DragFloat("Default Height (m)", &config.default_building_height, 0.5f, 1.0f, 100.0f);
     ImGui::DragFloat("Meters/Level", &config.meters_per_level, 0.1f, 2.0f, 5.0f);
 
+    ImGui::Spacing();
+    if (ImGui::Checkbox("Terrain-Aware Roads", &m_terrain_aware_roads)) {
+        // The toggle changes which surface the roads belong on, so the current
+        // solve is stale either way round. Re-solve now rather than waiting for
+        // the next terrain generate.
+        maybe_rebuild_roads_for_terrain();
+    }
+    ImGui::SetItemTooltip(
+        "Solve road heights against the terrain and carve the terrain to match.\n"
+        "Off: roads stay flat and the terrain keeps its procedural surface.\n"
+        "Requires chunked terrain to have been generated.");
+
+    if (m_terrain_aware_roads && !has_generated_terrain()) {
+        ImGui::TextDisabled("No terrain generated: roads will be flat.");
+    } else if (m_terrain_aware_roads && !m_use_chunked_terrain) {
+        ImGui::TextDisabled("Legacy terrain mode has no carve: roads will be flat.");
+    }
+
+    if (ImGui::Checkbox("Solve Junctions", &m_solve_junctions)) {
+        // The toggle changes the geometry of every edge that meets another, not
+        // only the junction fills: the arms are extruded from a trimmed
+        // centerline. Nothing in the current network survives it, so re-solve now
+        // rather than leaving the panel describing a network the toggle no longer
+        // matches.
+        begin_road_network_rebuild();
+    }
+    ImGui::SetItemTooltip(
+        "Trim each arm back from its node, fill the intersection, and fillet the corners.\n"
+        "Off: every road is extruded full length and ribbons overlap at every junction.\n"
+        "Off is the P2 reference output, kept so a junction defect can be bisected.");
+
+    // Detail passes. Each one reproduces the previous phase exactly on its own, so
+    // a visual defect can be bisected to a pass by flipping one box and
+    // re-solving, which is a second, rather than by rebuilding with it compiled
+    // out. All three change the geometry of the pieces themselves, so each has to
+    // re-solve the network rather than only redraw it.
+    if (ImGui::Checkbox("Lane Markings", &m_emit_markings)) {
+        begin_road_network_rebuild();
+    }
+    ImGui::SetItemTooltip(
+        "Centre lines, edge lines, stop lines, give-way triangles and turn arrows.\n"
+        "Painted into the Markings material as separate quads above the surface.\n"
+        "Off: the carriageway keeps its surfaces and carries no paint.");
+
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Crossings", &m_emit_crossings)) {
+        begin_road_network_rebuild();
+    }
+    ImGui::SetItemTooltip(
+        "Zebra stripes at highway=crossing nodes, and dropped kerbs in the curb ring.\n"
+        "Independent of Lane Markings: a crossing is found from OSM topology, a lane\n"
+        "line is derived from the profile, and the two fail in different ways.");
+
+    if (ImGui::Checkbox("Bridges and Tunnels", &m_emit_structures)) {
+        begin_road_network_rebuild();
+    }
+    ImGui::SetItemTooltip(
+        "Bridge deck slabs, parapets and piers; tunnel portal headwalls.\n"
+        "Both are cut against the ground under the road, so both need terrain-aware\n"
+        "roads. Off: a bridge is a bare ribbon and a tunnel has no mouth.");
+
+    if (m_emit_structures && !m_terrain_aware_roads) {
+        ImGui::TextDisabled("Structures need terrain-aware roads: none will be emitted.");
+    }
+
     ImGui::Separator();
 
     // File path input. Kept alongside the picker so a path can still be pasted or
@@ -670,9 +754,14 @@ void Editor::draw_osm_panel() {
     static std::string import_status;
     static bool import_error = false;
 
+    // An export re-solves the network from m_osm_parser's data on a worker, so it
+    // locks the parser for exactly the same reason an import in flight does.
     const bool importing = (m_import_stage == ImportStage::Parsing ||
+                            m_import_stage == ImportStage::BuildingRoads ||
                             m_import_stage == ImportStage::Indexing ||
-                            m_import_stage == ImportStage::BuildingMeshes);
+                            m_import_stage == ImportStage::BuildingMeshes ||
+                            m_import_stage == ImportStage::CarvingTerrain) ||
+                           export_in_flight();
 
     ImGui::BeginDisabled(importing);
     if (ImGui::Button("Import OSM File", ImVec2(-1, 0))) {
@@ -690,9 +779,11 @@ void Editor::draw_osm_panel() {
     // Progress, driven by poll_osm_import()
     if (importing) {
         const char* stage_label =
-            m_import_stage == ImportStage::Parsing        ? "1/3 Parsing" :
-            m_import_stage == ImportStage::Indexing       ? "2/3 Spatial index" :
-                                                            "3/3 Building meshes";
+            m_import_stage == ImportStage::Parsing        ? "1/5 Parsing" :
+            m_import_stage == ImportStage::BuildingRoads  ? "2/5 Road network" :
+            m_import_stage == ImportStage::Indexing       ? "3/5 Spatial index" :
+            m_import_stage == ImportStage::BuildingMeshes ? "4/5 Building meshes" :
+                                                            "5/5 Terrain carve";
 
         // The parser reports item counts only for some stages, so a zero fraction
         // means "unknown", not "nothing done" -- show an indeterminate bar rather
@@ -759,6 +850,145 @@ void Editor::draw_osm_panel() {
         ImGui::BulletText("Parse: %.1f ms", data.stats.parse_time_ms);
         ImGui::BulletText("Process: %.1f ms", data.stats.process_time_ms);
 
+        if (m_have_road_stats) {
+            ImGui::Spacing();
+            ImGui::Text("Road Network:");
+            ImGui::BulletText("Pieces: %zu (%zu triangles)",
+                              m_road_stats.pieces, m_road_stats.triangles);
+            ImGui::BulletText("Build: %.1f ms", m_road_stats.build_ms);
+
+            ImGui::Spacing();
+            if (m_road_built_on_terrain) {
+                ImGui::Text("Elevation Solve:");
+                ImGui::BulletText("Edges: %zu of %zu elevated in %.1f ms",
+                                  m_road_stats.elevated_edges, m_road_stats.edges,
+                                  m_road_stats.elevation_ms);
+                ImGui::BulletText("Iterations: %zu (residual %.3f m)",
+                                  m_road_elevation_stats.iterations,
+                                  m_road_elevation_stats.max_residual);
+                ImGui::BulletText("Max grade: %.1f%% (%zu edges grade-limited)",
+                                  m_road_max_grade * 100.0f,
+                                  m_road_elevation_stats.grade_limited_edges);
+                ImGui::BulletText("Bridges: %zu   Tunnels: %zu",
+                                  m_road_elevation_stats.bridges,
+                                  m_road_elevation_stats.tunnels);
+                if (m_terrain_tile_manager.has_road_carve_data()) {
+                    ImGui::BulletText("Terrain carved: yes");
+                } else {
+                    ImGui::BulletText("Terrain carved: no");
+                }
+            } else {
+                ImGui::TextDisabled("Roads are flat: no terrain surface to follow.");
+            }
+
+            ImGui::Spacing();
+            if (m_road_solved_junctions) {
+                ImGui::Text("Junctions:");
+                ImGui::BulletText("Solved: %zu   Roundabouts: %zu",
+                                  m_road_junction_stats.junctions,
+                                  m_road_junction_stats.roundabouts);
+                ImGui::BulletText("Tapers: %zu   Dead ends: %zu",
+                                  m_road_junction_stats.tapers,
+                                  m_road_junction_stats.dead_ends);
+                ImGui::BulletText("Pieces: %zu   Trimmed edges: %zu",
+                                  m_road_stats.junction_pieces,
+                                  m_road_stats.trimmed_edges);
+                ImGui::BulletText("Solve: %.1f ms", m_road_stats.junction_ms);
+
+                // A degenerate node fell back to a provisional disc and emitted no
+                // fill; an over-trimmed edge is one the junction polygon still
+                // overlaps. Neither is visible in the geometry without looking for
+                // it, so both are called out rather than buried in the list above.
+                if (m_road_junction_stats.degenerate > 0) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                                       "  %zu degenerate: arms too wide for the node.",
+                                       m_road_junction_stats.degenerate);
+                }
+                if (m_road_junction_stats.over_trimmed_edges > 0) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                                       "  %zu over-trimmed: the trim clamp bound.",
+                                       m_road_junction_stats.over_trimmed_edges);
+                }
+                if (m_road_stats.trimmed_away_edges > 0) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                                       "  %zu edges consumed entirely by their trims.",
+                                       m_road_stats.trimmed_away_edges);
+                }
+            } else {
+                ImGui::TextDisabled("Junction solver off: ribbons overlap at every node.");
+            }
+
+            ImGui::Spacing();
+            ImGui::Text("Detail:");
+
+            // Every count below is zero both when its pass was switched off and
+            // when the pass ran and found nothing. The two mean opposite things to
+            // anyone reading the panel, so the flag decides which is shown and the
+            // count is never left to imply it.
+            if (m_road_emitted_markings) {
+                ImGui::BulletText("Marking pieces: %zu", m_road_stats.markings_pieces);
+            } else {
+                ImGui::BulletText("Marking pieces: off");
+            }
+
+            if (m_road_emitted_crossings) {
+                ImGui::BulletText("Crossings: %zu", m_road_stats.crossings);
+            } else {
+                ImGui::BulletText("Crossings: off");
+            }
+
+            if (m_road_emitted_structures) {
+                ImGui::BulletText("Bridges: %zu   Tunnels: %zu (%zu portal mouths)",
+                                  m_road_stats.bridges, m_road_stats.tunnels,
+                                  m_road_portal_mouths);
+            } else if (!m_emit_structures) {
+                ImGui::BulletText("Bridges and tunnels: off");
+            } else {
+                // The flag was on but the builder skipped the pass, which it does
+                // whenever there is no terrain to cut a pier or a portal against.
+                ImGui::BulletText("Bridges and tunnels: skipped, no terrain surface");
+            }
+
+            // Counted per SIDE, not per edge: an edge whose sidewalk is separately
+            // mapped on both sides adds two.
+            ImGui::BulletText("Sidewalk sides deduped: %zu", m_road_stats.deduped_sidewalks);
+
+            // A portal mouth is the only carve primitive the road geometry cannot
+            // stand without: the headwall frames an opening the hillside would
+            // otherwise close over. Say so when portals were built and the terrain
+            // never received them.
+            if (m_road_portal_mouths > 0 && !m_terrain_tile_manager.has_road_carve_data()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                                   "  %zu portal mouths are not carved: the terrain has no "
+                                   "carve data.",
+                                   m_road_portal_mouths);
+            }
+
+            // The surface the roads WOULD be solved against right now. It differs
+            // from the one they WERE solved against whenever terrain was
+            // generated or regenerated while an import was in flight, or the
+            // terrain-aware toggle was flipped and the rebuild was refused.
+            const uint64_t live_surface = live_road_terrain_fingerprint();
+
+            if (live_surface != m_road_terrain_fingerprint) {
+                // A live surface of zero is not "a different terrain", it is no
+                // terrain at all: the chunks were cleared, chunked mode was
+                // switched off, or terrain-aware roads were switched off. The
+                // rebuild in that direction flattens the network rather than
+                // elevating it, so say which one the button does.
+                const bool to_flat = (live_surface == 0);
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                                   to_flat ? "Roads are elevated but no terrain surface is active."
+                                           : "Roads were solved against a different terrain.");
+                ImGui::BeginDisabled(importing);
+                if (ImGui::Button(to_flat ? "Re-solve Roads Flat" : "Re-solve Against Terrain",
+                                  ImVec2(-1, 0))) {
+                    begin_road_network_rebuild();
+                }
+                ImGui::EndDisabled();
+            }
+        }
+
         // Road type breakdown
         if (!data.roads.empty() && ImGui::TreeNode("Road Types")) {
             std::map<osm::RoadType, int> road_counts;
@@ -805,10 +1035,40 @@ void Editor::draw_osm_panel() {
             m_import_nodes_total = 0;
             m_import_message.clear();
             m_osm_parser.clear();
+
+            // Every leaf about to be destroyed may still own GPU meshes, and
+            // m_mesh_owners holds a raw pointer to each of them. Dropping the tree
+            // without this leaks the geometry AND leaves entries naming freed
+            // nodes, which the next eviction would follow.
+            if (m_gpu_renderer) {
+                for (auto* leaf : m_quadtree.get_all_leaves()) {
+                    if (leaf) release_node_from_gpu(*leaf, *m_gpu_renderer);
+                }
+            }
             m_quadtree.clear();
             m_building_meshes.clear();
             m_road_meshes.clear();
             m_area_meshes.clear();
+
+            // The carve describes a road network that no longer exists, so leaving
+            // it installed would keep cutting trenches for roads the user just
+            // deleted. Dropping it regenerates the affected chunks.
+            m_pending_carve.reset();
+            m_carve_apply_pending = false;
+            m_terrain_tile_manager.clear_road_carve_data();
+
+            m_have_road_stats = false;
+            m_road_built_on_terrain = false;
+            m_road_terrain_fingerprint = 0;
+            m_road_stats = {};
+            m_road_elevation_stats = {};
+            m_road_max_grade = 0.0f;
+            m_road_solved_junctions = false;
+            m_road_junction_stats = {};
+            m_road_emitted_markings = false;
+            m_road_emitted_crossings = false;
+            m_road_emitted_structures = false;
+            m_road_portal_mouths = 0;
         }
         ImGui::EndDisabled();
     }
@@ -1201,9 +1461,608 @@ void Editor::poll_file_dialog() {
     }
 }
 
+// ============================================================================
+// Road network export
+// ============================================================================
+
+void Editor::open_export_dir_dialog() {
+    if (m_dir_pick.pending) return;  // a dialog is already up
+
+    m_dir_pick.pending = true;
+
+    SDL_ShowOpenFolderDialog(
+        [](void* userdata, const char* const* filelist, int /*filter*/) {
+            // May run on a different thread than the main loop, so record the
+            // outcome and nothing else. poll_export_dir_dialog() applies it.
+            auto* self = static_cast<Editor*>(userdata);
+            std::lock_guard<std::mutex> lock(self->m_dir_pick.mutex);
+            self->m_dir_pick.has_result = true;
+            self->m_dir_pick.path.clear();
+            self->m_dir_pick.error.clear();
+
+            if (!filelist) {
+                const char* err = SDL_GetError();
+                self->m_dir_pick.error = (err && *err) ? err : "folder dialog failed";
+            } else if (filelist[0]) {
+                self->m_dir_pick.path = filelist[0];
+            }
+            // A non-null list with a null first entry is a cancel: both strings
+            // stay empty and the UI does nothing.
+        },
+        this,
+        static_cast<SDL_Window*>(m_window_handle),  // parent, for modality
+        nullptr,                                    // platform default location
+        false);                                     // single selection
+}
+
+void Editor::poll_export_dir_dialog() {
+    std::string path, error;
+    {
+        std::lock_guard<std::mutex> lock(m_dir_pick.mutex);
+        if (!m_dir_pick.has_result) return;
+        m_dir_pick.has_result = false;
+        m_dir_pick.pending = false;
+        path = std::move(m_dir_pick.path);
+        error = std::move(m_dir_pick.error);
+        m_dir_pick.path.clear();
+        m_dir_pick.error.clear();
+    }
+
+    if (!error.empty()) {
+        // Most likely on Linux with no XDG desktop portal and no zenity/kdialog.
+        // The path field is still there to type into, so this is not fatal.
+        spdlog::error("Folder dialog unavailable: {}", error);
+        m_export_status = "Folder dialog unavailable - type a path instead";
+        return;
+    }
+
+    if (!path.empty()) {
+        std::snprintf(m_export_dir, sizeof(m_export_dir), "%s", path.c_str());
+        spdlog::info("Export directory: {}", path);
+    }
+}
+
+void Editor::begin_road_export() {
+    if (export_in_flight()) {
+        return;
+    }
+    if (m_import_job || m_road_build_future.valid() || m_carve_index_future.valid()) {
+        m_export_status = "An import is still running";
+        return;
+    }
+    if (!m_osm_parser.has_data() || m_osm_parser.get_data().roads.empty()) {
+        m_export_status = "No road data to export";
+        return;
+    }
+    if (m_export_dir[0] == '\0') {
+        m_export_status = "Choose an output directory first";
+        return;
+    }
+
+    // Safe to hold a pointer into m_osm_parser for the same reason the import's
+    // road stage does: begin_osm_import(), begin_road_network_rebuild() and the
+    // Clear Data button all refuse to run while this future is valid.
+    const osm::ParsedOSMData* parsed = &m_osm_parser.get_data();
+
+    // The network is re-solved rather than kept: an import MOVES its pieces into
+    // the quadtree, which merges them per leaf and keeps only the render mesh, so
+    // the collision variant and the LOD chain no longer exist by the time anyone
+    // asks to export them. Solving again is a second of worker time; holding a
+    // second copy of a city's geometry is permanent.
+    osm::road::RoadNetworkConfig cfg = make_road_network_config();
+    cfg.build_collision = m_export_build_collision;
+    cfg.build_lods = m_export_build_lods;
+
+    auto job = std::make_unique<RoadExportJob>();
+    job->directory = m_export_dir;
+    job->config = m_export_config;
+    // The exporter only writes what the build produced, so the two pairs of flags
+    // are one decision and are stamped together.
+    job->config.export_collision = m_export_build_collision;
+    job->config.export_lods = m_export_build_lods;
+    job->build_collision = m_export_build_collision;
+    job->build_lods = m_export_build_lods;
+
+    const std::string dir = job->directory;
+    const osm::road::ExportConfig export_cfg = job->config;
+
+    // Off the UI thread, like the import. The solve alone is seconds on a city
+    // extract and the write is hundreds of megabytes of file I/O.
+    job->future = std::async(std::launch::async, [parsed, cfg, export_cfg, dir]() {
+        osm::road::RoadNetworkBuilder builder;
+        osm::road::RoadNetwork network = builder.build(*parsed, cfg);
+        return osm::road::export_road_network(network.pieces, std::filesystem::path(dir),
+                                              export_cfg);
+    });
+
+    m_export_job = std::move(job);
+    m_export_status = "Exporting...";
+    spdlog::info("Exporting the road network to {}", m_export_dir);
+}
+
+void Editor::poll_road_export() {
+    if (!m_export_job) return;
+
+    if (!m_export_job->future.valid()) {
+        m_export_job.reset();
+        return;
+    }
+    if (m_export_job->future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        return;  // still running; the indeterminate bar keeps animating
+    }
+
+    osm::road::ExportStats stats;
+    std::string failure;
+    try {
+        stats = m_export_job->future.get();
+    } catch (const std::exception& e) {
+        // std::filesystem throws on an unwritable or unreachable destination, and
+        // an uncaught exception out of a future's get() takes the editor with it.
+        failure = e.what();
+    }
+
+    const std::string directory = m_export_job->directory;
+    const bool wrote_collision = m_export_job->build_collision;
+    const bool wrote_lods = m_export_job->build_lods;
+    m_export_job.reset();
+
+    char msg[512];
+    if (!failure.empty()) {
+        m_export_status = "Export failed: " + failure;
+        snprintf(msg, sizeof(msg), "[Export] Failed: %s\n", failure.c_str());
+    } else if (stats.files == 0) {
+        // Not an exception: every file was refused, or the network held no
+        // triangles. Either way nothing reached the disk, and saying "done" would
+        // be a lie the user only discovers in the file manager.
+        m_export_status = "Export wrote no files - check the destination is writable";
+        snprintf(msg, sizeof(msg), "[Export] Wrote no files to %s\n", directory.c_str());
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "[Export] %zu chunk(s), %zu meshes, %zu triangles, %zu vertices, %zu file(s) "
+                 "in %.0f ms -> %s%s%s\n",
+                 stats.chunks, stats.meshes, stats.triangles, stats.vertices, stats.files,
+                 stats.export_ms, directory.c_str(),
+                 wrote_collision ? " (+collision)" : "",
+                 wrote_lods ? " (+LODs)" : "");
+        char status[256];
+        snprintf(status, sizeof(status), "Wrote %zu file(s), %zu triangles in %.0f ms",
+                 stats.files, stats.triangles, stats.export_ms);
+        m_export_status = status;
+    }
+
+    m_console_buffer.append(msg);
+    m_console_scroll_to_bottom = true;
+    spdlog::info("{}", msg);
+}
+
+// ============================================================================
+// GPU memory panel
+// ============================================================================
+
+namespace {
+
+/// Bytes as megabytes, for a readout that is never more precise than it is honest
+float as_mb(size_t bytes) {
+    return static_cast<float>(bytes) / (1024.0f * 1024.0f);
+}
+
+} // namespace
+
+void Editor::draw_memory_panel() {
+    ImGui::Begin("GPU Memory", &m_show_memory_panel);
+
+    if (!m_gpu_renderer) {
+        ImGui::TextDisabled("No renderer attached");
+        ImGui::End();
+        return;
+    }
+
+    GPURenderer& renderer = *m_gpu_renderer;
+    const GPURenderer::MemoryBudget budget = renderer.memory_budget();
+    const size_t resident = renderer.resident_bytes();
+
+    // ── Resident set ────────────────────────────────────────────────────────
+    ImGui::Text("Resident");
+    ImGui::Separator();
+
+    const float byte_fraction = budget.max_resident_bytes > 0
+        ? static_cast<float>(resident) / static_cast<float>(budget.max_resident_bytes)
+        : 0.0f;
+    char overlay[64];
+    snprintf(overlay, sizeof(overlay), "%.1f / %.0f MB", as_mb(resident),
+             as_mb(budget.max_resident_bytes));
+    ImGui::ProgressBar(std::clamp(byte_fraction, 0.0f, 1.0f), ImVec2(-1, 0), overlay);
+
+    const size_t meshes = renderer.resident_mesh_count();
+    const float mesh_fraction = budget.max_resident_meshes > 0
+        ? static_cast<float>(meshes) / static_cast<float>(budget.max_resident_meshes)
+        : 0.0f;
+    snprintf(overlay, sizeof(overlay), "%zu / %zu meshes", meshes, budget.max_resident_meshes);
+    ImGui::ProgressBar(std::clamp(mesh_fraction, 0.0f, 1.0f), ImVec2(-1, 0), overlay);
+
+    ImGui::Text("Tracked handles: %zu", m_mesh_owners.size());
+
+    // ── Budget ──────────────────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::Text("Budget");
+    ImGui::Separator();
+
+    GPURenderer::MemoryBudget edited = budget;
+    int budget_mb = static_cast<int>(edited.max_resident_bytes / (1024 * 1024));
+    int mesh_cap = static_cast<int>(edited.max_resident_meshes);
+    bool changed = false;
+    changed |= ImGui::SliderInt("Max MB", &budget_mb, 64, 4096);
+    changed |= ImGui::SliderInt("Max Meshes", &mesh_cap, 256, 32768);
+    changed |= ImGui::Checkbox("Evict under pressure", &edited.evict_under_pressure);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Off makes the caps diagnostics only: an upload that would breach one\n"
+                          "is refused instead, and the refusal shows up as an upload failure.");
+    }
+    if (changed) {
+        edited.max_resident_bytes = static_cast<size_t>(budget_mb) * 1024ull * 1024ull;
+        edited.max_resident_meshes = static_cast<size_t>(mesh_cap);
+        renderer.set_memory_budget(edited);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Evict Now")) {
+        const size_t evicted = renderer.evict_to_budget();
+        char msg[128];
+        snprintf(msg, sizeof(msg), "[GPU] Evicted %zu mesh(es) to budget\n", evicted);
+        m_console_buffer.append(msg);
+        m_console_scroll_to_bottom = true;
+    }
+
+    // ── Pools ───────────────────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::Text("Buffer pools");
+    ImGui::Separator();
+
+    const GPUBufferPool::Stats vertex_stats = renderer.vertex_pool_stats();
+    const GPUBufferPool::Stats index_stats = renderer.index_pool_stats();
+
+    if (ImGui::BeginTable("##pools", 6, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Pool");
+        ImGui::TableSetupColumn("Blocks");
+        ImGui::TableSetupColumn("Reserved");
+        ImGui::TableSetupColumn("Used");
+        ImGui::TableSetupColumn("Ranges");
+        ImGui::TableSetupColumn("Frag");
+        ImGui::TableHeadersRow();
+
+        const auto row = [](const char* name, const GPUBufferPool::Stats& st) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(name);
+            ImGui::TableNextColumn(); ImGui::Text("%zu", st.blocks);
+            ImGui::TableNextColumn(); ImGui::Text("%.1f MB", as_mb(st.bytes_reserved));
+            ImGui::TableNextColumn(); ImGui::Text("%.1f MB", as_mb(st.bytes_used));
+            ImGui::TableNextColumn(); ImGui::Text("%zu", st.live_allocations);
+            ImGui::TableNextColumn();
+            // Past ~0.8 with allocations failing is the signature of a free list
+            // that has stopped coalescing, so it gets a colour rather than a number
+            // nobody reads.
+            if (st.fragmentation > 0.8f) {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "%.2f", st.fragmentation);
+            } else {
+                ImGui::Text("%.2f", st.fragmentation);
+            }
+        };
+        row("Vertex", vertex_stats);
+        row("Index", index_stats);
+        ImGui::EndTable();
+    }
+
+    ImGui::TextDisabled("Blocks are the count that hits the driver's allocation limit.");
+
+    // ── Streaming ───────────────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::Text("Streaming");
+    ImGui::Separator();
+
+    ImGui::Text("Pending uploads: %zu", renderer.pending_upload_count());
+    ImGui::Text("Retired ranges:  %zu", renderer.retired_alloc_count());
+    ImGui::Text("Evictions:       %zu", renderer.evicted_mesh_count());
+
+    const size_t failures = renderer.upload_failures();
+    if (failures > 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Upload failures: %zu", failures);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Geometry is missing. Either the budget refused it or the pool "
+                              "could not grow a block.");
+        }
+    } else {
+        ImGui::Text("Upload failures: 0");
+    }
+
+    const GPURenderer::FrameStats frame = renderer.get_frame_stats();
+    ImGui::Text("Last frame: %u draw calls, %u triangles", frame.draw_calls, frame.triangles);
+
+    // ── Export ──────────────────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::Text("Export road network");
+    ImGui::Separator();
+
+    const bool busy = export_in_flight();
+    const bool importing = m_import_job || m_road_build_future.valid() ||
+                           m_carve_index_future.valid();
+    const bool have_roads = m_osm_parser.has_data() && !m_osm_parser.get_data().roads.empty();
+
+    ImGui::BeginDisabled(busy);
+
+    ImGui::SetNextItemWidth(-90.0f);
+    ImGui::InputText("##ExportDir", m_export_dir, sizeof(m_export_dir));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse##Export", ImVec2(-1, 0))) {
+        open_export_dir_dialog();
+    }
+
+    int format = static_cast<int>(m_export_config.format);
+    const char* formats[] = { "OBJ + MTL", "glTF 2.0 + .bin" };
+    if (ImGui::Combo("Format", &format, formats, 2)) {
+        m_export_config.format = static_cast<osm::road::ExportFormat>(format);
+    }
+
+    ImGui::SliderFloat("Chunk size", &m_export_config.chunk_size, 0.0f, 2000.0f, "%.0f m");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("0 writes the whole network as one file. The grid is anchored at the\n"
+                          "world origin, so two overlapping exports line up.");
+    }
+
+    ImGui::Checkbox("Collision mesh", &m_export_build_collision);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Derives a flat collision variant per piece during the re-solve.\n"
+                          "Costs roughly a third of the render mesh again.");
+    }
+
+    ImGui::Checkbox("LOD chain", &m_export_build_lods);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Simplifies once per material range per level. The most expensive\n"
+                          "option by a wide margin on a city extract.");
+    }
+    if (m_export_build_lods) {
+        ImGui::SliderInt("LOD levels", &m_export_config.lod_levels, 2, 4);
+    }
+
+    ImGui::BeginDisabled(!have_roads || importing);
+    if (ImGui::Button("Export", ImVec2(-1, 0))) {
+        begin_road_export();
+    }
+    ImGui::EndDisabled();
+
+    ImGui::EndDisabled();
+
+    if (busy) {
+        // Indeterminate: the exporter reports nothing until it returns, and a bar
+        // that sat at 0% would read as a hang.
+        ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), ImVec2(-1, 0),
+                           "Re-solving and writing...");
+    } else if (!have_roads) {
+        ImGui::TextDisabled("Import an OSM file with roads first");
+    }
+
+    if (!m_export_status.empty()) {
+        ImGui::TextWrapped("%s", m_export_status.c_str());
+    }
+
+    ImGui::End();
+}
+
+// ============================================================================
+// Terrain-aware roads
+// ============================================================================
+
+namespace {
+
+/// Boost-style mixer, so the fingerprint depends on field ORDER as well as value
+void hash_combine(uint64_t& seed, uint64_t value) {
+    seed ^= value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+}
+
+/// Bit pattern of a float, with the two zeroes folded together so they hash alike
+uint64_t hash_float(float v) {
+    if (v == 0.0f) v = 0.0f;
+    uint32_t bits = 0;
+    std::memcpy(&bits, &v, sizeof(bits));
+    return bits;
+}
+
+} // namespace
+
+uint64_t Editor::terrain_surface_fingerprint(const procgen::TerrainConfig& cfg) {
+    // Only the fields TerrainGenerator::sample_surface() reads: the raw height
+    // field, plus the urban flattening modifier, which is positioned from
+    // size_x/size_z. Resolution, water level, erosion and mesh settings do not
+    // change the surface a road is solved against, so a change to any of them
+    // must NOT invalidate the solve.
+    uint64_t h = 0xcbf29ce484222325ull;
+    hash_combine(h, static_cast<uint64_t>(cfg.seed));
+    hash_combine(h, static_cast<uint64_t>(cfg.type));
+    hash_combine(h, hash_float(cfg.base_height));
+    hash_combine(h, hash_float(cfg.max_height));
+    hash_combine(h, hash_float(cfg.noise_scale));
+    hash_combine(h, static_cast<uint64_t>(cfg.octaves));
+    hash_combine(h, hash_float(cfg.lacunarity));
+    hash_combine(h, hash_float(cfg.persistence));
+    hash_combine(h, static_cast<uint64_t>(cfg.flatten_center ? 1 : 0));
+    hash_combine(h, hash_float(cfg.flatten_radius));
+    hash_combine(h, hash_float(cfg.flatten_falloff));
+    hash_combine(h, hash_float(cfg.size_x));
+    hash_combine(h, hash_float(cfg.size_z));
+
+    // Never collide with the "no terrain" sentinel.
+    return h == 0 ? 1 : h;
+}
+
+bool Editor::has_generated_terrain() const {
+    return m_terrain_tile_manager.generated_count() > 0;
+}
+
+uint64_t Editor::live_road_terrain_fingerprint() const {
+    return (m_terrain_aware_roads && m_use_chunked_terrain && has_generated_terrain())
+               ? terrain_surface_fingerprint(m_terrain_tile_manager.get_config().terrain)
+               : 0;
+}
+
+osm::road::HeightSampler Editor::make_terrain_height_sampler() const {
+    if (!m_terrain_aware_roads) return nullptr;
+
+    // The legacy single-terrain path has no carve hook, so elevating roads
+    // against it would leave them following a surface nothing ever cuts. Flat
+    // roads on flat-looking terrain beat roads buried in an uncarved hillside.
+    if (!m_use_chunked_terrain) return nullptr;
+    if (!has_generated_terrain()) return nullptr;
+
+    // The config the CHUNKS were generated from, not the panel's live edit
+    // buffer: the buffer may already hold settings the user has not pressed
+    // Generate on, and solving against a surface that does not exist yet would
+    // float every road.
+    const procgen::TerrainConfig terrain = m_terrain_tile_manager.get_config().terrain;
+
+    // A generator of our own. TerrainTileManager's is private, and
+    // TerrainGenerator::sample_surface() is only re-entrant as long as nothing
+    // reseeds the same instance -- which generate_chunk() does, on the main
+    // thread, while this sampler is being called from the solver's workers.
+    // Seeded from the same config, a separate instance gives bit-identical
+    // heights with none of that coupling. Held by shared_ptr so it outlives the
+    // async build even if the editor's terrain settings change meanwhile.
+    auto generator = std::make_shared<procgen::TerrainGenerator>(terrain.seed);
+
+    return [terrain, generator](double x, double y) -> float {
+        // Roads carry LOCAL 2D metres, and so does the terrain height field: its
+        // second argument is the same local y, NOT render-space Z. Both sides
+        // negate independently on their way to render space -- terrain through
+        // TerrainMeshBuilder's vec3(world_x, h, -world_z), roads through
+        // vec3(x, h, -y_2d) -- so the two agree exactly when the second argument
+        // is passed through unchanged.
+        //
+        // Negate it and every road is elevated from the height at its own mirror
+        // image across the equator of the import: still smooth, still plausible,
+        // and completely wrong everywhere the terrain is not symmetric.
+        return generator->sample_surface(terrain,
+                                         static_cast<float>(x),
+                                         static_cast<float>(y));
+    };
+}
+
+osm::road::RoadNetworkConfig Editor::make_road_network_config() const {
+    osm::road::RoadNetworkConfig cfg;
+    cfg.height_sampler = make_terrain_height_sampler();
+    cfg.solve_junctions = m_solve_junctions;
+    cfg.emit_markings = m_emit_markings;
+    cfg.emit_crossings = m_emit_crossings;
+    cfg.emit_structures = m_emit_structures;
+    return cfg;
+}
+
+Editor::RoadBuildResult Editor::run_road_network_build(const osm::ParsedOSMData& data,
+                                                       const osm::road::RoadNetworkConfig& cfg) {
+    RoadBuildResult result;
+    result.elevated = static_cast<bool>(cfg.height_sampler);
+    result.solved_junctions = cfg.solve_junctions;
+
+    // Structures need a terrain height under the road, so the builder skips them
+    // whatever the flag says when there is no sampler. Recording the flag alone
+    // would leave the panel reporting a pass that never ran.
+    result.emitted_markings = cfg.emit_markings;
+    result.emitted_crossings = cfg.emit_crossings;
+    result.emitted_structures = cfg.emit_structures && static_cast<bool>(cfg.height_sampler);
+
+    osm::road::RoadNetworkBuilder builder;
+    result.network = builder.build(data, cfg);
+
+    // The builder owns the elevation solver and dies with this function, so
+    // everything the panel reads out has to be copied here.
+    const osm::road::RoadElevationSolver& solver = builder.elevation();
+    if (solver.is_solved()) {
+        result.elevation = solver.stats();
+        for (const osm::road::EdgeElevation& edge : solver.edges()) {
+            result.max_grade = std::max(result.max_grade, edge.max_grade_used);
+        }
+    } else {
+        // A sampler was supplied but the solve did not produce a result (no
+        // usable roads, or a centerline/graph size mismatch). The network is
+        // flat, so say so rather than showing an empty elevation readout.
+        result.elevated = false;
+    }
+
+    return result;
+}
+
+void Editor::begin_road_network_rebuild() {
+    if (m_import_job || m_road_build_future.valid() || m_carve_index_future.valid() ||
+        export_in_flight()) {
+        // Deferred, not dropped: the refused request is the NEWER one, and the
+        // build in flight is about to stamp a fingerprint that will then look
+        // current. finish_osm_import() picks this up.
+        m_road_rebuild_owed = true;
+        spdlog::warn("Road rebuild deferred: an import is already running");
+        return;
+    }
+    m_road_rebuild_owed = false;
+    if (!m_osm_parser.has_data() || m_osm_parser.get_data().roads.empty()) {
+        return;
+    }
+
+    // Safe to hold a pointer into m_osm_parser for the same reason the import
+    // path does: begin_osm_import() and the Clear Data button both refuse to run
+    // while a road build is in flight.
+    const osm::ParsedOSMData* parsed = &m_osm_parser.get_data();
+
+    m_road_rebuild_only = true;
+    m_import_stage = ImportStage::BuildingRoads;
+    m_import_message = "Re-solving the road network...";
+    m_import_fraction = 0.0f;
+    m_import_nodes_total = 0;
+    m_import_pending_nodes.clear();
+
+    // Both captures read the terrain config on THIS thread, in this statement, so
+    // the sampler and the fingerprint describe one and the same surface however
+    // the panel is driven while the build runs.
+    m_road_build_future = std::async(std::launch::async,
+                                     [parsed,
+                                      cfg = make_road_network_config(),
+                                      surface = live_road_terrain_fingerprint()]() {
+        RoadBuildResult result = run_road_network_build(*parsed, cfg);
+        result.terrain_fingerprint = surface;
+        return result;
+    });
+
+    spdlog::info("Rebuilding the road network against the current terrain");
+}
+
+void Editor::maybe_rebuild_roads_for_terrain() {
+    if (!m_osm_parser.has_data() || m_osm_parser.get_data().roads.empty()) {
+        return;
+    }
+
+    // The surface the roads WOULD be solved against now.
+    const uint64_t surface = live_road_terrain_fingerprint();
+
+    if (surface == m_road_terrain_fingerprint) {
+        return;  // already solved against exactly this surface
+    }
+
+    // Rebuilding beats telling the user to re-import. The parsed OSM data is
+    // already in memory and only the vertical solve is stale, so a rebuild costs
+    // the road pass alone; a re-import costs re-parsing a file that may be
+    // hundreds of megabytes. It also cannot be skipped: a network built with no
+    // sampler emits NO carve data at all, so without this the terrain would have
+    // nothing to carve and every road would sit buried in the hillside.
+    begin_road_network_rebuild();
+}
+
 void Editor::begin_osm_import(const std::string& filepath, const osm::ParserConfig& config) {
     if (m_import_job) {
         spdlog::warn("An OSM import is already running");
+        return;
+    }
+    // The road worker reads m_osm_parser's data by pointer, and a second import
+    // would reassign that parser out from under it.
+    if (m_road_build_future.valid() || m_carve_index_future.valid()) {
+        spdlog::warn("A road network build is still running; import refused");
+        return;
+    }
+    if (export_in_flight()) {
+        spdlog::warn("A road export is still running; import refused");
         return;
     }
 
@@ -1272,17 +2131,137 @@ void Editor::poll_osm_import() {
         m_osm_parser.log_statistics();
         m_osm_parser.log_sample_data();
 
-        // ── Stage 2: spatial index ──
+        // ── Stage 2: road network ──
+        // Solved once over the whole graph rather than per quadtree leaf, so
+        // junctions, miters and profile transitions survive leaf boundaries. It
+        // is pure stratum_core CPU work, so it goes on a worker like parsing did;
+        // the quadtree is not touched until it lands.
+        //
+        // The lambda holds a pointer into m_osm_parser. That is safe because
+        // nothing may reassign or clear the parser while this future is valid:
+        // begin_osm_import() and the Clear Data button are both gated on the
+        // import being idle.
+        m_import_stage = ImportStage::BuildingRoads;
+        m_import_message = "Building road network...";
+        m_import_fraction = 0.0f;
+
+        const osm::ParsedOSMData* parsed = &m_osm_parser.get_data();
+        m_road_rebuild_only = false;
+        m_road_build_future = std::async(std::launch::async,
+                                         [parsed,
+                                          cfg = make_road_network_config(),
+                                          surface = live_road_terrain_fingerprint()]() {
+            RoadBuildResult result = run_road_network_build(*parsed, cfg);
+            result.terrain_fingerprint = surface;
+            return result;
+        });
+        return;
+    }
+
+    if (m_import_stage == ImportStage::BuildingRoads) {
+        if (!m_road_build_future.valid()) {
+            // Cannot happen through the state machine above; recover rather than
+            // wedge the panel in a stage that never advances.
+            spdlog::error("Road network stage entered with no job; aborting import");
+            m_import_stage = ImportStage::Failed;
+            m_import_message = "Road network build lost";
+            return;
+        }
+
+        if (m_road_build_future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            return;  // still solving; the indeterminate bar keeps animating
+        }
+
+        RoadBuildResult result = m_road_build_future.get();
+        osm::road::RoadNetwork& network = result.network;
+
+        m_road_stats = network.stats;
+        m_road_elevation_stats = result.elevation;
+        m_road_junction_stats = network.junction_stats;
+        m_road_max_grade = result.max_grade;
+        m_road_built_on_terrain = result.elevated;
+        m_road_solved_junctions = result.solved_junctions;
+        m_road_emitted_markings = result.emitted_markings;
+        m_road_emitted_crossings = result.emitted_crossings;
+        m_road_emitted_structures = result.emitted_structures;
+        m_road_portal_mouths = network.carve_portals.size();
+        m_have_road_stats = true;
+        // The surface this build was SOLVED against, captured at launch. Reading
+        // the manager here instead would record whatever terrain is loaded when
+        // the future happens to land, which is a different surface entirely
+        // whenever the user regenerated terrain mid-build.
+        m_road_terrain_fingerprint = result.elevated ? result.terrain_fingerprint : 0;
+
+        char road_msg[320];
+        snprintf(road_msg, sizeof(road_msg),
+                 "[OSM] Road network: %zu pieces, %zu triangles from %zu edges in %.0f ms\n",
+                 network.stats.pieces, network.stats.triangles, network.stats.edges,
+                 network.stats.build_ms);
+        m_console_buffer.append(road_msg);
+
+        if (result.elevated) {
+            snprintf(road_msg, sizeof(road_msg),
+                     "[OSM] Elevation: %zu edges solved in %.0f ms, %zu iterations, "
+                     "max grade %.1f%%, %zu bridges, %zu tunnels\n",
+                     network.stats.elevated_edges, network.stats.elevation_ms,
+                     result.elevation.iterations, result.max_grade * 100.0f,
+                     result.elevation.bridges, result.elevation.tunnels);
+        } else {
+            snprintf(road_msg, sizeof(road_msg),
+                     "[OSM] Elevation: skipped, roads are flat (no terrain to follow)\n");
+        }
+        m_console_buffer.append(road_msg);
+
+        if (result.solved_junctions) {
+            snprintf(road_msg, sizeof(road_msg),
+                     "[OSM] Junctions: %zu solved, %zu roundabouts, %zu tapers, "
+                     "%zu dead ends, %zu degenerate, %zu over-trimmed edges in %.0f ms\n",
+                     network.junction_stats.junctions, network.junction_stats.roundabouts,
+                     network.junction_stats.tapers, network.junction_stats.dead_ends,
+                     network.junction_stats.degenerate,
+                     network.junction_stats.over_trimmed_edges,
+                     network.stats.junction_ms);
+        } else {
+            snprintf(road_msg, sizeof(road_msg),
+                     "[OSM] Junctions: solver off, ribbons run through every node\n");
+        }
+        m_console_buffer.append(road_msg);
+
+        snprintf(road_msg, sizeof(road_msg),
+                 "[OSM] Detail: %zu marking pieces, %zu crossings, %zu bridges, "
+                 "%zu tunnels (%zu portal mouths), %zu sidewalk sides deduped\n",
+                 network.stats.markings_pieces, network.stats.crossings,
+                 network.stats.bridges, network.stats.tunnels,
+                 network.carve_portals.size(), network.stats.deduped_sidewalks);
+        m_console_buffer.append(road_msg);
+        m_console_scroll_to_bottom = true;
+
+        // The corridors outlive the network: they are indexed and carved once the
+        // meshes are done. Moved out before the pieces are handed to the quadtree,
+        // because that call consumes the network.
+        m_pending_carve = std::make_unique<procgen::CarveInput>();
+        m_pending_carve->ribbons = std::move(network.carve_ribbons);
+        m_pending_carve->discs   = std::move(network.carve_discs);
+        m_pending_carve->portals = std::move(network.carve_portals);
+        m_pending_carve->config  = m_carve_config;
+
+        // ── Stage 3: spatial index ──
         // Blocking, but far cheaper than parsing, and it mutates the quadtree that
         // render_3d walks every frame, so it has to stay on the main thread.
         m_import_stage = ImportStage::Indexing;
         m_import_message = "Building spatial index...";
         m_import_fraction = 0.0f;
 
-        begin_mesh_rebuild();
+        begin_mesh_rebuild(std::move(network.pieces), !m_road_rebuild_only);
 
         m_import_stage = ImportStage::BuildingMeshes;
         m_import_message = "Building meshes...";
+        return;
+    }
+
+    // ── Stage 5: carve the solved corridors into the terrain ──
+    if (m_import_stage == ImportStage::CarvingTerrain) {
+        poll_road_carve();
         return;
     }
 
@@ -1308,7 +2287,7 @@ void Editor::poll_osm_import() {
         return;
     }
 
-    // ── Complete ──
+    // ── Meshes done: hand the corridors to the terrain ──
     m_import_pending_nodes.clear();
 
     const auto& data = m_osm_parser.get_data();
@@ -1318,13 +2297,123 @@ void Editor::poll_osm_import() {
     m_console_buffer.append(msg);
     m_console_scroll_to_bottom = true;
 
-    m_import_stage = ImportStage::Done;
-    m_import_fraction = 1.0f;
-    m_import_message = "Import successful";
-    spdlog::info("OSM import complete");
+    m_import_stage = ImportStage::CarvingTerrain;
+    m_import_fraction = 0.0f;
+    m_import_message = "Preparing terrain carve...";
+    begin_road_carve();
 }
 
-void Editor::begin_mesh_rebuild() {
+// ============================================================================
+// Terrain carve stage
+// ============================================================================
+
+void Editor::begin_road_carve() {
+    m_carve_apply_pending = false;
+
+    const bool have_corridors = m_pending_carve && m_pending_carve->item_count() > 0;
+
+    if (!have_corridors) {
+        // Roads were built flat, so there is nothing to carve. Any carve data
+        // still installed belongs to a network that no longer exists and would
+        // hold trenches under roads that have moved, so drop it. Dropping it
+        // regenerates the affected chunks, which is the same blocking work an
+        // install is, so it goes through the same deferred-by-one-frame path.
+        m_pending_carve.reset();
+        if (m_terrain_tile_manager.has_road_carve_data()) {
+            m_import_message = "Clearing terrain carve...";
+            m_carve_apply_pending = true;
+        } else {
+            finish_osm_import();
+        }
+        return;
+    }
+
+    // Indexing is proportional to the number of corridors, which is proportional
+    // to the size of the import, so it goes on a worker like every other
+    // whole-network pass. It touches nothing the main thread reads.
+    m_import_message = "Indexing road corridors...";
+    m_carve_index_future = std::async(std::launch::async,
+                                      [input = std::move(m_pending_carve)]() mutable {
+        input->build_index();
+        return std::move(input);
+    });
+}
+
+void Editor::poll_road_carve() {
+    // Second half of the deferred apply: the stage message set last frame has
+    // been drawn, so the blocking regeneration may now run.
+    if (m_carve_apply_pending) {
+        m_carve_apply_pending = false;
+        install_road_carve_data();
+        finish_osm_import();
+        return;
+    }
+
+    if (!m_carve_index_future.valid()) {
+        // No index job and no pending apply: nothing left to do in this stage.
+        finish_osm_import();
+        return;
+    }
+
+    if (m_carve_index_future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        return;  // still indexing; the indeterminate bar keeps animating
+    }
+
+    m_pending_carve = m_carve_index_future.get();
+
+    // Apply on the NEXT frame. set_road_carve_data() regenerates every existing
+    // chunk in one call; doing that in the frame that names the stage means the
+    // name never reaches the screen.
+    m_import_message = "Carving terrain...";
+    m_carve_apply_pending = true;
+}
+
+void Editor::install_road_carve_data() {
+    if (!m_pending_carve) {
+        if (m_terrain_tile_manager.has_road_carve_data()) {
+            m_terrain_tile_manager.clear_road_carve_data();
+            m_console_buffer.append("[Terrain] Road carve cleared; terrain returned to procedural\n");
+            m_console_scroll_to_bottom = true;
+        }
+        return;
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "[Terrain] Carving %zu corridors and %zu junctions into %zu chunks\n",
+             m_pending_carve->ribbons.size(), m_pending_carve->discs.size(),
+             m_terrain_tile_manager.chunk_count());
+    m_console_buffer.append(msg);
+    m_console_scroll_to_bottom = true;
+
+    // Regenerates every already-generated chunk, which is why this is on the main
+    // thread: render_3d() walks those chunks every frame. Chunks generated LATER
+    // pick the carve up inside generate_chunk(), so an install with no terrain yet
+    // is nearly free and still correct.
+    m_terrain_tile_manager.set_road_carve_data(std::move(*m_pending_carve));
+    m_pending_carve.reset();
+}
+
+void Editor::finish_osm_import() {
+    m_pending_carve.reset();
+    m_carve_apply_pending = false;
+    m_import_stage = ImportStage::Done;
+    m_import_fraction = 1.0f;
+    m_import_message = m_road_rebuild_only ? "Roads re-solved against the terrain"
+                                           : "Import successful";
+    m_road_rebuild_only = false;
+    spdlog::info("OSM import complete");
+
+    // A rebuild asked for while this one was in flight. Honoured through
+    // maybe_rebuild_roads_for_terrain() rather than launched directly, so a
+    // request that the just-landed build already satisfied costs nothing.
+    if (m_road_rebuild_owed) {
+        m_road_rebuild_owed = false;
+        maybe_rebuild_roads_for_terrain();
+    }
+}
+
+void Editor::begin_mesh_rebuild(std::vector<osm::road::RoadPiece>&& road_pieces,
+                                bool recenter_camera) {
     m_building_meshes.clear();
     m_road_meshes.clear();
     m_area_meshes.clear();
@@ -1333,10 +2422,24 @@ void Editor::begin_mesh_rebuild() {
 
     // Initialize quadtree
     spdlog::info("Initializing quadtree...");
+    // Every leaf about to be destroyed may still own GPU buffers. clear() only
+    // drops the CPU-side tree, so without this the previous tree's buffers stay
+    // alive with nothing referencing them for the rest of the session. A road
+    // rebuild makes this path routine rather than once-per-import.
+    if (m_gpu_renderer) {
+        for (auto* leaf : m_quadtree.get_all_leaves()) {
+            if (leaf) release_node_from_gpu(*leaf, *m_gpu_renderer);
+        }
+    }
     m_quadtree.clear();
     // Sized from the features, not osm_data.bounds -- see QuadTree::init(ParsedOSMData).
     m_quadtree.init(osm_data);
     m_quadtree.assign_data(osm_data);
+
+    // Roads are not rebuilt per leaf any more. Hand the already-solved geometry
+    // over now, while the leaves exist and before any node build is queued, so
+    // the first upload of a leaf already carries its roads.
+    m_quadtree.assign_road_pieces(std::move(road_pieces));
 
     spdlog::info("QuadTree: {} leaves, {} roads, {} buildings, {} areas, max depth {}",
                  m_quadtree.leaf_count(),
@@ -1362,7 +2465,7 @@ void Editor::begin_mesh_rebuild() {
     float focus_radius = 0.0f;
     const bool have_focus = m_quadtree.get_focus(focus_centre, focus_radius);
 
-    if (have_focus) {
+    if (have_focus && recenter_camera) {
         // Frame where the features actually are, not the centre of their bounding
         // box. Those differ wildly for an Overpass export, whose box is stretched
         // by the nodes it pulls in for ways crossing the query area.
@@ -1396,6 +2499,12 @@ void Editor::begin_mesh_rebuild() {
                      cam_pos.x, cam_pos.y, cam_pos.z,
                      data_center.x, data_center.y, data_center.z,
                      focus_radius, m_view_radius);
+    } else if (have_focus) {
+        // A road rebuild after terrain generation. The geometry is the same data
+        // in the same place, so re-framing it would only throw away wherever the
+        // user was looking.
+        data_center = focus_centre;
+        spdlog::info("Road rebuild: leaving the camera where it is");
     } else if (found_geometry) {
         spdlog::warn("No populated quadtree leaves; leaving the camera where it is");
     }
@@ -1436,41 +2545,177 @@ void Editor::begin_mesh_rebuild() {
 
 
 
+// ============================================================================
+// Resident GPU geometry: ownership, distance, and eviction
+// ============================================================================
+
+glm::vec3 Editor::node_anchor(const osm::QuadTreeNode& node) {
+    if (node.has_valid_bounds()) {
+        return (node.bounds_min + node.bounds_max) * 0.5f;
+    }
+    // No geometry ever grew the AABB, but the cell still locates the leaf. Local
+    // 2D (x, y) maps to world (x, height, -y); the height is unknown, so 0.
+    return glm::vec3(static_cast<float>(node.center.x), 0.0f,
+                     static_cast<float>(-node.center.y));
+}
+
+uint32_t Editor::upload_tracked_mesh(GPURenderer& renderer, const Mesh& mesh,
+                                     const MeshOwner& owner) {
+    const uint32_t id = renderer.upload_mesh(mesh);
+    if (id == 0) {
+        // Not a handle. Registering it would make the owner of mesh 0 whichever
+        // upload failed most recently.
+        return 0;
+    }
+    m_mesh_owners[id] = owner;
+    return id;
+}
+
+void Editor::release_tracked_mesh(GPURenderer& renderer, uint32_t& mesh_id) {
+    if (mesh_id == 0) return;
+    m_mesh_owners.erase(mesh_id);
+    renderer.release_mesh(mesh_id);
+    mesh_id = 0;
+}
+
+float Editor::mesh_distance_to_camera(uint32_t mesh_id) const {
+    const auto it = m_mesh_owners.find(mesh_id);
+    if (it == m_mesh_owners.end()) {
+        // Nothing is holding this handle, so nothing will miss it. Reporting it as
+        // infinitely far away puts it at the front of the eviction order, which is
+        // the right answer for geometry nobody is tracking any more.
+        return std::numeric_limits<float>::max();
+    }
+    if (it->second.kind == MeshOwner::Kind::Pinned) {
+        return -1.0f;
+    }
+    return glm::length(it->second.anchor - m_camera.get_position());
+}
+
+void Editor::on_mesh_evicted(uint32_t mesh_id) {
+    const auto it = m_mesh_owners.find(mesh_id);
+    if (it == m_mesh_owners.end()) return;
+
+    const MeshOwner owner = it->second;
+    m_mesh_owners.erase(it);
+
+    // No call back into the renderer from here: it is mid-eviction and walking
+    // its own mesh map. Clearing the handle is all this has to do.
+    switch (owner.kind) {
+        case MeshOwner::Kind::QuadTreeLeaf: {
+            if (!owner.node) break;
+            std::erase(owner.node->area_gpu_ids, mesh_id);
+            std::erase(owner.node->road_gpu_ids, mesh_id);
+            std::erase(owner.node->building_gpu_ids, mesh_id);
+            // The leaf is no longer whole, so it is no longer uploaded. It streams
+            // back in the next time it is visible, and upload_node_to_gpu()
+            // releases whichever of its handles survived before re-uploading.
+            owner.node->gpu_uploaded = false;
+            break;
+        }
+        case MeshOwner::Kind::TerrainChunk: {
+            auto* chunk = m_terrain_tile_manager.get_chunk(owner.coord);
+            if (!chunk) break;
+            if (chunk->terrain_gpu_id == mesh_id) chunk->terrain_gpu_id = 0;
+            if (chunk->water_gpu_id == mesh_id) chunk->water_gpu_id = 0;
+            // Same contract as a leaf: the re-upload path in render_3d() releases
+            // the surviving handle before replacing both.
+            chunk->gpu_uploaded = false;
+            break;
+        }
+        case MeshOwner::Kind::Pinned:
+            // Unreachable: a pinned mesh reports a negative distance and is never
+            // a candidate. If it happens, the handle has already been forgotten
+            // above, which is the most that can be done from here.
+            spdlog::warn("A pinned mesh ({}) was evicted", mesh_id);
+            break;
+    }
+}
+
 void Editor::upload_node_to_gpu(osm::QuadTreeNode& node, GPURenderer& renderer) {
     if (node.gpu_uploaded) return;
 
-    node.area_gpu_ids.clear();
-    for (const auto& mesh : node.area_meshes) {
-        uint32_t id = renderer.upload_mesh(mesh);
-        node.area_gpu_ids.push_back(id);
-    }
+    // A leaf can reach here still holding handles: eviction takes one of its
+    // meshes and clears gpu_uploaded, leaving the others live. Clearing the id
+    // vectors without releasing them -- which is what this used to do -- would
+    // strand that geometry on the GPU for the rest of the session.
+    release_node_from_gpu(node, renderer);
 
-    node.road_gpu_ids.clear();
-    for (const auto& mesh : node.road_meshes) {
-        uint32_t id = renderer.upload_mesh(mesh);
-        node.road_gpu_ids.push_back(id);
-    }
+    MeshOwner owner;
+    owner.kind = MeshOwner::Kind::QuadTreeLeaf;
+    owner.node = &node;
+    owner.anchor = node_anchor(node);
 
-    node.building_gpu_ids.clear();
-    for (const auto& mesh : node.building_meshes) {
-        uint32_t id = renderer.upload_mesh(mesh);
-        node.building_gpu_ids.push_back(id);
-    }
+    size_t failed = 0;
+    size_t uploaded = 0;
+    const auto upload_all = [&](const std::vector<Mesh>& meshes, std::vector<uint32_t>& ids) {
+        ids.reserve(meshes.size());
+        for (const Mesh& mesh : meshes) {
+            if (!mesh.is_valid()) {
+                continue;  // nothing to draw, and not a failure either
+            }
+            const uint32_t id = upload_tracked_mesh(renderer, mesh, owner);
+            if (id == 0) {
+                ++failed;
+                continue;
+            }
+            ids.push_back(id);
+            ++uploaded;
+        }
+    };
 
-    node.gpu_uploaded = true;
+    upload_all(node.area_meshes, node.area_gpu_ids);
+    upload_all(node.road_meshes, node.road_gpu_ids);
+    upload_all(node.building_meshes, node.building_gpu_ids);
+
+    // Only a leaf that uploaded IN FULL is uploaded.
+    //
+    // This used to push the 0 that upload_mesh() returns on FAILURE straight into
+    // the id vector and set gpu_uploaded = true regardless, so a leaf that lost an
+    // upload -- to a budget refusal, a pool refusal, or a device OOM -- was never
+    // retried. draw_mesh() then discarded the 0 silently every frame and the leaf
+    // rendered nothing for the rest of the session, with no error anywhere.
+    //
+    // The second half of the test covers eviction landing DURING this upload: an
+    // upload under pressure evicts to make room, and the victim it picks can be a
+    // mesh this very leaf uploaded a moment ago, which on_mesh_evicted() then
+    // erases from the vectors below. Counting what is still held against what was
+    // uploaded catches that without any extra state, and the leaf is retried
+    // whole rather than latching as complete while missing a mesh.
+    const size_t held = node.area_gpu_ids.size() + node.road_gpu_ids.size()
+                      + node.building_gpu_ids.size();
+    node.gpu_uploaded = (failed == 0) && (held == uploaded);
+
+    if (failed > 0) {
+        // Retried on every frame the leaf stays visible, so the warning is rate
+        // limited rather than the retry: a failure that persists must not turn
+        // into a 60 Hz log write.
+        const uint64_t now = SDL_GetTicks();
+        if (now >= m_next_upload_warn_ms) {
+            m_next_upload_warn_ms = now + 2000;
+            spdlog::warn("{} mesh(es) of quadtree leaf {} failed to upload; retrying while it "
+                         "stays visible ({} renderer upload failures so far, {} MB resident)",
+                         failed, node.node_id, renderer.upload_failures(),
+                         renderer.resident_bytes() / (1024 * 1024));
+        }
+    }
 }
 
 void Editor::release_node_from_gpu(osm::QuadTreeNode& node, GPURenderer& renderer) {
-    if (!node.gpu_uploaded) return;
+    // Deliberately NOT guarded on gpu_uploaded. A leaf that lost one mesh to
+    // eviction has the flag cleared while still holding the others, and a guard
+    // here would leave exactly those behind -- which is the leak this function is
+    // called to prevent, on every path that destroys the tree.
+    const auto release_all = [&](std::vector<uint32_t>& ids) {
+        for (uint32_t& id : ids) {
+            release_tracked_mesh(renderer, id);
+        }
+        ids.clear();
+    };
 
-    for (uint32_t id : node.area_gpu_ids) renderer.release_mesh(id);
-    node.area_gpu_ids.clear();
-
-    for (uint32_t id : node.road_gpu_ids) renderer.release_mesh(id);
-    node.road_gpu_ids.clear();
-
-    for (uint32_t id : node.building_gpu_ids) renderer.release_mesh(id);
-    node.building_gpu_ids.clear();
+    release_all(node.area_gpu_ids);
+    release_all(node.road_gpu_ids);
+    release_all(node.building_gpu_ids);
 
     node.gpu_uploaded = false;
 }
@@ -1562,28 +2807,57 @@ void Editor::render_3d(GPURenderer& renderer) {
             for (const auto& coord : m_terrain_tile_manager.get_all_chunks()) {
                 auto* chunk = const_cast<procgen::TerrainChunk*>(m_terrain_tile_manager.get_chunk(coord));
                 if (!chunk || !chunk->mesh_built) continue;
-                
-                // Upload to GPU if needed
-                if (!chunk->gpu_uploaded && m_gpu_renderer) {
-                    if (chunk->terrain_mesh.is_valid()) {
-                        chunk->terrain_gpu_id = m_gpu_renderer->upload_mesh(chunk->terrain_mesh);
-                    }
-                    if (chunk->water_mesh.is_valid()) {
-                        chunk->water_gpu_id = m_gpu_renderer->upload_mesh(chunk->water_mesh);
-                    }
-                    chunk->gpu_uploaded = true;
-                }
-                
-                // Frustum culling
+
+                // Cull BEFORE uploading. The upload used to run for every chunk in
+                // the manager whatever the camera could see, which was merely
+                // wasteful when nothing was ever unloaded; with an eviction budget
+                // it is a thrash loop, because a chunk evicted for being far away
+                // would re-upload on the very next frame.
                 if (m_use_tile_culling && !frustum.intersects_aabb(chunk->bounds_min, chunk->bounds_max)) {
                     continue;
                 }
-                
+
                 // Distance culling
                 if (m_use_distance_culling) {
                     glm::vec3 chunk_center = (chunk->bounds_min + chunk->bounds_max) * 0.5f;
                     float dist_sq = glm::dot(chunk_center - cam_pos, chunk_center - cam_pos);
                     if (dist_sq > radius_sq) continue;
+                }
+
+                // Upload to GPU if needed
+                if (!chunk->gpu_uploaded && m_gpu_renderer) {
+                    // A cleared gpu_uploaded on a chunk that still carries handles
+                    // means either its mesh was REBUILT -- by a road carve install,
+                    // or by a terrain settings change -- or one of its two meshes
+                    // was evicted. Overwriting the handles without releasing them
+                    // first strands the old ranges for the rest of the session, and
+                    // a carve regenerates every chunk at once.
+                    release_tracked_mesh(*m_gpu_renderer, chunk->terrain_gpu_id);
+                    release_tracked_mesh(*m_gpu_renderer, chunk->water_gpu_id);
+
+                    MeshOwner owner;
+                    owner.kind = MeshOwner::Kind::TerrainChunk;
+                    owner.coord = coord;
+                    owner.anchor = (chunk->bounds_min + chunk->bounds_max) * 0.5f;
+
+                    if (chunk->terrain_mesh.is_valid()) {
+                        chunk->terrain_gpu_id =
+                            upload_tracked_mesh(*m_gpu_renderer, chunk->terrain_mesh, owner);
+                    }
+                    if (chunk->water_mesh.is_valid()) {
+                        chunk->water_gpu_id =
+                            upload_tracked_mesh(*m_gpu_renderer, chunk->water_mesh, owner);
+                    }
+
+                    // Same rule as a quadtree leaf: a partial upload is not an
+                    // upload and must be retried rather than latched. Read back
+                    // from the handles AFTER both uploads rather than from each
+                    // return value, because the second upload can evict the first
+                    // one to make room -- on_mesh_evicted() then zeroes a handle
+                    // that was good when it was returned.
+                    chunk->gpu_uploaded =
+                        (!chunk->terrain_mesh.is_valid() || chunk->terrain_gpu_id != 0) &&
+                        (!chunk->water_mesh.is_valid() || chunk->water_gpu_id != 0);
                 }
                 
                 // Draw terrain

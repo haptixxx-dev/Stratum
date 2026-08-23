@@ -1,5 +1,6 @@
 #pragma once
 
+#include "procgen/terrain_carve.hpp"
 #include "procgen/terrain_generator.hpp"
 #include "procgen/terrain_mesh_builder.hpp"
 #include "osm/types.hpp"
@@ -128,6 +129,11 @@ public:
     
     /**
      * @brief Clear all terrain data
+     *
+     * Drops every chunk and both flatten masks. Road carve data SURVIVES: it
+     * describes the imported road network, not the terrain, and set_config()
+     * routes through here. Losing it on a terrain-setting change would silently
+     * un-carve every road. Use clear_road_carve_data() to drop it.
      */
     void clear();
     
@@ -147,7 +153,13 @@ public:
      * 
      * Analyzes OSM buildings, roads, and areas to determine where
      * terrain should be flattened for clean blending.
-     * 
+     *
+     * Roads are painted into a mask of their own, and that mask is applied only
+     * while no road carve data is set. Once set_road_carve_data() has run, the
+     * solved corridors own the terrain under every road and the crude flat band
+     * is ignored, so the two never fight over the same cells. Buildings and areas
+     * are unaffected and keep their existing behaviour.
+     *
      * @param roads OSM roads
      * @param buildings OSM buildings  
      * @param areas OSM areas (parks, water, etc.)
@@ -155,6 +167,49 @@ public:
     void import_osm_data(const std::vector<osm::Road>& roads,
                          const std::vector<osm::Building>& buildings,
                          const std::vector<osm::Area>& areas);
+
+    /**
+     * @brief Supply solved road corridors for carving
+     *
+     * Chunks generated after this call are carved as part of generate_chunk(),
+     * before their mesh is built, because the terrain mesh must be built from the
+     * carved heightmap and not the raw one.
+     *
+     * Already generated chunks are invalidated and regenerated, and any chunk
+     * that already had a mesh gets that mesh rebuilt. This is what makes the
+     * ordering of "import OSM" against "generate terrain" irrelevant to the user:
+     * either order converges on the same world.
+     *
+     * @p input is moved in. It must already have had CarveInput::build_index()
+     * called on it; an un-indexed input carves nothing. Road elevation is solved
+     * globally before this point, so nothing here depends on which chunks exist.
+     *
+     * This supersedes the crude flatten-mask road path in import_osm_data(),
+     * which paints a fixed-radius flat band around every road polyline and knows
+     * nothing about road height, width, or grade. When carve data is present,
+     * roads are excluded from the flatten mask and the carve owns their terrain.
+     *
+     * Calling this again with a NEWER input is the plan's "pass 2". Every chunk
+     * is regenerated from the noise before it is carved, never carved a second
+     * time on top of an already carved surface, so replacing P3's provisional
+     * junction discs with P4's real fillet polygons refines the junction
+     * neighbourhoods rather than compounding two carves into one wrong surface.
+     *
+     * @param input Ribbons, junction footprints, tunnel portal mouths, and carve
+     *              configuration
+     */
+    void set_road_carve_data(CarveInput&& input);
+
+    /**
+     * @brief Drop the road carve data and regenerate affected chunks
+     *
+     * Returns the terrain to its uncarved procedural surface. Same invalidation
+     * behaviour as set_road_carve_data().
+     */
+    void clear_road_carve_data();
+
+    /// True when solved road corridors have been supplied and are being carved
+    bool has_road_carve_data() const { return m_has_carve_data; }
     
     /**
      * @brief Generate terrain for a specific chunk
@@ -232,36 +287,87 @@ private:
     TerrainGenerator m_generator;
     std::unordered_map<TerrainChunkCoord, TerrainChunk> m_chunks;
     
-    // Global flattening mask (covers entire world bounds)
+    /**
+     * @brief Flatten mask for buildings and areas, covering the whole world bounds
+     *
+     * Roads are deliberately NOT painted here; they live in m_road_flatten_mask.
+     * The two are kept apart so the road contribution can be switched off the
+     * moment solved corridors arrive, without needing the Road list again. See
+     * set_road_carve_data().
+     */
     FlattenMask m_flatten_mask;
+
+    /**
+     * @brief Flatten mask for roads alone, applied only when nothing carves them
+     *
+     * The crude fixed-radius band this holds is superseded by the road carve: it
+     * knows nothing about road height, width, or grade, and flattens to
+     * TerrainTileConfig::osm_base_height rather than to the solved surface.
+     * apply_flatten_mask() therefore ignores it while has_road_carve_data() is
+     * true, and honours it again after clear_road_carve_data(), which is what
+     * makes the two paths stop fighting over the same cells.
+     */
+    FlattenMask m_road_flatten_mask;
+
     bool m_has_osm_data = false;
+
+    // Solved road corridors, carved into every chunk heightmap after generation
+    CarveInput m_carve_input;
+    bool m_has_carve_data = false;
+
+    /**
+     * @brief Regenerate every already-generated chunk, and rebuild meshes it had
+     *
+     * Called when the carve data changes, so chunks generated before the roads
+     * arrived do not stay uncarved.
+     */
+    void regenerate_existing_chunks();
+
+    /**
+     * @brief Carve the road corridors into one chunk heightmap
+     *
+     * No-op when no carve data is set. Called by generate_chunk() after the
+     * heightmap is generated and the flatten mask is applied, and before the
+     * mesh is built.
+     */
+    void apply_road_carve(Heightmap& heightmap) const;
     
     /**
-     * @brief Create flattening mask from OSM features
+     * @brief Create the flattening masks from OSM features
+     *
+     * Roads go into m_road_flatten_mask; buildings and areas go into
+     * m_flatten_mask. Splitting them here is what lets apply_flatten_mask() drop
+     * the road half when the road carve owns those cells.
      */
     void build_flatten_mask(const std::vector<osm::Road>& roads,
                             const std::vector<osm::Building>& buildings,
                             const std::vector<osm::Area>& areas);
-    
+
     /**
-     * @brief Apply flattening mask to a heightmap
+     * @brief Apply the flattening masks to a heightmap
+     *
+     * The building and area mask always applies. The road mask applies only when
+     * no road carve data is set; roads own their own terrain otherwise.
      */
     void apply_flatten_mask(Heightmap& heightmap) const;
-    
+
     /**
-     * @brief Expand a point into the flatten mask with falloff
+     * @brief Expand a point into a flatten mask with falloff
      */
-    void paint_flatten_point(float world_x, float world_z, float radius, float falloff);
-    
+    static void paint_flatten_point(FlattenMask& mask, float world_x, float world_z,
+                                    float radius, float falloff);
+
     /**
-     * @brief Expand a line segment into the flatten mask
+     * @brief Expand a line segment into a flatten mask
      */
-    void paint_flatten_line(const glm::dvec2& p0, const glm::dvec2& p1, float radius, float falloff);
-    
+    static void paint_flatten_line(FlattenMask& mask, const glm::dvec2& p0, const glm::dvec2& p1,
+                                   float radius, float falloff);
+
     /**
-     * @brief Expand a polygon into the flatten mask
+     * @brief Expand a polygon into a flatten mask
      */
-    void paint_flatten_polygon(const std::vector<glm::dvec2>& polygon, float falloff);
+    static void paint_flatten_polygon(FlattenMask& mask, const std::vector<glm::dvec2>& polygon,
+                                      float falloff);
 };
 
 } // namespace stratum::procgen

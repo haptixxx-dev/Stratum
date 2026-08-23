@@ -108,6 +108,27 @@ enum class RoofType {
     Unknown         ///< Unclassified roof style
 };
 
+/**
+ * @brief Which sides of a road carry an ancillary feature
+ *
+ * Models the common OSM left/right/both/no tag family used by sidewalk=*,
+ * cycleway=*, parking:lane=*, and shoulder=*.
+ *
+ * Left and Right are relative to the direction of travel along the road's
+ * polyline, that is, the OSM way direction. They are not compass directions.
+ *
+ * Unknown and None are deliberately distinct. Unknown means the tag was absent,
+ * so the profile builder may infer a default from the road class. None means the
+ * tag explicitly said the feature is not present, so no default may be applied.
+ */
+enum class SideFlags : uint8_t {
+    Unknown = 0,    ///< Tag absent; a class-based default may be inferred
+    None,           ///< Tag present and negative (e.g. sidewalk=no); do not infer
+    Left,           ///< Present on the left of the way direction only
+    Right,          ///< Present on the right of the way direction only
+    Both            ///< Present on both sides
+};
+
 // ============================================================================
 // Raw OSM Structures (intermediate representation)
 // ============================================================================
@@ -181,6 +202,64 @@ struct Road {
     bool is_oneway = false;                 ///< One-way street
     bool is_bridge = false;                 ///< Bridge segment
     bool is_tunnel = false;                 ///< Tunnel segment
+
+    // ------------------------------------------------------------------------
+    // Topology
+    // ------------------------------------------------------------------------
+
+    /**
+     * @brief OSM node IDs of the centerline, parallel to polyline
+     *
+     * Same size as polyline, and node_ids[i] is the node at polyline[i].
+     *
+     * This field is load-bearing for the whole road network pipeline. Junctions
+     * are found by node identity shared between ways, not by proximity of way
+     * endpoints, so a road with an empty node_ids vector cannot take part in the
+     * graph and is skipped by RoadGraph::build().
+     */
+    std::vector<NodeId> node_ids;
+
+    // ------------------------------------------------------------------------
+    // Cross-section tags
+    // ------------------------------------------------------------------------
+
+    int lanes_forward = -1;                 ///< lanes:forward=*, -1 when unspecified
+    int lanes_backward = -1;                ///< lanes:backward=*, -1 when unspecified
+
+    /**
+     * @brief OSM layer=* value
+     *
+     * Separates a bridge from whatever passes under it. Two roads may share a
+     * node in an extract and still not form a junction when their layers differ,
+     * so the graph builder splits such nodes per layer.
+     */
+    int layer = 0;
+
+    bool is_roundabout = false;             ///< junction=roundabout or junction=circular
+    bool is_link = false;                   ///< highway=*_link (motorway_link, primary_link, ...)
+
+    SideFlags sidewalk = SideFlags::Unknown;    ///< sidewalk=* / sidewalk:both|left|right=*
+    SideFlags cycleway = SideFlags::Unknown;    ///< cycleway=* / cycleway:both|left|right=*
+    SideFlags parking = SideFlags::Unknown;     ///< parking:lane:*=* / parking:both|left|right=*
+    SideFlags shoulder = SideFlags::Unknown;    ///< shoulder=* / shoulder:both|left|right=*
+
+    std::string surface;        ///< Raw surface=* value, lowercased. Empty when absent.
+    std::string smoothness;     ///< Raw smoothness=* value, lowercased. Empty when absent.
+
+    // ------------------------------------------------------------------------
+    // Design note: Road deliberately carries no TagMap copy.
+    //
+    // ParsedOSMData::ways already holds every way's complete tags keyed by WayId,
+    // and roads are numerous, so duplicating a hash map per road would cost real
+    // memory on a city-sized import for tags that are read once, if ever. The
+    // fields above are the hot ones, promoted because the profile builder touches
+    // them for every road. Anything rarer is looked up on demand:
+    //
+    //     const auto& tags = data.ways.at(road.osm_id).tags;
+    //
+    // Use find() rather than at() on the tag map itself; the way is guaranteed to
+    // exist for a processed road, an individual tag is not.
+    // ------------------------------------------------------------------------
 };
 
 /**
@@ -392,6 +471,34 @@ struct ParsedOSMData {
         case AreaType::Unknown:     return "Unknown";
     }
     return "Unknown";
+}
+
+/**
+ * @brief Convert SideFlags to human-readable string
+ */
+[[nodiscard]] inline const char* side_flags_name(SideFlags side) {
+    switch (side) {
+        case SideFlags::Unknown: return "Unknown";
+        case SideFlags::None:    return "None";
+        case SideFlags::Left:    return "Left";
+        case SideFlags::Right:   return "Right";
+        case SideFlags::Both:    return "Both";
+    }
+    return "Unknown";
+}
+
+/**
+ * @brief Check whether a feature is present on the left of the way direction
+ */
+[[nodiscard]] inline bool side_has_left(SideFlags s) {
+    return s == SideFlags::Left || s == SideFlags::Both;
+}
+
+/**
+ * @brief Check whether a feature is present on the right of the way direction
+ */
+[[nodiscard]] inline bool side_has_right(SideFlags s) {
+    return s == SideFlags::Right || s == SideFlags::Both;
 }
 
 } // namespace stratum::osm

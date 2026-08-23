@@ -42,3 +42,10 @@ renderdoc/
 
 # Parallel-agent git worktrees (see launch-features.sh)
 Worktrees/
+
+# ═══════════════════════════════════════════════════════════════════
+# Exported meshes (road_export / OBJ dumps) — can reach tens of GB
+# ═══════════════════════════════════════════════════════════════════
+TestOutput/
+road_export/
+road_dump/

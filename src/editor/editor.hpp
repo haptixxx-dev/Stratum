@@ -6,11 +6,13 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "osm/parser.hpp"
 #include "osm/mesh_builder.hpp"
-#include "osm/tile_manager.hpp"
 #include "osm/quadtree.hpp"
+#include "osm/road/road_export.hpp"
+#include "osm/road/road_network_builder.hpp"
 #include "procgen/terrain_generator.hpp"
 #include "procgen/terrain_mesh_builder.hpp"
 #include "procgen/terrain_tile_manager.hpp"
@@ -64,6 +66,7 @@ private:
     void draw_procgen_panel();
     void draw_toolbar();
     void draw_render_settings();
+    void draw_memory_panel();
     
     // Procgen helpers
     void generate_terrain();
@@ -86,6 +89,7 @@ private:
     bool m_show_osm_panel = true;
     bool m_show_procgen_panel = true;
     bool m_show_render_settings = false;
+    bool m_show_memory_panel = false;
 
     // Render toggles
     bool m_render_areas = true;
@@ -145,16 +149,26 @@ private:
     float m_view_radius = 2000.0f;
     float m_contribution_threshold = 4.0f;
 
-    // Cached meshes for rendering (legacy - now managed by TileManager)
+    // Cached meshes for rendering (legacy - the live path is m_quadtree)
     std::vector<Mesh> m_building_meshes;
     std::vector<Mesh> m_road_meshes;
     std::vector<Mesh> m_area_meshes;
 
     // ── Async OSM import ────────────────────────────────────────────────────
-    // Parsing runs on a worker thread; everything that touches the quadtree, the
-    // camera or GPU resources stays on the main thread. Progress is surfaced as a
-    // three-stage bar: parse -> spatial index -> mesh build.
-    enum class ImportStage { Idle, Parsing, Indexing, BuildingMeshes, Done, Failed };
+    // Parsing and road network building run on worker threads; everything that
+    // touches the quadtree, the camera or GPU resources stays on the main
+    // thread. Progress is surfaced as a four-stage bar:
+    // parse -> road network -> spatial index -> mesh build.
+    enum class ImportStage {
+        Idle,
+        Parsing,
+        BuildingRoads,   ///< RoadNetworkBuilder on a worker, over the whole graph
+        Indexing,
+        BuildingMeshes,
+        CarvingTerrain,  ///< Corridors indexed on a worker, then carved into the chunks
+        Done,
+        Failed
+    };
 
     struct OSMImportJob {
         // Owns its own parser so the worker never touches Editor::m_osm_parser,
@@ -174,6 +188,92 @@ private:
     };
 
     std::unique_ptr<OSMImportJob> m_import_job;
+
+    // Road geometry is solved once against the whole road graph, not per quadtree
+    // leaf -- junctions and miters are topology and topology does not stop at a
+    // leaf boundary. The solve is pure CPU work in stratum_core with no GPU or UI
+    // state, so it runs on a worker between parsing and indexing.
+    //
+    // The worker reads m_osm_parser's ParsedOSMData by pointer, so nothing may
+    // clear or reassign the parser while this future is valid. begin_osm_import()
+    // and the Clear Data button both refuse to run while the import is in flight.
+    /**
+     * @brief What one RoadNetworkBuilder run hands back to the main thread
+     *
+     * The elevation solver lives inside the builder, and the builder is local to
+     * the worker lambda, so its statistics have to be lifted out before the
+     * builder dies. They are what the OSM panel reads out.
+     */
+    struct RoadBuildResult {
+        osm::road::RoadNetwork network;
+        osm::road::RoadElevationSolver::Stats elevation;
+
+        /// Steepest solved gradient over every edge, rise over run
+        float max_grade = 0.0f;
+
+        /// A height sampler was supplied, so the network follows the terrain
+        bool elevated = false;
+
+        /**
+         * @brief The P4 junction solve ran, so RoadNetwork::junction_stats is real
+         *
+         * Stamped from the config the worker was launched with, never re-read from
+         * the toggle when the future lands: the user may flip the checkbox while a
+         * build is in flight, and the readout would then describe a solve that did
+         * not happen.
+         */
+        bool solved_junctions = false;
+
+        /**
+         * @brief The P5 and P6 detail passes the worker was launched with
+         *
+         * Stamped from the config for the same reason solved_junctions is. Each
+         * count in RoadNetwork::Stats is zero both when its pass was off and when
+         * its pass found nothing, so the readout needs the flag to tell a
+         * disabled pass from an empty one.
+         */
+        bool emitted_markings = false;
+        bool emitted_crossings = false;
+        bool emitted_structures = false;
+
+        /**
+         * @brief Fingerprint of the terrain this build was SOLVED against
+         *
+         * Stamped when the future is launched, from the same TerrainConfig the
+         * height sampler captured -- never re-read when the future lands. The
+         * user may press "Generate Chunked Terrain" while a build is in flight,
+         * and reading the manager's config at the drain would then record a
+         * surface the network was never solved against. The staleness check
+         * would match, the drift warning would go quiet, and the roads would
+         * stay wrong until some later terrain edit happened to disagree.
+         */
+        uint64_t terrain_fingerprint = 0;
+    };
+
+    std::future<RoadBuildResult> m_road_build_future;
+
+    /**
+     * @brief This road build is a rebuild, not a fresh import
+     *
+     * Set when terrain generation re-solves an already-imported network against
+     * the new surface. It suppresses the camera re-frame in begin_mesh_rebuild():
+     * the user pressed "Generate Chunked Terrain", not "Import", and having the
+     * view jump back to the middle of the OSM data reads as a bug.
+     */
+    bool m_road_rebuild_only = false;
+
+    /**
+     * @brief A road rebuild was asked for while one was already in flight
+     *
+     * begin_road_network_rebuild() refuses to launch a second build, and the
+     * request that was refused is the NEWER one -- the terrain the user just
+     * generated. Dropping it leaves the network solved against the older surface
+     * with nothing left to notice. finish_osm_import() honours this flag once
+     * the in-flight build has landed, so a refused rebuild is deferred rather
+     * than lost.
+     */
+    bool m_road_rebuild_owed = false;
+
     ImportStage m_import_stage = ImportStage::Idle;
     std::string m_import_message;
     float m_import_fraction = 0.0f;
@@ -197,11 +297,399 @@ private:
     void open_osm_file_dialog();
     void poll_file_dialog();
 
+    // ── Road network export ─────────────────────────────────────────────────
+    //
+    // Export re-solves the network rather than keeping a copy of it. The pieces
+    // an import produces are MOVED into the quadtree, which merges them per leaf
+    // and keeps only the render mesh -- the collision variant and the LOD chain
+    // are dropped there, because nothing on screen draws them. Holding a second
+    // full copy of a 63 MB extract's geometry against the chance of an export is
+    // the wrong trade; re-solving costs a second of worker time and produces
+    // exactly the data the exporter needs, including whichever of collision and
+    // LODs the user asked for.
+    //
+    // The re-solve reads m_osm_parser's data by pointer on a worker, the same
+    // way the import's road stage does, so the same rule applies: nothing may
+    // clear or reassign the parser while the future is valid.
+
+    /// A directory chosen through SDL_ShowOpenFolderDialog, parked for the UI thread
+    FilePickResult m_dir_pick;
+
+    /**
+     * @brief One export running on a worker thread
+     *
+     * Held by pointer so `valid()` on the future is not the only liveness signal:
+     * the destination and the flags the run was launched with are reported when
+     * it lands, and re-reading the UI state at that point would describe a run
+     * that did not happen.
+     */
+    struct RoadExportJob {
+        std::string directory;
+        osm::road::ExportConfig config;
+        bool build_collision = false;
+        bool build_lods = false;
+
+        /// MUST be declared last: ~future joins the worker, and the worker's
+        /// captures must outlive it. Same rule as OSMImportJob::future.
+        std::future<osm::road::ExportStats> future;
+    };
+
+    std::unique_ptr<RoadExportJob> m_export_job;
+
+    /// Format, chunk size and naming, edited by the memory panel
+    osm::road::ExportConfig m_export_config;
+
+    /// Fill RoadPiece::collision during the export re-solve
+    bool m_export_build_collision = false;
+
+    /// Fill RoadPiece::lods during the export re-solve
+    bool m_export_build_lods = false;
+
+    /// Destination directory, typed or chosen. Empty until one is picked.
+    char m_export_dir[512] = "";
+
+    /// Last export outcome, shown under the button
+    std::string m_export_status;
+
+    /// True while an export worker is running
+    [[nodiscard]] bool export_in_flight() const { return m_export_job != nullptr; }
+
+    /// Open the folder picker for the export destination
+    void open_export_dir_dialog();
+
+    /// Apply a folder the picker returned, on the main thread
+    void poll_export_dir_dialog();
+
+    /// Launch the export. Refuses while an import, a road build or another export runs.
+    void begin_road_export();
+
+    /// Drive the export across frames and report the result once
+    void poll_road_export();
+
     void begin_osm_import(const std::string& filepath, const osm::ParserConfig& config);
     void poll_osm_import();
-    void begin_mesh_rebuild();
+    /// @param road_pieces Prebuilt road geometry, handed to the quadtree once its
+    ///                    leaves exist and before any node mesh build is queued.
+    /// @param recenter_camera Frame the imported data. False for a road rebuild,
+    ///                    which must leave the user's viewpoint alone.
+    void begin_mesh_rebuild(std::vector<osm::road::RoadPiece>&& road_pieces = {},
+                            bool recenter_camera = true);
+
+    // ── Terrain-aware roads (P3) ────────────────────────────────────────────
+    // Road elevation is solved GLOBALLY, over the whole graph, BEFORE any terrain
+    // chunk is carved. That is only possible because the procedural height field
+    // is a pure function of (TerrainConfig, x, z) and needs no generated chunk to
+    // be sampled, so the solver reaches the terrain through a callback and the
+    // carve happens later, per chunk, at chunk generation time.
+
+    /**
+     * @brief Solve road heights against the terrain surface, and carve it to match
+     *
+     * When off, roads come out flat at the corridor base height -- the P2
+     * behaviour -- and any installed carve data is dropped so the terrain returns
+     * to its procedural surface.
+     */
+    bool m_terrain_aware_roads = true;
+
+    /**
+     * @brief Run the P4 junction solve
+     *
+     * Maps straight onto RoadNetworkConfig::solve_junctions. When off, every edge
+     * is extruded over its full length and ribbons overlap at every junction --
+     * the P2 output, and the reference the junction work is diffed against.
+     *
+     * Exposed because a junction defect that only shows on one extract is
+     * bisectable by flipping this and re-solving, which takes a second, rather
+     * than by rebuilding with the solver compiled out.
+     */
+    bool m_solve_junctions = true;
+
+    /**
+     * @brief Emit painted lane markings
+     *
+     * RoadNetworkConfig::emit_markings. Off restores the P4 surfaces exactly:
+     * no centre lines, edge lines, stop lines or turn arrows.
+     */
+    bool m_emit_markings = true;
+
+    /**
+     * @brief Emit pedestrian crossings
+     *
+     * RoadNetworkConfig::emit_crossings. Independent of m_emit_markings even
+     * though a zebra is Markings geometry too: a crossing is located from OSM
+     * topology and a lane line is derived from the profile, so they fail in
+     * different ways and are bisected separately.
+     */
+    bool m_emit_crossings = true;
+
+    /**
+     * @brief Emit bridge decks and tunnel portals
+     *
+     * RoadNetworkConfig::emit_structures. Both need a terrain height under the
+     * road, so both are skipped whatever this says when terrain-aware roads are
+     * off -- the panel says so rather than leaving the toggle looking broken.
+     */
+    bool m_emit_structures = true;
+
+    /**
+     * @brief Height query handed to the road elevation solver, or null
+     *
+     * Null when terrain-aware roads are off, when the legacy single-terrain mode
+     * is selected, or when no terrain chunk has been generated yet. A null
+     * sampler is how RoadNetworkConfig asks for the flat P2 network.
+     *
+     * The returned callable owns its OWN TerrainGenerator. TerrainTileManager's
+     * generator is private, and sampling one that another thread may reseed
+     * through generate_chunk() is explicitly unsafe -- see the @note on
+     * TerrainGenerator::sample_surface(). A private generator seeded from the
+     * same config gives the identical surface with no such coupling, and it stays
+     * valid for the whole life of the async build because the closure holds it by
+     * shared_ptr.
+     */
+    [[nodiscard]] osm::road::HeightSampler make_terrain_height_sampler() const;
+
+    /// True when the chunked terrain manager holds at least one generated chunk
+    [[nodiscard]] bool has_generated_terrain() const;
+
+    /**
+     * @brief Identity of a terrain surface, for detecting a stale road solve
+     *
+     * Combines only the fields TerrainGenerator::sample_surface() reads. Two
+     * configs with the same fingerprint produce the same surface, so a road
+     * network solved against one is still correct against the other.
+     *
+     * Hashed field by field rather than over the raw bytes: TerrainConfig carries
+     * padding, whose contents are indeterminate, and a byte hash would report
+     * spurious changes.
+     */
+    [[nodiscard]] static uint64_t terrain_surface_fingerprint(const procgen::TerrainConfig& cfg);
+
+    /**
+     * @brief Fingerprint of the surface roads would be solved against right now
+     *
+     * Zero means "flat": terrain-aware roads off, legacy terrain mode, or no
+     * chunk generated. Read at BUILD LAUNCH and compared against
+     * m_road_terrain_fingerprint, which records the surface the live network was
+     * actually solved against.
+     */
+    [[nodiscard]] uint64_t live_road_terrain_fingerprint() const;
+
+    /**
+     * @brief Re-solve the already-imported road network against the current terrain
+     *
+     * Runs the same staged, asynchronous path an import uses from the road stage
+     * onward, so the progress bar and the "no blocking work on the UI thread"
+     * rule both still hold. Does nothing when an import is already in flight or
+     * when there is no parsed OSM data.
+     */
+    void begin_road_network_rebuild();
+
+    /**
+     * @brief Re-solve the roads if the terrain they were solved against changed
+     *
+     * Called after terrain generation. Two cases need it:
+     *  - roads were imported before any terrain existed, so they were built flat
+     *    and produced no carve data at all;
+     *  - terrain was regenerated from a different config, so the solved heights
+     *    belong to a surface that no longer exists.
+     *
+     * A rebuild is the right answer rather than a message telling the user to
+     * re-import, because the parsed OSM data is already in memory and only the
+     * road solve is stale. Re-importing would re-parse a file that can be
+     * hundreds of megabytes to redo work that costs a second.
+     */
+    void maybe_rebuild_roads_for_terrain();
+
+    /**
+     * @brief Assemble the road pipeline config for a build about to be launched
+     *
+     * Main thread only: it reads the terrain settings and the terrain-aware
+     * toggle. The result is captured by value into the worker lambda, so a later
+     * edit of the terrain panel cannot change the surface a build in flight is
+     * being solved against.
+     */
+    [[nodiscard]] osm::road::RoadNetworkConfig make_road_network_config() const;
+
+    /**
+     * @brief Run one road network build and lift the solver statistics out
+     *
+     * Static and free of Editor state: this is the body of the worker lambda, and
+     * it must not touch anything the UI thread reads.
+     */
+    [[nodiscard]] static RoadBuildResult run_road_network_build(
+        const osm::ParsedOSMData& data, const osm::road::RoadNetworkConfig& cfg);
+
+    /// Enter the carve stage: index the corridors, or skip straight to Done
+    void begin_road_carve();
+
+    /// Drive the carve stage across frames
+    void poll_road_carve();
+
+    /// Leave the import state machine in the Done state
+    void finish_osm_import();
+
+    /**
+     * @brief Hand the solved corridors to the terrain, or drop stale ones
+     *
+     * Main thread: TerrainTileManager::set_road_carve_data() regenerates every
+     * existing chunk, and those chunks are walked by render_3d() every frame.
+     * The spatial index over the corridors is built on a worker first, because
+     * that part is pure CPU work over every ribbon in the import.
+     */
+    void install_road_carve_data();
+
+    /**
+     * @brief Solved corridors between the road build and the terrain install
+     *
+     * Filled when the road network lands, moved to a worker to be indexed, and
+     * moved into the terrain tile manager once the meshes are done. Null outside
+     * that window.
+     */
+    std::unique_ptr<procgen::CarveInput> m_pending_carve;
+
+    /// Corridors waiting to be indexed on a worker, then installed
+    std::future<std::unique_ptr<procgen::CarveInput>> m_carve_index_future;
+
+    /// Embankment tunables applied to every corridor
+    procgen::CarveConfig m_carve_config;
+
+    /**
+     * @brief The indexed carve input is ready and is applied on the NEXT frame
+     *
+     * Deliberately deferred by one frame. Installing it regenerates every terrain
+     * chunk in one blocking call, and running that in the same frame that sets
+     * the stage message means the message never reaches the screen and the hitch
+     * looks like a freeze.
+     */
+    bool m_carve_apply_pending = false;
+
+    /// Statistics of the last road build, for the OSM panel readout
+    osm::road::RoadNetwork::Stats m_road_stats{};
+    osm::road::RoadElevationSolver::Stats m_road_elevation_stats{};
+    osm::road::JunctionBuilder::Stats m_road_junction_stats{};
+    float m_road_max_grade = 0.0f;
+    bool m_road_built_on_terrain = false;
+
+    /// The last build ran the junction solve, so m_road_junction_stats means something
+    bool m_road_solved_junctions = false;
+
+    /// The last build ran each detail pass, so its count means "found none" rather than "off"
+    bool m_road_emitted_markings = false;
+    bool m_road_emitted_crossings = false;
+    bool m_road_emitted_structures = false;
+
+    /// Portal mouths the last build handed to the terrain carve
+    size_t m_road_portal_mouths = 0;
+
+    bool m_have_road_stats = false;
+
+    /// Surface the current road network was solved against; 0 when it is flat
+    uint64_t m_road_terrain_fingerprint = 0;
     void upload_node_to_gpu(osm::QuadTreeNode& node, GPURenderer& renderer);
     void release_node_from_gpu(osm::QuadTreeNode& node, GPURenderer& renderer);
+
+    // ── Resident GPU geometry: who owns which mesh id ───────────────────────
+    //
+    // The renderer holds a byte budget and evicts the furthest geometry when it
+    // is breached, but a GPUMesh is a vertex count and two ranges: it has no
+    // transform and no bounds, so the renderer cannot say which mesh is furthest
+    // and cannot tell anyone that a handle has stopped resolving. Both answers
+    // live here, and this map is what supplies them.
+    //
+    // The consequence of getting it wrong is not a missing tile. A quadtree leaf
+    // holding an evicted id and still drawing it is a use-after-free.
+
+    /**
+     * @brief Who owns one uploaded mesh id, and where in the world its geometry is
+     */
+    struct MeshOwner {
+        /// What the owner is, which decides how the handle is cleared on eviction
+        enum class Kind : uint8_t {
+            /**
+             * @brief Never evicted, whatever the pressure
+             *
+             * The legacy single terrain and its water plane. There is exactly one
+             * of each, the user generated them deliberately, and neither streams
+             * back in on its own -- an eviction would simply make them vanish
+             * until the user pressed Generate again.
+             */
+            Pinned,
+
+            /// A leaf of m_quadtree; `node` names it and stays valid while the tree does
+            QuadTreeLeaf,
+
+            /// A chunk of m_terrain_tile_manager; `coord` names it
+            TerrainChunk
+        };
+
+        Kind kind = Kind::Pinned;
+
+        /**
+         * @brief Owning leaf, for Kind::QuadTreeLeaf
+         *
+         * A raw pointer into the quadtree, which is why every path that destroys
+         * the tree -- begin_mesh_rebuild() and the Clear Data button -- must
+         * release every leaf's meshes FIRST. release_node_from_gpu() unregisters
+         * as it goes, so after that pass no entry can name a dead node.
+         */
+        osm::QuadTreeNode* node = nullptr;
+
+        /// Owning chunk, for Kind::TerrainChunk. An index, so it cannot dangle.
+        procgen::TerrainChunkCoord coord{};
+
+        /// World-space point the eviction distance is measured to
+        glm::vec3 anchor{0.0f};
+    };
+
+    std::unordered_map<uint32_t, MeshOwner> m_mesh_owners;
+
+    /**
+     * @brief Upload a mesh and record who owns the handle
+     *
+     * The only upload path in the editor. An untracked id would be evicted first
+     * -- an owner the renderer cannot ask about is reported as infinitely far
+     * away -- and nothing would be told to drop it.
+     *
+     * @return The mesh id, or 0 when the upload failed. A failed upload registers
+     *         nothing.
+     */
+    uint32_t upload_tracked_mesh(GPURenderer& renderer, const Mesh& mesh, const MeshOwner& owner);
+
+    /**
+     * @brief Release a tracked mesh and zero the caller's handle
+     *
+     * @param mesh_id Handle, set to 0 on return. 0 in is a no-op.
+     */
+    void release_tracked_mesh(GPURenderer& renderer, uint32_t& mesh_id);
+
+    /**
+     * @brief Distance from the camera to a mesh, for the renderer's eviction sort
+     *
+     * Installed as GPURenderer::MeshDistanceFn. Negative means pinned. An id with
+     * no owner comes back at the largest finite float, which makes it the first
+     * thing evicted -- correct, because nothing is holding it any more.
+     */
+    [[nodiscard]] float mesh_distance_to_camera(uint32_t mesh_id) const;
+
+    /**
+     * @brief Drop a handle the renderer has just evicted
+     *
+     * Installed as GPURenderer::MeshEvictedFn, and called from inside
+     * evict_to_budget(), so it must not call back into the renderer.
+     *
+     * A quadtree leaf that loses one of its meshes has `gpu_uploaded` cleared and
+     * streams back in whole the next time it is visible; upload_node_to_gpu()
+     * releases whichever of its handles survived before re-uploading, so the
+     * partial state never leaks. A terrain chunk is handled the same way.
+     */
+    void on_mesh_evicted(uint32_t mesh_id);
+
+    /// Centre of a leaf's 3D bounds, falling back to its 2D centre when the leaf
+    /// holds no geometry to have grown bounds from.
+    [[nodiscard]] static glm::vec3 node_anchor(const osm::QuadTreeNode& node);
+
+    /// Rate limit for the "a node failed to upload" warning, in SDL ticks
+    uint64_t m_next_upload_warn_ms = 0;
 
     // Procedural Generation (single terrain - legacy)
     procgen::TerrainGenerator m_terrain_generator;

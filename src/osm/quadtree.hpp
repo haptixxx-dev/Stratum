@@ -1,5 +1,6 @@
 #pragma once
 
+#include "osm/road/road_network_builder.hpp"
 #include "osm/types.hpp"
 #include "renderer/mesh.hpp"
 #include <glm/glm.hpp>
@@ -38,6 +39,11 @@ struct QuadTreeNode {
     std::vector<Area> areas;
 
     // Merged meshes (one per category)
+    //
+    // road_meshes is NOT built from this node's `roads`. It is filled once by
+    // QuadTree::assign_road_pieces() from geometry the road network builder
+    // solved against the whole graph, and the per-leaf mesh build never touches
+    // it. See assign_road_pieces().
     std::vector<Mesh> road_meshes;
     std::vector<Mesh> building_meshes;
     std::vector<Mesh> area_meshes;
@@ -88,6 +94,39 @@ public:
     void clear();
     void assign_data(const ParsedOSMData& data);
 
+    /**
+     * @brief Take ownership of prebuilt road geometry and route it to leaves
+     *
+     * Road geometry is solved once against the whole road graph, not per leaf,
+     * because junctions, miters and profile transitions are topology and
+     * topology does not stop at a leaf boundary. This is the hand-off point:
+     * the spatial index receives finished triangles and never sees a Road
+     * again.
+     *
+     * Each piece is routed by its RoadPiece::anchor -- a point that lies on the
+     * road -- down to the leaf containing that point, and appended into that
+     * leaf's road_meshes with its MaterialId ranges preserved. A piece is
+     * indivisible: whole triangles only, never split across leaves. A road
+     * therefore may hang over the boundary of the leaf that owns it. That is
+     * correct and expected, and the leaf's AABB is grown to cover the overhang
+     * so frustum culling does not clip it.
+     *
+     * A P4 JUNCTION piece is routed by the same rule and by nothing else. It
+     * carries `RoadPiece::edge == road::kInvalidId`, because a junction spans
+     * several edges and belongs to none of them, and is anchored at the graph
+     * node -- so this function never reads `edge` at all. A junction straddling a
+     * leaf boundary is the overhang case again, not a new one: it lands whole in
+     * the leaf containing its node, and the AABB growth that covers a road
+     * hanging over the boundary covers a fillet hanging over it too.
+     *
+     * Call AFTER init() and assign_data(), so the leaves the pieces route to
+     * already exist, and BEFORE any node mesh build is queued. Pieces are moved
+     * from, so @p pieces is left empty.
+     *
+     * @param pieces Output of road::RoadNetworkBuilder::build(); consumed.
+     */
+    void assign_road_pieces(std::vector<road::RoadPiece>&& pieces);
+
     // Hierarchical traversal: frustum + distance + contribution culling
     // Collects visible leaves sorted front-to-back, then visits them
     void traverse_visible(
@@ -134,7 +173,9 @@ private:
     void insert_building(QuadTreeNode* node, const Building& building);
     void insert_area(QuadTreeNode* node, const Area& area);
     int child_index(const QuadTreeNode* node, const glm::dvec2& point) const;
+    QuadTreeNode* find_leaf(const glm::dvec2& point);
     void compute_3d_bounds(QuadTreeNode* node);
+    void recompute_bounds(QuadTreeNode* node);
 
     void traverse_recursive(
         QuadTreeNode* node,
@@ -159,8 +200,9 @@ private:
     void find_max_depth(const QuadTreeNode* node, uint8_t& depth) const;
 
     // Mesh building (thread-safe internals)
+    // Roads are absent by design: they are assigned whole by
+    // assign_road_pieces() and must survive every later per-leaf build.
     struct BuiltMeshes {
-        std::vector<Mesh> road_meshes;
         std::vector<Mesh> building_meshes;
         std::vector<Mesh> area_meshes;
     };

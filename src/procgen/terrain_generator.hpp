@@ -137,7 +137,72 @@ public:
      * @brief Get current seed
      */
     uint32_t get_seed() const { return m_noise.get_seed(); }
-    
+
+    /**
+     * @brief Sample the procedural surface at a world position
+     *
+     * Pure: the same config and position always give the same height,
+     * independent of any generated chunk. This is what makes it possible to
+     * solve road elevation GLOBALLY, before a single terrain chunk exists --
+     * terrain is chunked and generated on demand, but the height field itself is
+     * just a function of (TerrainConfig, x, z). The road elevation solver queries
+     * this through its HeightSampler callback; see osm/road/road_elevation.hpp.
+     *
+     * Equivalent to the sample_height() plus apply_flattening() pair that
+     * generate_chunk() runs per cell, and it must stay equivalent: a road solved
+     * against a different surface from the one the terrain mesh is built from
+     * would float or sink.
+     *
+     * @warning Erosion is NOT reflected here. apply_erosion() is a whole-heightmap
+     *          thermal relaxation: each iteration moves material between adjacent
+     *          cells of an existing Heightmap, so its result at a position depends
+     *          on that position's neighbourhood over every prior iteration. It has
+     *          no per-position closed form and cannot be evaluated without a
+     *          generated heightmap, which is exactly what sample_surface() exists
+     *          to avoid needing.
+     *
+     *          The consequence, with TerrainConfig::apply_erosion enabled: road
+     *          elevations are solved against the PRE-erosion surface, so the road
+     *          and the eroded terrain can disagree by the erosion delta.
+     *
+     *          The mitigation is ordering. The carve pass runs AFTER erosion and
+     *          forces the corridor cells to the solved road height regardless of
+     *          what erosion left there, so the visible result stays consistent;
+     *          the embankment falloff band then blends into the eroded terrain.
+     *          Only the grade solve sees the pre-erosion shape, which means
+     *          erosion can shift where a road wanted to sit but cannot make it
+     *          float above or sink below the terrain it is carved into.
+     *
+     *          Note also that generate() applies erosion and generate_chunk() does
+     *          not, so on the chunked path -- the one the editor uses -- erosion is
+     *          never applied at all and this caveat is vacuous.
+     *
+     * @warning @p config.seed must match the seed this generator currently holds
+     *          (get_seed()), which is what generate()/generate_chunk() leave behind
+     *          for the config they were called with. When it does not match, the
+     *          fallback builds the correct permutation table in thread-local
+     *          storage instead of reseeding m_noise, so the returned height is
+     *          still correct and the call is still re-entrant -- it just costs a
+     *          table rebuild the first time each thread sees a new seed.
+     *
+     * @note Thread-safe and re-entrant. It reads m_noise and @p config and mutates
+     *       no shared state, so it may be used as a HeightSampler by the parallel
+     *       elevation solve. Noise::simplex2d() and the fbm/ridged wrappers are
+     *       const and touch only the permutation tables, which are built eagerly
+     *       in the Noise constructor and in reseed() -- there is no lazy
+     *       initialisation or cache to race on. Concurrent sample_surface() calls
+     *       are therefore safe; a concurrent generate()/generate_chunk()/reseed()
+     *       on the SAME TerrainGenerator is NOT, because those reseed m_noise. Do
+     *       not generate terrain while the elevation solve is running.
+     *
+     * @param config  Terrain parameters; must be the same config the chunks are
+     *                generated from
+     * @param world_x World X in metres
+     * @param world_z World Z in metres
+     * @return World Y of the procedural surface in metres
+     */
+    float sample_surface(const TerrainConfig& config, float world_x, float world_z) const;
+
 private:
     Noise m_noise;
     

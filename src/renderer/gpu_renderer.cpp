@@ -7,10 +7,38 @@
 #include "renderer/mesh.hpp"
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <unordered_set>
 
 namespace stratum {
+
+namespace {
+
+/**
+ * @brief Alignment demanded of a pooled VERTEX range
+ *
+ * The vertex stride. A binding offset that is a whole number of vertices is what
+ * every backend is happy with, and it costs at most 63 bytes of padding on a
+ * range that is tens of kilobytes.
+ */
+constexpr uint32_t kVertexAlignment = static_cast<uint32_t>(sizeof(Vertex));
+
+/**
+ * @brief Alignment demanded of a pooled INDEX range
+ *
+ * One 32-bit index. This is the load-bearing one: draw_mesh() reaches a mesh's
+ * range through `first_index`, which counts INDICES rather than bytes, so the
+ * range's byte offset has to divide by 4 exactly or the base is not expressible
+ * and the draw reads from the wrong place -- silently, with no validation error.
+ */
+constexpr uint32_t kIndexAlignment = static_cast<uint32_t>(sizeof(uint32_t));
+
+static_assert(kIndexAlignment == 4u, "draw_mesh() converts an index range's byte offset "
+                                     "to a first_index by dividing by sizeof(uint32_t)");
+
+} // namespace
 
 GPURenderer::~GPURenderer() {
     shutdown();
@@ -38,6 +66,18 @@ bool GPURenderer::init(SDL_Window* window) {
 
     const char* driver = SDL_GetGPUDeviceDriver(m_device);
     spdlog::info("GPU device created with driver: {}", driver ? driver : "unknown");
+
+    // A mesh is a RANGE from here on, not a pair of device allocations. A city
+    // extract is thousands of meshes and a driver commonly caps
+    // VkPhysicalDeviceLimits::maxMemoryAllocationCount at 4096, which the old
+    // two-buffers-per-mesh scheme reached with VRAM to spare. See
+    // gpu_buffer_pool.hpp.
+    if (!m_vertex_pool.init(m_device, SDL_GPU_BUFFERUSAGE_VERTEX, kVertexBlockBytes) ||
+        !m_index_pool.init(m_device, SDL_GPU_BUFFERUSAGE_INDEX, kIndexBlockBytes)) {
+        spdlog::error("Failed to initialize the GPU buffer pools");
+        shutdown();
+        return false;
+    }
 
     // Claim window for GPU rendering
     if (!SDL_ClaimWindowForGPUDevice(m_device, m_window)) {
@@ -98,6 +138,13 @@ void GPURenderer::shutdown() {
 
     // Release all meshes
     release_all_meshes();
+
+    // The device is idle, so every retired range is provably unreferenced. Free
+    // them now rather than waiting out kBufferRetireFrames that will never
+    // elapse, or the pools would report every one of them as a leak.
+    drain_retired_allocs(true);
+    m_vertex_pool.shutdown();
+    m_index_pool.shutdown();
 
     // Release transfer buffer
     if (m_transfer_buffer) {
@@ -550,155 +597,496 @@ uint32_t GPURenderer::upload_mesh(const Mesh& mesh) {
         }
     }
 
-    GPUMesh gpu_mesh{};;
+    const size_t vertex_size = mesh.vertices.size() * sizeof(Vertex);
+    const size_t index_size = mesh.indices.size() * sizeof(uint32_t);
+    const size_t total_size = vertex_size + index_size;
+
+    // Make room BEFORE allocating, not after. Allocating first and evicting
+    // afterwards would let the pool grow a block to hold this mesh -- which is
+    // the device allocation the budget exists to avoid -- and only then hand the
+    // freed space back.
+    if (m_memory_budget.evict_under_pressure) {
+        evict_to_fit(total_size, 1);
+    }
+    if (m_resident_bytes + total_size > m_memory_budget.max_resident_bytes ||
+        m_meshes.size() + 1 > m_memory_budget.max_resident_meshes) {
+        // Either eviction is switched off, or everything still resident is pinned
+        // or mid-upload. Refuse rather than quietly breaching the cap: geometry
+        // missing with upload_failures() climbing is diagnosable, geometry that
+        // pushed the process into a driver OOM is not.
+        ++m_upload_failures;
+        return 0;
+    }
+
+    GPUMesh gpu_mesh{};
     gpu_mesh.vertex_count = static_cast<uint32_t>(mesh.vertices.size());
     gpu_mesh.index_count = static_cast<uint32_t>(mesh.indices.size());
+    // effective_submeshes() resolves the implicit whole-mesh case, so an
+    // untagged mesh records exactly one MaterialId::Default range covering
+    // [0, index_count) and draws as a single call just as it did before.
+    gpu_mesh.submeshes = mesh.effective_submeshes();
 
-    size_t vertex_size = mesh.vertices.size() * sizeof(Vertex);
-    size_t index_size = mesh.indices.size() * sizeof(uint32_t);
-    size_t total_size = vertex_size + index_size;
+    // Reserve the ranges now so the handle returned here is immediately valid,
+    // but DEFER the copy into the next batched flush. See flush_pending_uploads()
+    // for why the copy is not submitted per mesh.
+    gpu_mesh.vertex_alloc = m_vertex_pool.allocate(static_cast<uint32_t>(vertex_size),
+                                                   kVertexAlignment);
+    if (!gpu_mesh.vertex_alloc.valid()) {
+        const GPUBufferPool::Stats vs = m_vertex_pool.stats();
+        spdlog::error("Vertex pool refused {} KB ({} blocks, {} KB reserved, {} KB used, "
+                      "fragmentation {:.2f}, {} meshes resident)",
+                      vertex_size / 1024, vs.blocks, vs.bytes_reserved / 1024,
+                      vs.bytes_used / 1024, vs.fragmentation, m_meshes.size());
+        ++m_upload_failures;
+        return 0;
+    }
 
-    // Create or resize transfer buffer if needed
-    if (!m_transfer_buffer || m_transfer_buffer_size < total_size) {
+    // Enforced HERE rather than trusted at the draw. The pool floors an index
+    // pool's alignment to 4 on its own, so this cannot trip -- but a draw reading
+    // from a misaligned base produces plausible-looking garbage triangles rather
+    // than an error, and that is not a bug anyone finds twice.
+    if ((gpu_mesh.vertex_alloc.offset % kVertexAlignment) != 0u) {
+        spdlog::error("Vertex range at byte offset {} is not a multiple of the {} byte vertex "
+                      "stride; refusing the upload", gpu_mesh.vertex_alloc.offset, kVertexAlignment);
+        m_vertex_pool.free(gpu_mesh.vertex_alloc);
+        ++m_upload_failures;
+        return 0;
+    }
+
+    if (index_size > 0) {
+        gpu_mesh.index_alloc = m_index_pool.allocate(static_cast<uint32_t>(index_size),
+                                                     kIndexAlignment);
+        if (!gpu_mesh.index_alloc.valid()) {
+            const GPUBufferPool::Stats is = m_index_pool.stats();
+            spdlog::error("Index pool refused {} KB ({} blocks, {} KB reserved, {} KB used, "
+                          "fragmentation {:.2f}, {} meshes resident)",
+                          index_size / 1024, is.blocks, is.bytes_reserved / 1024,
+                          is.bytes_used / 1024, is.fragmentation, m_meshes.size());
+            m_vertex_pool.free(gpu_mesh.vertex_alloc);
+            ++m_upload_failures;
+            return 0;
+        }
+        if ((gpu_mesh.index_alloc.offset % kIndexAlignment) != 0u) {
+            // draw_mesh() turns this offset into a first_index by dividing by 4.
+            // An offset that is not a whole number of indices makes that division
+            // lossy and the mesh would draw from somebody else's triangles.
+            spdlog::error("Index range at byte offset {} is not a whole number of 32-bit "
+                          "indices; refusing the upload", gpu_mesh.index_alloc.offset);
+            m_index_pool.free(gpu_mesh.index_alloc);
+            m_vertex_pool.free(gpu_mesh.vertex_alloc);
+            ++m_upload_failures;
+            return 0;
+        }
+    }
+
+    // Stage the bytes CPU-side; the flush moves the whole batch through the
+    // transfer buffer in one copy pass.
+    const size_t staging_offset = m_staging.size();
+    m_staging.resize(staging_offset + total_size);
+    memcpy(m_staging.data() + staging_offset, mesh.vertices.data(), vertex_size);
+    if (index_size > 0) {
+        memcpy(m_staging.data() + staging_offset + vertex_size,
+               mesh.indices.data(), index_size);
+    }
+
+    const uint32_t mesh_id = m_next_mesh_id++;
+    gpu_mesh.ready = false;
+    m_meshes[mesh_id] = std::move(gpu_mesh);
+    m_resident_bytes += total_size;
+
+    m_pending_uploads.push_back(PendingUpload{
+        mesh_id, staging_offset,
+        static_cast<uint32_t>(vertex_size),
+        static_cast<uint32_t>(index_size)
+    });
+
+    return mesh_id;
+}
+
+UploadBatch plan_upload_batch(const std::vector<PendingUpload>& queue, size_t budget) {
+    UploadBatch batch;
+    batch.offsets.reserve(queue.size());
+
+    for (const PendingUpload& p : queue) {
+        const size_t size = p.total_bytes();
+        if (!batch.offsets.empty() && batch.bytes + size > budget) break;
+        batch.offsets.push_back(batch.bytes);
+        batch.bytes += size;
+    }
+    return batch;
+}
+
+size_t staging_compaction_offset(const std::vector<PendingUpload>& queue, size_t arena_bytes) {
+    if (queue.empty()) {
+        return arena_bytes;   // nothing live: the whole arena is dead
+    }
+    const size_t dead = std::min(queue.front().staging_offset, arena_bytes);
+    return dead * 2u >= arena_bytes ? dead : 0u;
+}
+
+void GPURenderer::flush_pending_uploads() {
+    if (!m_device || m_pending_uploads.empty()) return;
+
+    // Admit as many staged meshes as this frame's budget allows; the rest stay
+    // queued for later frames, which is what turns a stampeding import into a
+    // stream. The batch also decides where each entry lands in the transfer
+    // buffer, because the staging arena it came from is not packed -- see
+    // plan_upload_batch().
+    const UploadBatch batch = plan_upload_batch(m_pending_uploads, kMaxUploadBytesPerFrame);
+    const size_t batch_count = batch.offsets.size();
+    if (batch_count == 0) return;
+
+    if (!m_transfer_buffer || m_transfer_buffer_size < batch.bytes) {
         if (m_transfer_buffer) {
             SDL_ReleaseGPUTransferBuffer(m_device, m_transfer_buffer);
         }
-
         SDL_GPUTransferBufferCreateInfo transfer_info{};
         transfer_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-        transfer_info.size = static_cast<uint32_t>(total_size);
-
+        transfer_info.size = static_cast<uint32_t>(batch.bytes);
         m_transfer_buffer = SDL_CreateGPUTransferBuffer(m_device, &transfer_info);
-        m_transfer_buffer_size = total_size;
-
+        m_transfer_buffer_size = m_transfer_buffer ? batch.bytes : 0;
         if (!m_transfer_buffer) {
-            spdlog::error("Failed to create transfer buffer: {}", SDL_GetError());
-            return 0;
+            spdlog::error("Failed to create transfer buffer ({} KB): {}",
+                          batch.bytes / 1024, SDL_GetError());
+            ++m_upload_failures;
+            return;
         }
     }
 
-    // cycle = true: if a previous upload is still reading this transfer buffer,
-    // SDL rotates to another internal allocation instead of us having to wait for
-    // the GPU to drain. This is what makes the SDL_WaitForGPUIdle below
-    // unnecessary -- see the note at the submit.
+    // cycle = true: SDL rotates to a fresh internal allocation if the GPU is
+    // still reading the previous contents, so this never stalls.
     void* mapped = SDL_MapGPUTransferBuffer(m_device, m_transfer_buffer, true);
     if (!mapped) {
         spdlog::error("Failed to map transfer buffer: {}", SDL_GetError());
-        return 0;
+        ++m_upload_failures;
+        return;
     }
-
-    memcpy(mapped, mesh.vertices.data(), vertex_size);
-    if (index_size > 0) {
-        memcpy(static_cast<uint8_t*>(mapped) + vertex_size, mesh.indices.data(), index_size);
+    // One entry at a time, into the destination the plan assigned it. NOT one
+    // memcpy of a window of the arena: the arena has holes in it wherever a mesh
+    // was released between being staged and being flushed.
+    for (size_t i = 0; i < batch_count; ++i) {
+        const PendingUpload& p = m_pending_uploads[i];
+        const size_t size = p.total_bytes();
+        if (p.staging_offset + size > m_staging.size()) {
+            continue;   // cannot happen; a truncated arena must not be read past
+        }
+        memcpy(static_cast<uint8_t*>(mapped) + batch.offsets[i],
+               m_staging.data() + p.staging_offset, size);
     }
-
     SDL_UnmapGPUTransferBuffer(m_device, m_transfer_buffer);
 
-    // Create GPU buffers
-    SDL_GPUBufferCreateInfo vertex_buffer_info{};
-    vertex_buffer_info.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
-    vertex_buffer_info.size = static_cast<uint32_t>(vertex_size);
-
-    gpu_mesh.vertex_buffer = SDL_CreateGPUBuffer(m_device, &vertex_buffer_info);
-    if (!gpu_mesh.vertex_buffer) {
-        spdlog::error("Failed to create vertex buffer: {}", SDL_GetError());
-        return 0;
-    }
-
-    if (index_size > 0) {
-        SDL_GPUBufferCreateInfo index_buffer_info{};
-        index_buffer_info.usage = SDL_GPU_BUFFERUSAGE_INDEX;
-        index_buffer_info.size = static_cast<uint32_t>(index_size);
-
-        gpu_mesh.index_buffer = SDL_CreateGPUBuffer(m_device, &index_buffer_info);
-        if (!gpu_mesh.index_buffer) {
-            spdlog::error("Failed to create index buffer: {}", SDL_GetError());
-            SDL_ReleaseGPUBuffer(m_device, gpu_mesh.vertex_buffer);
-            return 0;
-        }
-    }
-
-    // Upload via copy pass
     SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(m_device);
     if (!cmd) {
-        spdlog::error("Failed to acquire command buffer for upload: {}", SDL_GetError());
-        return 0;
+        spdlog::error("Failed to acquire upload command buffer: {}", SDL_GetError());
+        ++m_upload_failures;
+        return;
     }
 
     SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(cmd);
+    for (size_t i = 0; i < batch_count; ++i) {
+        const PendingUpload& p = m_pending_uploads[i];
+        auto it = m_meshes.find(p.mesh_id);
+        if (it == m_meshes.end()) continue;   // released before it ever flushed
+        GPUMesh& gm = it->second;
 
-    // Upload vertices
-    SDL_GPUTransferBufferLocation src_vertex{};
-    src_vertex.transfer_buffer = m_transfer_buffer;
-    src_vertex.offset = 0;
+        const uint32_t rel = static_cast<uint32_t>(batch.offsets[i]);
 
-    SDL_GPUBufferRegion dst_vertex{};
-    dst_vertex.buffer = gpu_mesh.vertex_buffer;
-    dst_vertex.offset = 0;
-    dst_vertex.size = static_cast<uint32_t>(vertex_size);
+        // The batching is unchanged by pooling; only the DESTINATION moved. A
+        // SDL_GPUBufferRegion already carries an offset, so a copy into a
+        // suballocated range is the same call it was into a whole buffer, aimed
+        // at {block, range offset} instead of {buffer, 0}. cycle stays false:
+        // cycling a shared block would hand back a fresh allocation and discard
+        // every OTHER mesh living in it.
+        SDL_GPUTransferBufferLocation src_vertex{};
+        src_vertex.transfer_buffer = m_transfer_buffer;
+        src_vertex.offset = rel;
+        SDL_GPUBufferRegion dst_vertex{};
+        dst_vertex.buffer = gm.vertex_alloc.buffer;
+        dst_vertex.offset = gm.vertex_alloc.offset;
+        dst_vertex.size = p.vertex_bytes;
+        SDL_UploadToGPUBuffer(copy_pass, &src_vertex, &dst_vertex, false);
 
-    SDL_UploadToGPUBuffer(copy_pass, &src_vertex, &dst_vertex, false);
+        if (p.index_bytes > 0 && gm.index_alloc.valid()) {
+            SDL_GPUTransferBufferLocation src_index{};
+            src_index.transfer_buffer = m_transfer_buffer;
+            src_index.offset = rel + p.vertex_bytes;
+            SDL_GPUBufferRegion dst_index{};
+            dst_index.buffer = gm.index_alloc.buffer;
+            dst_index.offset = gm.index_alloc.offset;
+            dst_index.size = p.index_bytes;
+            SDL_UploadToGPUBuffer(copy_pass, &src_index, &dst_index, false);
+        }
+        gm.ready = true;
+    }
+    SDL_EndGPUCopyPass(copy_pass);
 
-    // Upload indices
-    if (index_size > 0) {
-        SDL_GPUTransferBufferLocation src_index{};
-        src_index.transfer_buffer = m_transfer_buffer;
-        src_index.offset = static_cast<uint32_t>(vertex_size);
-
-        SDL_GPUBufferRegion dst_index{};
-        dst_index.buffer = gpu_mesh.index_buffer;
-        dst_index.offset = 0;
-        dst_index.size = static_cast<uint32_t>(index_size);
-
-        SDL_UploadToGPUBuffer(copy_pass, &src_index, &dst_index, false);
+    // ONE submit for the whole batch.
+    //
+    // This replaced a submit PER MESH issued from inside the visible-node
+    // traversal -- i.e. thousands of command buffers inside a single frame,
+    // while that frame's own render pass was still open. Every submit allocates
+    // a fence, and with no GPU progress between them none could be retired, so a
+    // city-scale import piled up hundreds of live command buffers and exhausted
+    // the driver's HOST allocator:
+    //     vkCreateFence VK_ERROR_OUT_OF_HOST_MEMORY
+    // after which buffer binds failed too, the swapchain semaphores were left
+    // signalled, and the app died on VUID-vkAcquireNextImageKHR-semaphore-01286.
+    // It was never a VRAM shortage.
+    if (!SDL_SubmitGPUCommandBuffer(cmd)) {
+        spdlog::error("Batched upload submit failed ({} meshes, {} KB): {}",
+                      batch_count, batch.bytes / 1024, SDL_GetError());
+        for (size_t i = 0; i < batch_count; ++i) {
+            auto it = m_meshes.find(m_pending_uploads[i].mesh_id);
+            if (it != m_meshes.end()) it->second.ready = false;
+        }
+        ++m_upload_failures;
+        return;
     }
 
-    SDL_EndGPUCopyPass(copy_pass);
-    SDL_SubmitGPUCommandBuffer(cmd);
+    m_pending_uploads.erase(m_pending_uploads.begin(),
+                            m_pending_uploads.begin() + static_cast<long>(batch_count));
 
-    // Deliberately NOT SDL_WaitForGPUIdle here. This is called from inside
-    // render_3d's traversal for every node that has just become visible, so a
-    // full pipeline flush per mesh meant thousands of stalls on import and a
-    // fresh stall for every node streamed in while the camera moves. Mapping
-    // with cycle = true above already guarantees we never write to memory the
-    // GPU is still reading.
+    if (m_pending_uploads.empty()) {
+        m_staging.clear();
+        m_staging.shrink_to_fit();
+        return;
+    }
 
-    // Store and return ID
-    uint32_t mesh_id = m_next_mesh_id++;
-    m_meshes[mesh_id] = gpu_mesh;
-
-    return mesh_id;
+    // Reclaim the dead prefix, but only once there is enough of it to be worth a
+    // memmove of everything still queued. shrink_to_fit() is deliberately NOT
+    // called: it reallocates and copies the remainder a second time, and doubles
+    // peak host memory for the duration of the copy, on a path that runs every
+    // frame of an import.
+    const size_t keep_from = staging_compaction_offset(m_pending_uploads, m_staging.size());
+    if (keep_from > 0) {
+        m_staging.erase(m_staging.begin(), m_staging.begin() + static_cast<long>(keep_from));
+        for (auto& p : m_pending_uploads) {
+            p.staging_offset -= std::min(p.staging_offset, keep_from);
+        }
+    }
 }
 
 void GPURenderer::release_mesh(uint32_t mesh_id) {
     auto it = m_meshes.find(mesh_id);
     if (it == m_meshes.end()) return;
 
+    // A mesh can be released before its staged copy ever flushed (streamed in
+    // and back out within a frame). Drop the pending entry so the flush does not
+    // later write into a range that now belongs to something else.
+    //
+    // Its bytes stay in the staging arena as a hole until the next compaction,
+    // which is why the flush packs the transfer buffer itself instead of
+    // treating the queue's staging offsets as contiguous.
+    std::erase_if(m_pending_uploads,
+                  [mesh_id](const PendingUpload& p) { return p.mesh_id == mesh_id; });
+
     GPUMesh& mesh = it->second;
-    if (mesh.vertex_buffer) {
-        SDL_ReleaseGPUBuffer(m_device, mesh.vertex_buffer);
-    }
-    if (mesh.index_buffer) {
-        SDL_ReleaseGPUBuffer(m_device, mesh.index_buffer);
-    }
+    // The REQUESTED sizes, which is exactly what upload_mesh() added, so the
+    // accounting closes even though the pool reserved a little more for
+    // alignment.
+    const size_t bytes = static_cast<size_t>(mesh.vertex_alloc.size)
+                       + static_cast<size_t>(mesh.index_alloc.size);
+    m_resident_bytes -= std::min(m_resident_bytes, bytes);
+
+    retire_alloc(mesh.vertex_alloc, false);
+    retire_alloc(mesh.index_alloc, true);
 
     m_meshes.erase(it);
 }
 
 void GPURenderer::release_all_meshes() {
+    m_pending_uploads.clear();
+    m_staging.clear();
+    m_staging.shrink_to_fit();
+
     for (auto& [id, mesh] : m_meshes) {
-        if (mesh.vertex_buffer) {
-            SDL_ReleaseGPUBuffer(m_device, mesh.vertex_buffer);
-        }
-        if (mesh.index_buffer) {
-            SDL_ReleaseGPUBuffer(m_device, mesh.index_buffer);
-        }
+        retire_alloc(mesh.vertex_alloc, false);
+        retire_alloc(mesh.index_alloc, true);
     }
     m_meshes.clear();
+    m_resident_bytes = 0;
+}
+
+void GPURenderer::retire_alloc(const BufferAlloc& alloc, bool is_index) {
+    if (!alloc.valid()) return;
+
+    // Not freed here. A command buffer submitted in an earlier frame may still be
+    // reading these bytes, and GPUBufferPool::free() would make them immediately
+    // reallocatable -- so the next flush's copy pass could overwrite geometry a
+    // draw in flight is still fetching. That shows up as another mesh's triangles
+    // flickering through, with nothing to attribute it to.
+    m_retired_allocs.push_back(RetiredAlloc{ alloc, m_frame_index + kBufferRetireFrames, is_index });
+}
+
+void GPURenderer::drain_retired_allocs(bool force) {
+    if (m_retired_allocs.empty()) return;
+
+    size_t keep = 0;
+    for (size_t i = 0; i < m_retired_allocs.size(); ++i) {
+        const RetiredAlloc& r = m_retired_allocs[i];
+        if (!force && m_frame_index <= r.retire_after_frame) {
+            m_retired_allocs[keep++] = r;   // still possibly in flight
+            continue;
+        }
+        if (r.is_index) {
+            m_index_pool.free(r.alloc);
+        } else {
+            m_vertex_pool.free(r.alloc);
+        }
+    }
+    m_retired_allocs.resize(keep);
+}
+
+// ============================================================================
+// Resident memory budget
+// ============================================================================
+
+void GPURenderer::set_memory_budget(const MemoryBudget& budget) {
+    m_memory_budget = budget;
+    // Deliberately does not evict. A caller lowering the cap in a settings panel
+    // would otherwise drop geometry from inside an ImGui widget callback, which
+    // is a surprising place for the scene to change.
+    m_eviction_warned = false;
+}
+
+const GPURenderer::MemoryBudget& GPURenderer::memory_budget() const {
+    return m_memory_budget;
+}
+
+void GPURenderer::set_mesh_distance_fn(MeshDistanceFn fn) {
+    m_mesh_distance_fn = std::move(fn);
+    m_eviction_warned = false;
+}
+
+void GPURenderer::set_mesh_evicted_fn(MeshEvictedFn fn) {
+    m_mesh_evicted_fn = std::move(fn);
+}
+
+size_t GPURenderer::evict_to_budget() {
+    return evict_to_fit(0, 0);
+}
+
+size_t GPURenderer::evict_to_fit(size_t extra_bytes, size_t extra_meshes) {
+    const auto over_budget = [&]() {
+        return (m_resident_bytes + extra_bytes > m_memory_budget.max_resident_bytes)
+            || (m_meshes.size() + extra_meshes > m_memory_budget.max_resident_meshes);
+    };
+
+    if (!over_budget()) {
+        return 0;
+    }
+
+    if (!m_mesh_distance_fn) {
+        // Once, not per frame: over budget with no distance function is a wiring
+        // mistake that persists, and repeating it every frame would bury the log.
+        if (!m_eviction_warned) {
+            m_eviction_warned = true;
+            spdlog::warn("Over the resident GPU budget ({} MB across {} meshes, cap {} MB / {}) "
+                         "with no mesh distance function installed. Nothing is evicted: "
+                         "evicting without a distance discards the road under the camera as "
+                         "readily as one on the horizon.",
+                         m_resident_bytes / (1024 * 1024), m_meshes.size(),
+                         m_memory_budget.max_resident_bytes / (1024 * 1024),
+                         m_memory_budget.max_resident_meshes);
+        }
+        return 0;
+    }
+
+    // Anything staged but not yet copied is off limits. Its bytes are still held
+    // in m_staging and its ranges are the destination the next flush will copy
+    // into; freeing them here would have that copy land in whatever geometry the
+    // pool handed the same bytes to in the meantime.
+    std::unordered_set<uint32_t> staged;
+    staged.reserve(m_pending_uploads.size() * 2);
+    for (const PendingUpload& p : m_pending_uploads) {
+        staged.insert(p.mesh_id);
+    }
+
+    struct Candidate {
+        float distance;
+        uint32_t id;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(m_meshes.size());
+    for (const auto& [id, mesh] : m_meshes) {
+        if (staged.find(id) != staged.end()) {
+            continue;
+        }
+        const float distance = m_mesh_distance_fn(id);
+        // Negative means pinned. NaN falls through the same test and is treated as
+        // pinned too, which is the safe reading of an owner that cannot answer.
+        if (!(distance >= 0.0f)) {
+            continue;
+        }
+        candidates.push_back(Candidate{ distance, id });
+    }
+
+    // Furthest first. Ties break on ascending id so the same over-budget frame
+    // evicts the same meshes twice running, which is what makes a thrash
+    // reproducible instead of merely intermittent.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) {
+                  if (a.distance != b.distance) return a.distance > b.distance;
+                  return a.id < b.id;
+              });
+
+    size_t evicted = 0;
+    for (const Candidate& c : candidates) {
+        if (!over_budget()) {
+            break;
+        }
+        // The owner is told BEFORE the id stops resolving, so it can drop its
+        // handle. Iterating `candidates` rather than m_meshes is what makes the
+        // release_mesh() below safe: the map is being mutated, the snapshot is
+        // not.
+        if (m_mesh_evicted_fn) {
+            m_mesh_evicted_fn(c.id);
+        }
+        release_mesh(c.id);
+        ++evicted;
+    }
+
+    m_evicted_meshes += evicted;
+
+    if (over_budget() && m_frame_index >= m_next_budget_warn_frame) {
+        m_next_budget_warn_frame = m_frame_index + kBudgetWarnFrameInterval;
+        spdlog::warn("Still over the resident GPU budget after evicting {} mesh(es): {} MB across "
+                     "{} meshes, cap {} MB / {}. The remainder is pinned or mid-upload.",
+                     evicted, m_resident_bytes / (1024 * 1024), m_meshes.size(),
+                     m_memory_budget.max_resident_bytes / (1024 * 1024),
+                     m_memory_budget.max_resident_meshes);
+    }
+
+    return evicted;
+}
+
+GPUBufferPool::Stats GPURenderer::vertex_pool_stats() const {
+    return m_vertex_pool.stats();
+}
+
+GPUBufferPool::Stats GPURenderer::index_pool_stats() const {
+    return m_index_pool.stats();
 }
 
 bool GPURenderer::begin_frame() {
     if (!m_device) return false;
+
+    // Everything staged or freed from here on is accounted against this frame.
+    ++m_frame_index;
+
+    // Drain staged mesh copies BEFORE this frame's command buffer exists, so the
+    // upload is one self-contained submit rather than thousands interleaved with
+    // an open render pass. Budgeted per frame, so a large import streams in.
+    flush_pending_uploads();
+
+    // Ranges freed at least kBufferRetireFrames ago cannot be referenced by any
+    // command buffer still in flight, so they may go back to their pools now.
+    drain_retired_allocs();
+
+    // Then take the resident set back under its caps. After the flush, so a mesh
+    // staged last frame is a candidate rather than being skipped as mid-upload,
+    // and before the scene traversal, so this frame draws only what survived.
+    evict_to_budget();
 
     // Acquire command buffer
     m_cmd_buffer = SDL_AcquireGPUCommandBuffer(m_device);
@@ -1094,6 +1482,9 @@ void GPURenderer::draw_mesh(uint32_t mesh_id, const glm::mat4& model,
 
     const GPUMesh& mesh = it->second;
     if (!mesh.is_valid()) return;
+    // Its buffers exist but the copy has not run yet -- drawing now would render
+    // uninitialised device memory. It appears next frame instead.
+    if (!mesh.ready) return;
 
     if (m_current_shader_mode == ShaderMode::PBR && m_pbr_pipeline) {
         // PBR shader uniform layout: { mvp, model, normal_matrix, color_tint, camera_position }
@@ -1118,25 +1509,62 @@ void GPURenderer::draw_mesh(uint32_t mesh_id, const glm::mat4& model,
         SDL_PushGPUVertexUniformData(m_cmd_buffer, 0, &uniforms, sizeof(uniforms));
     }
 
-    // Bind vertex buffer
+    // Bind the vertex RANGE. The binding offset is where this mesh's vertex 0
+    // lives inside the shared block, so the mesh's indices stay zero-based and
+    // mesh-local and the draw needs no vertex offset of its own.
     SDL_GPUBufferBinding vertex_binding{};
-    vertex_binding.buffer = mesh.vertex_buffer;
-    vertex_binding.offset = 0;
+    vertex_binding.buffer = mesh.vertex_alloc.buffer;
+    vertex_binding.offset = mesh.vertex_alloc.offset;
     SDL_BindGPUVertexBuffers(m_render_pass, 0, &vertex_binding, 1);
 
     // Draw
-    if (mesh.index_buffer && mesh.index_count > 0) {
+    if (mesh.index_alloc.valid() && mesh.index_count > 0) {
         SDL_GPUBufferBinding index_binding{};
-        index_binding.buffer = mesh.index_buffer;
+        index_binding.buffer = mesh.index_alloc.buffer;
+        // Bound at the START of the block rather than at this mesh's range: the
+        // mesh base travels in first_index instead, so every mesh sharing a block
+        // issues the identical bind and the backend can drop the redundant ones.
         index_binding.offset = 0;
         SDL_BindGPUIndexBuffer(m_render_pass, &index_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
-        SDL_DrawGPUIndexedPrimitives(m_render_pass, mesh.index_count, 1, 0, 0, 0);
+
+        // first_index counts INDICES, not bytes, so the range's byte offset has to
+        // be divided by the index size to become one. That division is exact:
+        // upload_mesh() allocates index ranges at kIndexAlignment (4), the pool
+        // floors an index pool's alignment to 4 regardless of what it is asked
+        // for, and an offset that somehow arrived unaligned is rejected at the
+        // allocation site rather than reaching here. A truncating division here
+        // would aim the draw a few bytes short of the mesh and rasterise
+        // convincing nonsense, with no validation error to point at it.
+        const uint32_t base_index =
+            mesh.index_alloc.offset / static_cast<uint32_t>(sizeof(uint32_t));
+
+        // One draw per material range. The ranges tile [0, index_count), so the
+        // total primitive count is unchanged and a single-range mesh issues the
+        // exact same call as the flat draw this replaced.
+        //
+        // NOTE: no per-material pipeline or texture binding yet. Every range is
+        // drawn with the pipeline and bindings already set by the caller; the
+        // material slot is carried only so a later phase can bind per range.
+        if (mesh.submeshes.empty()) {
+            SDL_DrawGPUIndexedPrimitives(m_render_pass, mesh.index_count, 1, base_index, 0, 0);
+            ++m_frame_stats.draw_calls;
+        } else {
+            for (const auto& sub : mesh.submeshes) {
+                if (sub.index_count == 0) continue;
+                // SubMesh::index_offset is relative to the MESH; base_index is
+                // where the mesh starts in the block. The sum is the absolute
+                // index, and both terms are exact index counts.
+                SDL_DrawGPUIndexedPrimitives(m_render_pass, sub.index_count, 1,
+                                             base_index + sub.index_offset, 0, 0);
+                ++m_frame_stats.draw_calls;
+            }
+        }
         m_frame_stats.triangles += mesh.index_count / 3;
     } else {
         SDL_DrawGPUPrimitives(m_render_pass, mesh.vertex_count, 1, 0, 0);
         m_frame_stats.triangles += mesh.vertex_count / 3;
+        ++m_frame_stats.draw_calls;
     }
-    ++m_frame_stats.draw_calls;
 }
 
 void GPURenderer::draw_mesh_immediate(const Mesh& mesh, const glm::mat4& model) {

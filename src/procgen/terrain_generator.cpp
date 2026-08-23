@@ -98,7 +98,24 @@ void TerrainGenerator::reseed(uint32_t seed) {
     m_noise.reseed(seed);
 }
 
-float TerrainGenerator::sample_height(const TerrainConfig& config, float x, float z) const {
+namespace {
+
+/**
+ * @brief Raw height field, evaluated against an explicit noise instance
+ *
+ * Pulled out of TerrainGenerator::sample_height() so the same code can serve
+ * both the member sampler and the scratch generator that sample_surface() falls
+ * back on when the member noise is not seeded from @p config. Keeping one
+ * implementation is what guarantees that sample_surface() and the generate paths
+ * cannot drift apart.
+ *
+ * @param noise  Noise instance, expected to be seeded from config.seed
+ * @param config Terrain parameters
+ * @param x      World X in metres
+ * @param z      World Z in metres
+ * @return Raw surface height in metres, before flattening and before erosion
+ */
+float sample_height_impl(const Noise& noise, const TerrainConfig& config, float x, float z) {
     float nx = x * config.noise_scale;
     float nz = z * config.noise_scale;
     
@@ -107,14 +124,14 @@ float TerrainGenerator::sample_height(const TerrainConfig& config, float x, floa
     switch (config.type) {
         case TerrainType::Flat: {
             // Very subtle variation for flat terrain
-            height = m_noise.fbm2d(nx, nz, 2, config.lacunarity, 0.3f);
+            height = noise.fbm2d(nx, nz, 2, config.lacunarity, 0.3f);
             height *= 0.1f; // Very low amplitude
             break;
         }
         
         case TerrainType::Rolling: {
             // Gentle, smooth hills
-            height = m_noise.fbm2d(nx, nz, config.octaves, config.lacunarity, config.persistence);
+            height = noise.fbm2d(nx, nz, config.octaves, config.lacunarity, config.persistence);
             // Apply smoothing curve (ease in/out)
             height = height * 0.5f + 0.5f; // Normalize to [0, 1]
             height = height * height * (3.0f - 2.0f * height); // Smoothstep
@@ -124,16 +141,16 @@ float TerrainGenerator::sample_height(const TerrainConfig& config, float x, floa
         
         case TerrainType::Hilly: {
             // More pronounced hills with some variety
-            float base = m_noise.fbm2d(nx, nz, config.octaves, config.lacunarity, config.persistence);
-            float detail = m_noise.fbm2d(nx * 2.0f, nz * 2.0f, 3, 2.0f, 0.5f);
+            float base = noise.fbm2d(nx, nz, config.octaves, config.lacunarity, config.persistence);
+            float detail = noise.fbm2d(nx * 2.0f, nz * 2.0f, 3, 2.0f, 0.5f);
             height = base * 0.8f + detail * 0.2f;
             break;
         }
         
         case TerrainType::Mountainous: {
             // Ridged mountains with sharp peaks
-            float ridged = m_noise.ridged2d(nx, nz, config.octaves, config.lacunarity, 0.5f);
-            float base = m_noise.fbm2d(nx * 0.5f, nz * 0.5f, 4, 2.0f, 0.5f);
+            float ridged = noise.ridged2d(nx, nz, config.octaves, config.lacunarity, 0.5f);
+            float base = noise.fbm2d(nx * 0.5f, nz * 0.5f, 4, 2.0f, 0.5f);
             
             // Blend: use base noise to control where mountains appear
             float mountain_mask = (base + 1.0f) * 0.5f; // [0, 1]
@@ -145,6 +162,12 @@ float TerrainGenerator::sample_height(const TerrainConfig& config, float x, floa
     }
     
     return config.base_height + height * config.max_height;
+}
+
+} // namespace
+
+float TerrainGenerator::sample_height(const TerrainConfig& config, float x, float z) const {
+    return sample_height_impl(m_noise, config, x, z);
 }
 
 float TerrainGenerator::apply_flattening(const TerrainConfig& config, float x, float z, float height) const {
@@ -282,6 +305,36 @@ Heightmap TerrainGenerator::generate_chunk(const TerrainConfig& config,
     }
     
     return heightmap;
+}
+
+float TerrainGenerator::sample_surface(const TerrainConfig& config, float world_x, float world_z) const {
+    // Exactly the pair generate() and generate_chunk() run per cell, in the same
+    // order: raw height field, then the urban flattening modifier. Both generate
+    // paths reseed m_noise from config.seed before their cell loop, so the field
+    // this returns is only the same field when m_noise carries that seed too.
+    // sample_surface() is const and must stay re-entrant, so it cannot reseed
+    // m_noise; instead the mismatch falls through to a per-thread scratch
+    // generator below.
+    //
+    // Erosion is deliberately absent -- see the @warning on the declaration.
+    if (m_noise.get_seed() == config.seed) {
+        float h = sample_height_impl(m_noise, config, world_x, world_z);
+        return apply_flattening(config, world_x, world_z, h);
+    }
+
+    // Seed mismatch: the caller is sampling a config this generator has not been
+    // reseeded from (sampling before the first generate() call, or against a
+    // different config). Build the matching permutation table in thread-local
+    // storage rather than touching m_noise, so concurrent callers never share it.
+    // Reseeding costs a 256-entry shuffle and only happens when the seed changes,
+    // so a whole elevation solve pays it once per thread.
+    thread_local Noise scratch(0);
+    if (scratch.get_seed() != config.seed) {
+        scratch.reseed(config.seed);
+    }
+
+    float h = sample_height_impl(scratch, config, world_x, world_z);
+    return apply_flattening(config, world_x, world_z, h);
 }
 
 } // namespace stratum::procgen

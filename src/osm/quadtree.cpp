@@ -7,6 +7,68 @@
 
 namespace stratum::osm {
 
+namespace {
+
+/**
+ * @brief Append @p src into @p dst, keeping @p src's material ranges intact
+ *
+ * Mesh::append() attributes everything it copies to a single MaterialId, which
+ * would flatten a road piece's asphalt, curb and sidewalk ranges into one slot
+ * and undo the whole point of P0.3. This walks the source's effective ranges
+ * instead and extends or opens a matching range in the destination, so the
+ * material slots survive the merge of many pieces into one leaf mesh.
+ *
+ * Submesh bookkeeping otherwise follows Mesh::append() exactly: a destination
+ * that has indices but no submeshes first materialises its implicit whole-mesh
+ * range, so pre-existing geometry keeps its identity.
+ */
+void append_preserving_materials(Mesh& dst, const Mesh& src) {
+    if (src.vertices.empty() || src.indices.empty()) return;
+
+    if (!dst.indices.empty() && dst.submeshes.empty()) {
+        dst.submeshes.push_back({0u, static_cast<uint32_t>(dst.indices.size()),
+                                 MaterialId::Default});
+    }
+
+    const uint32_t base_vertex = static_cast<uint32_t>(dst.vertices.size());
+    dst.vertices.insert(dst.vertices.end(), src.vertices.begin(), src.vertices.end());
+    for (const auto& v : src.vertices) {
+        dst.bounds.expand(v.position);
+    }
+
+    for (const SubMesh& range : src.effective_submeshes()) {
+        if (range.index_count == 0) continue;
+
+        const size_t end = static_cast<size_t>(range.index_offset) + range.index_count;
+        if (end > src.indices.size()) continue;  // malformed range; drop rather than over-read
+
+        const uint32_t start = static_cast<uint32_t>(dst.indices.size());
+
+        // Grow geometrically, never to the exact size needed. reserve() allocates
+        // EXACTLY what is asked for, and the loop below then fills the buffer to
+        // capacity precisely, so an exact reserve per range reallocates and copies
+        // the whole leaf index buffer on every single append -- quadratic in the
+        // ranges routed to one leaf, and seconds of frozen UI on a city extract.
+        const size_t needed = dst.indices.size() + range.index_count;
+        if (needed > dst.indices.capacity()) {
+            dst.indices.reserve(std::max(needed, dst.indices.capacity() * 2));
+        }
+        for (size_t i = range.index_offset; i < end; ++i) {
+            dst.indices.push_back(src.indices[i] + base_vertex);
+        }
+
+        SubMesh* back = dst.submeshes.empty() ? nullptr : &dst.submeshes.back();
+        if (back && back->material == range.material &&
+            back->index_offset + back->index_count == start) {
+            back->index_count += range.index_count;
+        } else {
+            dst.submeshes.push_back({start, range.index_count, range.material});
+        }
+    }
+}
+
+} // namespace
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -165,31 +227,84 @@ void QuadTree::assign_data(const ParsedOSMData& data) {
 
     // Recompute 3D bounds bottom-up after all insertions
     // (bounds need to encompass actual building heights)
-    std::function<void(QuadTreeNode*)> recompute = [&](QuadTreeNode* node) {
-        if (!node) return;
-        if (node->is_leaf()) {
-            compute_3d_bounds(node);
-        } else {
-            for (auto& child : node->children) {
-                if (child) {
-                    recompute(child.get());
-                }
-            }
-            // Parent bounds = union of children
-            node->bounds_min = glm::vec3(std::numeric_limits<float>::max());
-            node->bounds_max = glm::vec3(std::numeric_limits<float>::lowest());
-            for (auto& child : node->children) {
-                if (child) {
-                    node->bounds_min = glm::min(node->bounds_min, child->bounds_min);
-                    node->bounds_max = glm::max(node->bounds_max, child->bounds_max);
-                }
-            }
-        }
-    };
-    recompute(m_root.get());
+    recompute_bounds(m_root.get());
 
     spdlog::info("QuadTree: Assigned data — {} leaves, {} roads, {} buildings, {} areas",
                  leaf_count(), total_roads(), total_buildings(), total_areas());
+}
+
+// ============================================================================
+// Road Geometry Assignment
+// ============================================================================
+
+void QuadTree::assign_road_pieces(std::vector<road::RoadPiece>&& pieces) {
+    if (!m_root) {
+        spdlog::warn("QuadTree: assign_road_pieces() before init(); {} road pieces dropped",
+                     pieces.size());
+        pieces.clear();
+        return;
+    }
+
+    // This is the only writer of QuadTreeNode::road_meshes, so an empty
+    // road_meshes means the leaf has not been touched yet on this pass. That is
+    // what makes the first-touch test below O(1).
+    std::vector<QuadTreeNode*> touched;
+    size_t assigned = 0;
+    size_t skipped = 0;
+    size_t triangles = 0;
+
+    for (auto& piece : pieces) {
+        if (piece.mesh.vertices.empty() || piece.mesh.indices.empty()) {
+            ++skipped;
+            continue;
+        }
+
+        // Route by the anchor only. The piece is never split, so part of the
+        // road may lie outside this leaf; recompute_bounds() below grows the
+        // leaf AABB to cover it.
+        //
+        // RoadPiece::edge is deliberately not consulted. A junction piece carries
+        // kInvalidId and is anchored at its graph node, so branching on
+        // provenance here would be a way to get junctions wrong and no way to get
+        // anything right.
+        QuadTreeNode* leaf = find_leaf(piece.anchor);
+        if (!leaf) {
+            ++skipped;
+            continue;
+        }
+
+        if (leaf->road_meshes.empty()) {
+            leaf->road_meshes.emplace_back();
+            touched.push_back(leaf);
+        }
+
+        append_preserving_materials(leaf->road_meshes.front(), piece.mesh);
+        triangles += piece.mesh.indices.size() / 3;
+        ++assigned;
+
+        // Release the source as it is consumed, so peak memory holds one copy of
+        // the road network rather than two. Mesh::clear() empties the vectors but
+        // keeps their capacity, which releases nothing: the whole source network
+        // would stay allocated beside the copy being built until pieces.clear()
+        // below. Move-assigning a fresh Mesh frees the storage instead.
+        piece.mesh = Mesh{};
+    }
+
+    // Pieces arrive interleaved by material, so each leaf mesh now holds one
+    // range per material per piece. Collapse them to one range per material so
+    // the leaf costs a handful of draw calls rather than thousands.
+    for (QuadTreeNode* leaf : touched) {
+        leaf->road_meshes.front().sort_submeshes_by_material();
+    }
+
+    // A piece may overhang the leaf that owns it, and a leaf that received one
+    // may sit outside the AABB assign_data() computed from features alone.
+    recompute_bounds(m_root.get());
+
+    pieces.clear();
+
+    spdlog::info("QuadTree: assigned {} road pieces ({} triangles) to {} leaves, {} skipped",
+                 assigned, triangles, touched.size(), skipped);
 }
 
 // ============================================================================
@@ -202,6 +317,22 @@ int QuadTree::child_index(const QuadTreeNode* node, const glm::dvec2& point) con
     if (point.x >= node->center.x) idx |= 1; // East
     if (point.y < node->center.y) idx |= 2;  // South
     return idx;
+}
+
+QuadTreeNode* QuadTree::find_leaf(const glm::dvec2& point) {
+    QuadTreeNode* node = m_root.get();
+    if (!node) return nullptr;
+
+    // Same descent insert_road() uses, minus the insertion: walk children by
+    // quadrant until a leaf. child_index() clamps nothing, so a point outside
+    // the root still resolves to the nearest boundary leaf rather than falling
+    // out of the tree.
+    while (!node->is_leaf()) {
+        QuadTreeNode* child = node->children[child_index(node, point)].get();
+        if (!child) break;
+        node = child;
+    }
+    return node;
 }
 
 void QuadTree::subdivide(QuadTreeNode* node) {
@@ -355,6 +486,41 @@ void QuadTree::compute_3d_bounds(QuadTreeNode* node) {
     );
 }
 
+void QuadTree::recompute_bounds(QuadTreeNode* node) {
+    if (!node) return;
+
+    if (node->is_leaf()) {
+        compute_3d_bounds(node);
+
+        // Road pieces are anchored inside this leaf but are never split, so a
+        // road may hang over the boundary. Grow the AABB to cover it, otherwise
+        // frustum culling drops the leaf while part of its geometry is still on
+        // screen.
+        //
+        // This is what covers a junction straddling a leaf boundary as well. Its
+        // fill and curb ring reach out to the arm mouths in every direction from
+        // the node it is anchored at, so a node near a boundary always overhangs;
+        // the bounds are grown from the accumulated vertex bounds of the leaf's
+        // road mesh, which append_preserving_materials() maintains, so the reach
+        // is measured rather than assumed.
+        for (const auto& mesh : node->road_meshes) {
+            if (!mesh.bounds.is_valid()) continue;
+            node->bounds_min = glm::min(node->bounds_min, mesh.bounds.min);
+            node->bounds_max = glm::max(node->bounds_max, mesh.bounds.max);
+        }
+        return;
+    }
+
+    node->bounds_min = glm::vec3(std::numeric_limits<float>::max());
+    node->bounds_max = glm::vec3(std::numeric_limits<float>::lowest());
+    for (auto& child : node->children) {
+        if (!child) continue;
+        recompute_bounds(child.get());
+        node->bounds_min = glm::min(node->bounds_min, child->bounds_min);
+        node->bounds_max = glm::max(node->bounds_max, child->bounds_max);
+    }
+}
+
 // ============================================================================
 // Traversal
 // ============================================================================
@@ -463,7 +629,9 @@ void QuadTree::traverse_recursive(
 
     // 4. If leaf: collect
     if (node->is_leaf()) {
-        if (node->feature_count() > 0) {
+        // road_meshes is checked separately: a road piece is routed by its
+        // anchor, so a leaf can own road geometry without owning any feature.
+        if (node->feature_count() > 0 || !node->road_meshes.empty()) {
             visible.emplace_back(node, dist_sq);
         }
         return;
@@ -486,27 +654,10 @@ void QuadTree::traverse_recursive(
 QuadTree::BuiltMeshes QuadTree::build_node_meshes_internal(const QuadTreeNode& node) {
     BuiltMeshes result;
 
-    // Roads
-    {
-        std::vector<Mesh> individual;
-        individual.reserve(node.roads.size());
-        for (const auto& road : node.roads) {
-            Mesh mesh = MeshBuilder::build_road_mesh(road);
-            if (mesh.is_valid()) {
-                individual.push_back(std::move(mesh));
-            }
-        }
-        if (!node.roads.empty()) {
-            auto junctions = MeshBuilder::build_junction_meshes(node.roads);
-            for (auto& j : junctions) {
-                if (j.is_valid()) individual.push_back(std::move(j));
-            }
-        }
-        Mesh merged = MeshBuilder::merge_meshes(individual);
-        if (merged.is_valid()) {
-            result.road_meshes.push_back(std::move(merged));
-        }
-    }
+    // No roads here. Road geometry is solved once against the whole road graph
+    // and delivered by assign_road_pieces(); building it per leaf is what made
+    // junctions stop at leaf boundaries. Buildings and areas keep the per-leaf
+    // path because they carry no cross-leaf topology.
 
     // Buildings
     {
@@ -544,9 +695,10 @@ bool QuadTree::queue_node_build_async(QuadTreeNode* node) {
 
     node->meshes_pending = true;
 
-    // Copy node data for thread safety
+    // Copy node data for thread safety. Roads are deliberately not copied: the
+    // worker no longer builds road geometry, so copying every Road per node was
+    // pure cost.
     QuadTreeNode node_copy;
-    node_copy.roads = node->roads;
     node_copy.buildings = node->buildings;
     node_copy.areas = node->areas;
 
@@ -570,7 +722,9 @@ size_t QuadTree::poll_async_builds() {
             BuiltMeshes meshes = it->future.get();
             QuadTreeNode* node = it->node;
             if (node) {
-                node->road_meshes = std::move(meshes.road_meshes);
+                // road_meshes is untouched on purpose: it was filled by
+                // assign_road_pieces() before any build was queued, and this
+                // result carries no road geometry to replace it with.
                 node->building_meshes = std::move(meshes.building_meshes);
                 node->area_meshes = std::move(meshes.area_meshes);
                 node->meshes_built = true;
