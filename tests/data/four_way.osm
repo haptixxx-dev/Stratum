@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  four_way.osm - two roads crossing at one shared, signalled node.
+
+  Node 100 is interior to BOTH ways, so each way splits into two edges and the
+  node carries four arms. Expected: exactly one GraphNode of degree 4, with
+  has_signals true.
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.33936" minlon="-6.26100" maxlat="53.34064" maxlon="-6.25900"/>
+
+  <!-- Junction node, signalled -->
+  <node id="100" version="1" lat="53.34000" lon="-6.26000">
+    <tag k="highway" v="traffic_signals"/>
+  </node>
+
+  <!-- East-west arms -->
+  <node id="101" version="1" lat="53.34000" lon="-6.26090"/>
+  <node id="102" version="1" lat="53.34000" lon="-6.25910"/>
+
+  <!-- North-south arms -->
+  <node id="103" version="1" lat="53.33946" lon="-6.26000"/>
+  <node id="104" version="1" lat="53.34054" lon="-6.26000"/>
+
+  <way id="1000" version="1">
+    <nd ref="101"/>
+    <nd ref="100"/>
+    <nd ref="102"/>
+    <tag k="highway" v="secondary"/>
+    <tag k="name" v="Dame Street"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+    <tag k="maxspeed" v="50"/>
+  </way>
+
+  <way id="1001" version="1">
+    <nd ref="103"/>
+    <nd ref="100"/>
+    <nd ref="104"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="South Great George's Street"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+    <tag k="maxspeed" v="50"/>
+  </way>
+</osm>

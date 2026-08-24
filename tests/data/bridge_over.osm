@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  bridge_over.osm - a bridge passing OVER a road while sharing its crossing node.
+
+  This is bad-but-common OSM data. Way 7000 is at layer 0. Way 7010 is a bridge at
+  layer 1. Both reference node 702 at the crossing point, but they never meet: the
+  bridge deck is above the road.
+
+  Expected: node 702 yields TWO GraphNodes, one at layer 0 and one at layer 1.
+  Neither has degree 4 - each carries only the two arms of its own layer. So
+  Stats::layer_split_nodes == 1 and no junction is invented here.
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.33540" minlon="-6.24600" maxlat="53.33660" maxlon="-6.24400"/>
+
+  <node id="701" version="1" lat="53.33600" lon="-6.24590"/>
+  <node id="702" version="1" lat="53.33600" lon="-6.24500"/>
+  <node id="703" version="1" lat="53.33600" lon="-6.24410"/>
+
+  <node id="704" version="1" lat="53.33546" lon="-6.24500"/>
+  <node id="705" version="1" lat="53.33654" lon="-6.24500"/>
+
+  <way id="7000" version="1">
+    <nd ref="701"/>
+    <nd ref="702"/>
+    <nd ref="703"/>
+    <tag k="highway" v="secondary"/>
+    <tag k="name" v="Canal Road"/>
+    <tag k="lanes" v="2"/>
+    <tag k="layer" v="0"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="7010" version="1">
+    <nd ref="704"/>
+    <nd ref="702"/>
+    <nd ref="705"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Mill Bridge"/>
+    <tag k="bridge" v="yes"/>
+    <tag k="layer" v="1"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+</osm>

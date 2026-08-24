@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  rural_track.osm - an unpaved farm track, isolated, with no sidewalk tag.
+
+  Expected: one edge, surface == "gravel", sidewalk == SideFlags::Unknown (the tag
+  is absent) or SideFlags::None (a class default of "no sidewalk on a track").
+  Both endpoints are degree-1 dead ends and there is no junction.
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.32990" minlon="-6.24010" maxlat="53.33100" maxlon="-6.23790"/>
+
+  <node id="601" version="1" lat="53.33000" lon="-6.24000"/>
+  <node id="602" version="1" lat="53.33045" lon="-6.23920"/>
+  <node id="603" version="1" lat="53.33090" lon="-6.23800"/>
+
+  <way id="6000" version="1">
+    <nd ref="601"/>
+    <nd ref="602"/>
+    <nd ref="603"/>
+    <tag k="highway" v="track"/>
+    <tag k="surface" v="gravel"/>
+    <tag k="tracktype" v="grade3"/>
+    <tag k="access" v="agricultural"/>
+  </way>
+</osm>

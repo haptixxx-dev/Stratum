@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  t_junction.osm - the case endpoint-proximity clustering misses.
+
+  Way 2000 runs east-west through five nodes. Way 2010 STARTS at node 203, which
+  is the middle node of way 2000's node list, not one of its endpoints. Only node
+  identity finds this junction.
+
+  Expected: exactly one GraphNode of degree 3, at node 203. Nodes 202, 204 and 206
+  are referenced by a single way and are not way endpoints, so they stay as plain
+  polyline vertices and get no GraphNode.
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.34190" minlon="-6.26600" maxlat="53.34264" maxlon="-6.26400"/>
+
+  <node id="201" version="1" lat="53.34200" lon="-6.26590"/>
+  <node id="202" version="1" lat="53.34200" lon="-6.26545"/>
+  <node id="203" version="1" lat="53.34200" lon="-6.26500"/>
+  <node id="204" version="1" lat="53.34200" lon="-6.26455"/>
+  <node id="205" version="1" lat="53.34200" lon="-6.26410"/>
+
+  <node id="206" version="1" lat="53.34227" lon="-6.26500"/>
+  <node id="207" version="1" lat="53.34254" lon="-6.26500"/>
+
+  <way id="2000" version="1">
+    <nd ref="201"/>
+    <nd ref="202"/>
+    <nd ref="203"/>
+    <nd ref="204"/>
+    <nd ref="205"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Sycamore Road"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="2010" version="1">
+    <nd ref="203"/>
+    <nd ref="206"/>
+    <nd ref="207"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Fitzwilliam Lane"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="left"/>
+  </way>
+</osm>

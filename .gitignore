@@ -27,6 +27,11 @@ Thumbs.db
 # ═══════════════════════════════════════════════════════════════════
 *.osm
 *.pbf
+# ...except the hand-authored test fixtures, which ARE source. Without this
+# negation the golden-file suites cannot run on a fresh clone: the .osm files
+# they parse are excluded by the rule above, which is meant for downloaded
+# extracts sitting in the working tree.
+!tests/data/*.osm
 data/cache/
 data/exports/
 
@@ -42,3 +47,10 @@ renderdoc/
 
 # Parallel-agent git worktrees (see launch-features.sh)
 Worktrees/
+
+# ═══════════════════════════════════════════════════════════════════
+# Exported meshes (road_export / OBJ dumps) — can reach tens of GB
+# ═══════════════════════════════════════════════════════════════════
+TestOutput/
+road_export/
+road_dump/

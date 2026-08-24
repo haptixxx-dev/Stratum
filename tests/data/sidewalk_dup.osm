@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  sidewalk_dup.osm - the doubly-mapped sidewalk, and the footway that is not one.
+
+  Node block 11xx, way block 110xx. Own patch around 53.3320 N, 6.2790 W.
+
+  Way 11000 "Ranelagh Avenue" is a residential street tagged sidewalk=both, so
+  build_profile() synthesises a Sidewalk strip on each side of it.
+
+  Way 11010 "Ranelagh Avenue footway" is the SAME footway surveyed separately:
+  highway=footway, footway=sidewalk, running NORTH of the carriageway alongside
+  most of it. The carriageway is digitised west to east, so north is LEFT of its
+  direction of travel and dedup_sidewalks() must report SideFlags::Left for it.
+  Left only, never Both: the right-hand sidewalk is mapped nowhere else and must
+  keep being synthesised.
+
+  The offset has to put the surveyed footway ON TOP OF the synthesised one, or
+  the duplication the feature removes is not there to remove. build_profile()
+  lays out 3.5 m of lane, 0.3 m of gutter, 0.02 m of curb face and 0.15 m of curb
+  top before the sidewalk starts, so the synthesised strip spans 3.97 to 5.97 in
+  the parser's local units and the footway has to land inside that band.
+
+  MIND THE UNITS. OSMParser projects through EPSG:3857 Web Mercator and applies
+  no latitude correction, so one local unit is one TRUE metre divided by
+  cos(latitude). At 53.332 N that factor is 1.6744. The footway nodes sit
+  0.0000270 degrees north of the carriageway, which is 3.01 true metres and
+  5.03 LOCAL units, and 5.03 is the number that matters because every road width
+  in the pipeline is a plain number of local units. A fixture author who places a
+  node at three true metres expecting a three-unit offset gets 5.03, and one who
+  places it at five true metres gets 8.37 and lands clear of the strip entirely.
+
+  Way 11020 "Ranelagh Avenue crossing" is the control. It is also a
+  highway=footway, so it passes the RoadType filter dedup_sidewalks() uses, but
+  it runs square ACROSS the carriageway instead of alongside it and must fail the
+  bearing test. Suppressing a sidewalk for it would delete the footway from a
+  street that has only the one.
+
+  The crossing footway shares node 1105, which is INTERIOR to way 11000, so way
+  11000 splits into two GraphEdges there: a 199 m western edge and a 66 m eastern
+  one. The parallel footway lies wholly within the span of the WESTERN edge, so
+  every one of its stations is testable against a single carriageway edge and the
+  parallel fraction is unambiguous. Node 1105 ends up degree 4.
+
+  Note that the parallel footway is digitised in the SAME direction as the
+  carriageway here. Direction is deliberately not the thing under test: the
+  bearing comparison is documented as modulo pi, and a reversed sidewalk is
+  covered by the synthetic tests rather than by a second near-identical fixture.
+
+  Expected:
+    * DedupResult::suppress_side is SideFlags::Left for the western edge of way
+      11000, SideFlags::None everywhere else
+    * DedupResult::suppressed_edges == 1, matched_footways == 1
+    * neither edge of way 11020 is ever recorded as a match
+    * built end to end, the western edge carries Sidewalk geometry on one side
+      only, and the separately-mapped footway is still extruded
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.33160" minlon="-6.28110" maxlat="53.33240" maxlon="-6.27690"/>
+
+  <node id="1101" version="1" lat="53.33200" lon="-6.28100"/>
+  <node id="1102" version="1" lat="53.33200" lon="-6.28020"/>
+  <node id="1103" version="1" lat="53.33200" lon="-6.27940"/>
+  <node id="1104" version="1" lat="53.33200" lon="-6.27860"/>
+  <node id="1105" version="1" lat="53.33200" lon="-6.27800"/>
+  <node id="1106" version="1" lat="53.33200" lon="-6.27700"/>
+
+  <!-- Plus 0.0000270 degrees: 3.01 true metres north, 5.03 local units. -->
+  <node id="1111" version="1" lat="53.3320270" lon="-6.28060"/>
+  <node id="1112" version="1" lat="53.3320270" lon="-6.27970"/>
+  <node id="1113" version="1" lat="53.3320270" lon="-6.27880"/>
+
+  <node id="1121" version="1" lat="53.33170" lon="-6.27800"/>
+  <node id="1122" version="1" lat="53.33230" lon="-6.27800"/>
+
+  <way id="11000" version="1">
+    <nd ref="1101"/>
+    <nd ref="1102"/>
+    <nd ref="1103"/>
+    <nd ref="1104"/>
+    <nd ref="1105"/>
+    <nd ref="1106"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Ranelagh Avenue"/>
+    <tag k="lanes" v="2"/>
+    <tag k="maxspeed" v="50"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="11010" version="1">
+    <nd ref="1111"/>
+    <nd ref="1112"/>
+    <nd ref="1113"/>
+    <tag k="highway" v="footway"/>
+    <tag k="footway" v="sidewalk"/>
+    <tag k="surface" v="paving_stones"/>
+    <tag k="width" v="2"/>
+  </way>
+
+  <way id="11020" version="1">
+    <nd ref="1121"/>
+    <nd ref="1105"/>
+    <nd ref="1122"/>
+    <tag k="highway" v="footway"/>
+    <tag k="footway" v="crossing"/>
+    <tag k="crossing" v="uncontrolled"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+</osm>

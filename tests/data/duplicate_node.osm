@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  duplicate_node.osm - two node IDs at one coordinate, the common OSM data defect.
+
+  Nodes 802 and 803 carry identical lat/lon. Way 8000 lists both, so the stretch of
+  it between them has zero length. Way 8010 tees off at 802 and way 8020 tees off
+  at 803, so both duplicates are referenced twice and both qualify as graph nodes.
+
+  The zero-length stretch cannot become a GraphEdge: an arm with no direction is
+  useless to the junction solver. Dropping it is not enough on its own, though.
+  Left as two distinct graph nodes at one position, way 8000 would be cut in half
+  with no path from 801 to 804, and a four-way crossroads would read as two
+  unrelated continuations.
+
+  Expected: 802 and 803 resolve to ONE GraphNode of degree 4. Four edges, five
+  nodes, one junction, and four dead ends at 801, 804, 805 and 806.
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.34740" minlon="-6.25900" maxlat="53.34860" maxlon="-6.25700"/>
+
+  <node id="801" version="1" lat="53.34800" lon="-6.25850"/>
+  <node id="802" version="1" lat="53.34800" lon="-6.25800"/>
+  <node id="803" version="1" lat="53.34800" lon="-6.25800"/>
+  <node id="804" version="1" lat="53.34800" lon="-6.25750"/>
+
+  <node id="805" version="1" lat="53.34845" lon="-6.25800"/>
+  <node id="806" version="1" lat="53.34755" lon="-6.25800"/>
+
+  <way id="8000" version="1">
+    <nd ref="801"/>
+    <nd ref="802"/>
+    <nd ref="803"/>
+    <nd ref="804"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Marlborough Row"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+
+  <way id="8010" version="1">
+    <nd ref="802"/>
+    <nd ref="805"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Beresford Close"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+
+  <way id="8020" version="1">
+    <nd ref="803"/>
+    <nd ref="806"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Gardiner Close"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+  </way>
+</osm>

@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  service_roads.osm - the three service classes hanging off a residential street.
+
+  Node block 14xx, way block 140xx. Own patch around 53.3380 N, 6.2800 W.
+
+  Way 14000 "Beechwood Avenue" is an ordinary residential street with a sidewalk
+  on both sides. Three service roads leave it at INTERIOR nodes, so each one
+  splits the parent and produces a degree 3 node rather than a coincidence of way
+  endpoints:
+
+    way 14010  service=driveway       at node 1402
+    way 14020  service=parking_aisle  at node 1403
+    way 14030  service=alley          at node 1404
+
+  The service=* subtag, not the highway tag, is what sets the width: build_profile()
+  reads driveway_width, parking_aisle_width and alley_width, which default to
+  3.0 m, 5.5 m and 3.5 m. A parking aisle is therefore the WIDEST of the three
+  and a driveway the narrowest, which is the ordering a builder that ignored the
+  subtag and used service_lane_width for all three would flatten. None of them
+  carries a kerb, a gutter or a sidewalk. Each is where a vehicle crosses the
+  parent street's footway, so each is where the kerb has to drop.
+
+  The three carry different surface values on purpose. A driveway in concrete, a
+  parking aisle in asphalt and an alley in setts are all ordinary tagging, and
+  they make the material mix in an OBJ dump say which service road is which.
+
+  Way 14020 has two segments so a parking aisle is not a single straight stub:
+  it turns, which is the case a narrow profile with a gutter has to miter without
+  pinching.
+
+  Expected:
+    * three degree 3 nodes, at 1402, 1403 and 1404
+    * every edge of ways 14010, 14020 and 14030 has RoadType::Service and no
+      Sidewalk, CurbFace, CurbTop or Gutter strip
+    * their total widths are 3.0 m, 5.5 m and 3.5 m, so 14010 < 14030 < 14020
+    * way 14010 carries MaterialId::Concrete lanes, 14020 Asphalt, 14030 whatever
+      the surface table maps setts onto
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.33770" minlon="-6.28210" maxlat="53.33840" maxlon="-6.27790"/>
+
+  <node id="1401" version="1" lat="53.33800" lon="-6.28200"/>
+  <node id="1402" version="1" lat="53.33800" lon="-6.28100"/>
+  <node id="1403" version="1" lat="53.33800" lon="-6.28000"/>
+  <node id="1404" version="1" lat="53.33800" lon="-6.27900"/>
+  <node id="1405" version="1" lat="53.33800" lon="-6.27800"/>
+
+  <node id="1411" version="1" lat="53.33820" lon="-6.28100"/>
+
+  <node id="1421" version="1" lat="53.33780" lon="-6.28000"/>
+  <node id="1422" version="1" lat="53.33780" lon="-6.27960"/>
+
+  <node id="1431" version="1" lat="53.33830" lon="-6.27900"/>
+
+  <way id="14000" version="1">
+    <nd ref="1401"/>
+    <nd ref="1402"/>
+    <nd ref="1403"/>
+    <nd ref="1404"/>
+    <nd ref="1405"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Beechwood Avenue"/>
+    <tag k="lanes" v="2"/>
+    <tag k="maxspeed" v="50"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="14010" version="1">
+    <nd ref="1402"/>
+    <nd ref="1411"/>
+    <tag k="highway" v="service"/>
+    <tag k="service" v="driveway"/>
+    <tag k="surface" v="concrete"/>
+  </way>
+
+  <way id="14020" version="1">
+    <nd ref="1403"/>
+    <nd ref="1421"/>
+    <nd ref="1422"/>
+    <tag k="highway" v="service"/>
+    <tag k="service" v="parking_aisle"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="oneway" v="yes"/>
+  </way>
+
+  <way id="14030" version="1">
+    <nd ref="1404"/>
+    <nd ref="1431"/>
+    <tag k="highway" v="service"/>
+    <tag k="service" v="alley"/>
+    <tag k="surface" v="sett"/>
+    <tag k="name" v="Beechwood Lane"/>
+  </way>
+</osm>

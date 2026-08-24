@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  dual_carriageway.osm - the raised median island, and the class rule around it.
+
+  Node block 13xx, way block 130xx. Own patch around 53.3360 N, 6.2800 W.
+
+  Way 13000 "Stillorgan Road" is a four lane two way PRIMARY. It carries no
+  median=* tag at all, which is the ordinary state of the data: the lane count is
+  the evidence. ProfileConfig::urban_dual_median turns that into a Median strip,
+  ProfileConfig::median_width makes it 3.0 m, and 3.0 m clears both
+  min_median_raised_urban at 1.0 m and min_median_grass at 2.0 m, so the island
+  comes out RAISED and GRASSED: CurbFace, Median top at curb_height in
+  MaterialId::Grass, CurbFace again.
+
+  Way 13010 "Nutley Lane" is the negative control and the reason this fixture
+  carries two roads. It is a four lane SECONDARY, tagged identically in every
+  other respect. Secondary and below need an explicit median=* or divider=* tag,
+  so it must get NO Median strip: the lane count alone is not evidence there.
+  Without this row a builder that gave every wide road a median would pass.
+
+  Way 13020 "Nutley Link" joins the two at their middle nodes, so 1302 and 1312
+  are both degree 3. That is what puts a junction at the end of an arm carrying a
+  raised island, which is the case a median has to survive: the junction solver
+  trims the arm back through the island, and the markings pass has to find a
+  centre boundary that is a Median rather than a Lane to Lane join.
+
+  The two carriageways are 55 m apart, far outside DedupConfig::max_offset, so
+  nothing here is a sidewalk dedup case.
+
+  Expected:
+    * every edge of way 13000 has exactly one StripKind::Median strip, raised to
+      ProfileConfig::curb_height, in MaterialId::Grass, with a CurbFace either
+      side of it
+    * no edge of way 13010 has a Median strip
+    * neither road gets a painted centre line: the primary's two lane groups are
+      separated by the island rather than by a Lane to Lane boundary, and the
+      secondary is a plain four lane street whose middle boundary is the one that
+      does get painted
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.33540" minlon="-6.28210" maxlat="53.33610" maxlon="-6.27790"/>
+
+  <node id="1301" version="1" lat="53.33600" lon="-6.28200"/>
+  <node id="1302" version="1" lat="53.33600" lon="-6.28000"/>
+  <node id="1303" version="1" lat="53.33600" lon="-6.27800"/>
+
+  <node id="1311" version="1" lat="53.33550" lon="-6.28200"/>
+  <node id="1312" version="1" lat="53.33550" lon="-6.28000"/>
+  <node id="1313" version="1" lat="53.33550" lon="-6.27800"/>
+
+  <way id="13000" version="1">
+    <nd ref="1301"/>
+    <nd ref="1302"/>
+    <nd ref="1303"/>
+    <tag k="highway" v="primary"/>
+    <tag k="name" v="Stillorgan Road"/>
+    <tag k="ref" v="N11"/>
+    <tag k="lanes" v="4"/>
+    <tag k="maxspeed" v="60"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="13010" version="1">
+    <nd ref="1311"/>
+    <nd ref="1312"/>
+    <nd ref="1313"/>
+    <tag k="highway" v="secondary"/>
+    <tag k="name" v="Nutley Lane"/>
+    <tag k="lanes" v="4"/>
+    <tag k="maxspeed" v="50"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="13020" version="1">
+    <nd ref="1302"/>
+    <nd ref="1312"/>
+    <tag k="highway" v="tertiary"/>
+    <tag k="name" v="Nutley Link"/>
+    <tag k="lanes" v="2"/>
+    <tag k="maxspeed" v="50"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+</osm>

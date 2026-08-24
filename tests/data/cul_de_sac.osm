@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  cul_de_sac.osm - a suburban dead end with a turning circle.
+
+  Way 3000 is the through street. Way 3010 branches from its middle node 302 and
+  terminates at node 306, tagged highway=turning_circle.
+
+  Expected: node 306 is the only degree-1 GraphNode with is_turning_circle true.
+  Node 302 is a degree-3 junction. Nodes 301, 303 are plain degree-1 dead ends
+  with no turning circle.
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.33790" minlon="-6.25700" maxlat="53.33882" maxlon="-6.25500"/>
+
+  <node id="301" version="1" lat="53.33800" lon="-6.25690"/>
+  <node id="302" version="1" lat="53.33800" lon="-6.25600"/>
+  <node id="303" version="1" lat="53.33800" lon="-6.25510"/>
+
+  <node id="304" version="1" lat="53.33827" lon="-6.25600"/>
+  <node id="305" version="1" lat="53.33854" lon="-6.25600"/>
+  <node id="306" version="1" lat="53.33872" lon="-6.25600">
+    <tag k="highway" v="turning_circle"/>
+  </node>
+
+  <way id="3000" version="1">
+    <nd ref="301"/>
+    <nd ref="302"/>
+    <nd ref="303"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Elm Road"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+  </way>
+
+  <way id="3010" version="1">
+    <nd ref="302"/>
+    <nd ref="304"/>
+    <nd ref="305"/>
+    <nd ref="306"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Elm Close"/>
+    <tag k="lanes" v="2"/>
+    <tag k="surface" v="asphalt"/>
+    <tag k="sidewalk" v="both"/>
+    <tag k="maxspeed" v="30"/>
+  </way>
+</osm>

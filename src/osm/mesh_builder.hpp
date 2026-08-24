@@ -6,14 +6,19 @@
 
 namespace stratum::osm {
 
+/**
+ * @brief Per-feature mesh construction for buildings and areas
+ *
+ * Roads are NOT built here. Road geometry is topology-driven and has to be
+ * solved against the whole network at once, so it is produced by
+ * stratum::osm::road::RoadNetworkBuilder and handed to the spatial index as
+ * finished pieces via QuadTree::assign_road_pieces(). The old per-feature
+ * build_road_mesh() and the endpoint-clustering build_junction_meshes() were
+ * removed with that change; see docs/plans/road_network_plan.md, P0.2.
+ */
 class MeshBuilder {
 public:
     MeshBuilder() = default;
-
-    /**
-     * @brief Generates a mesh for a road segment
-     */
-    static Mesh build_road_mesh(const Road& road);
 
     /**
      * @brief Generates a mesh for a building
@@ -24,13 +29,6 @@ public:
      * @brief Generates a mesh for an area (park, water, etc.)
      */
     static Mesh build_area_mesh(const Area& area);
-
-    /**
-     * @brief Generates meshes for road junctions/intersections
-     * @param roads All roads in the scene
-     * @return Vector of junction meshes
-     */
-    static std::vector<Mesh> build_junction_meshes(const std::vector<Road>& roads);
 
     /**
      * @brief Merge multiple meshes into a single mesh

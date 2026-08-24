@@ -265,6 +265,22 @@ private:
     // Resolve way node references to coordinates
     [[nodiscard]] std::vector<glm::dvec2> resolve_way_coords(const OSMWay& way) const;
 
+    /**
+     * @brief Resolve way node references to coordinates and their node IDs
+     *
+     * A node reference with no entry in ParsedOSMData::nodes has no position, so
+     * it is skipped. Both outputs skip it together: on return out_coords and
+     * out_node_ids always have the same size, and out_node_ids[i] is the OSM node
+     * at out_coords[i]. Road::node_ids depends on that invariant.
+     *
+     * @param way           Way to resolve
+     * @param out_coords    Receives the local-metre positions, cleared first
+     * @param out_node_ids  Receives the matching node IDs, cleared first
+     */
+    void resolve_way_coords_with_ids(const OSMWay& way,
+                                     std::vector<glm::dvec2>& out_coords,
+                                     std::vector<NodeId>& out_node_ids) const;
+
     // Data members
     ParserConfig m_config;
     ParsedOSMData m_data;

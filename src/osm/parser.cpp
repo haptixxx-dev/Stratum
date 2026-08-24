@@ -7,6 +7,14 @@
 #include <spdlog/spdlog.h>
 #include <chrono>
 #include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <initializer_list>
+#include <optional>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
 
 // libosmium includes
 #include <osmium/io/any_input.hpp>
@@ -317,6 +325,476 @@ void OSMParser::convert_coordinates() {
     }
 }
 
+// ============================================================================
+// Tag Parsing Helpers
+// ============================================================================
+
+namespace {
+
+/**
+ * @brief Look up a tag by key
+ * @param tags Tag map to search
+ * @param key Tag key
+ * @return Pointer to the raw value, or nullptr when the tag is absent
+ */
+[[nodiscard]] const std::string* find_tag(const TagMap& tags, const std::string& key) {
+    auto it = tags.find(key);
+    return it == tags.end() ? nullptr : &it->second;
+}
+
+/**
+ * @brief Lowercase and whitespace-trim a tag value
+ *
+ * OSM values are free text typed by mappers, so "Yes", " lane" and "M" all
+ * occur. Comparing raw values against lowercase literals loses real data.
+ *
+ * @param value Raw tag value
+ * @return Normalized copy
+ */
+[[nodiscard]] std::string normalize_value(std::string_view value) {
+    size_t begin = 0;
+    size_t end = value.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(value[begin]))) ++begin;
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) --end;
+
+    std::string out;
+    out.reserve(end - begin);
+    for (size_t i = begin; i < end; ++i) {
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(value[i]))));
+    }
+    return out;
+}
+
+/**
+ * @brief Normalized value of a tag
+ * @param tags Tag map to search
+ * @param key Tag key
+ * @return Lowercased, trimmed value, or an empty string when the tag is absent
+ */
+[[nodiscard]] std::string tag_value(const TagMap& tags, const std::string& key) {
+    const std::string* raw = find_tag(tags, key);
+    return raw ? normalize_value(*raw) : std::string{};
+}
+
+/**
+ * @brief Read a tag as an integer, tolerating junk
+ *
+ * Values such as "1;2" or "two" are common. They must not throw and must not
+ * abort the import, so an unreadable value reads as absent.
+ *
+ * @param tags Tag map to search
+ * @param key Tag key
+ * @return The integer, or std::nullopt when the tag is absent or unreadable
+ */
+[[nodiscard]] std::optional<int> parse_tag_int(const TagMap& tags, const std::string& key) {
+    const std::string* raw = find_tag(tags, key);
+    if (!raw) return std::nullopt;
+    try {
+        size_t consumed = 0;
+        const int value = std::stoi(*raw, &consumed);
+        if (consumed == 0) return std::nullopt;
+        return value;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+/**
+ * @brief Read a lane count tag
+ * @param tags Tag map to search
+ * @param key Tag key, for example "lanes" or "lanes:forward"
+ * @return Lane count, or -1 when the tag is absent, unreadable, or not positive
+ */
+[[nodiscard]] int parse_lane_count(const TagMap& tags, const std::string& key) {
+    const auto value = parse_tag_int(tags, key);
+    if (!value || *value <= 0) return -1;
+    return *value;
+}
+
+/**
+ * @brief Total lanes implied by lanes:forward and lanes:backward
+ *
+ * A one-way slip road often carries only lanes:forward, so a missing side
+ * counts as zero rather than voiding the total.
+ *
+ * @param tags Tag map to search
+ * @return Combined lane count, or -1 when neither tag is usable
+ */
+[[nodiscard]] int directional_lane_total(const TagMap& tags) {
+    const int forward = parse_lane_count(tags, "lanes:forward");
+    const int backward = parse_lane_count(tags, "lanes:backward");
+    if (forward < 0 && backward < 0) return -1;
+    return std::max(forward, 0) + std::max(backward, 0);
+}
+
+/**
+ * @brief Read a length value that may carry a unit suffix
+ *
+ * Accepts a bare number in metres ("12"), an explicit metre suffix ("12 m",
+ * "12 metres"), feet ("30 ft", "30 feet"), and the feet-and-inches form
+ * ("30'6\""). An unrecognised suffix is read as metres, which is what a bare
+ * std::stof did before.
+ *
+ * @param raw Raw tag value
+ * @return Length in metres, or std::nullopt when no number could be read
+ */
+[[nodiscard]] std::optional<float> parse_length_meters(std::string_view raw) {
+    constexpr double kFeetToMeters = 0.3048;
+    constexpr double kInchesToMeters = 0.0254;
+
+    const std::string value = normalize_value(raw);
+    if (value.empty()) return std::nullopt;
+
+    const char* begin = value.c_str();
+    char* end = nullptr;
+    const double number = std::strtod(begin, &end);
+    if (end == begin || !std::isfinite(number)) return std::nullopt;
+
+    const std::string suffix = normalize_value(std::string_view(end));
+
+    if (suffix.empty() || suffix == "m" || suffix == "meter" || suffix == "meters" ||
+        suffix == "metre" || suffix == "metres") {
+        return static_cast<float>(number);
+    }
+    if (suffix == "ft" || suffix == "feet" || suffix == "foot") {
+        return static_cast<float>(number * kFeetToMeters);
+    }
+    if (suffix.front() == '\'') {
+        // Feet and inches, "30'6\"". Inches are optional.
+        const char* inch_begin = suffix.c_str() + 1;
+        char* inch_end = nullptr;
+        const double inches = std::strtod(inch_begin, &inch_end);
+        const double extra = (inch_end != inch_begin && std::isfinite(inches)) ? inches : 0.0;
+        return static_cast<float>(number * kFeetToMeters + extra * kInchesToMeters);
+    }
+
+    // Unrecognised unit. Read as metres so the value is not thrown away.
+    return static_cast<float>(number);
+}
+
+/**
+ * @brief What one tag value says about a road feature
+ */
+enum class TagPresence : uint8_t {
+    Absent,     ///< Value not understood; treat the tag as if it were not there
+    Negative,   ///< Value denies the feature (no, none, separate)
+    Positive    ///< Value asserts the feature
+};
+
+/// Reads one value of a sided feature, ignoring which side it came from
+using ValueClassifier = TagPresence (*)(const std::string&);
+
+/**
+ * @brief Read the left/right/both tag family of one road feature
+ *
+ * OSM spells these two ways and both appear in the same extract. The classic
+ * form puts the side in the value (sidewalk=both, shoulder=left). The newer
+ * form puts the side in the key (sidewalk:left=yes, cycleway:both=lane,
+ * parking:right=lane).
+ *
+ * @param tags      Way tags
+ * @param base_keys Keys read on their own, whose value may name a side
+ * @param side_keys Keys read with a ":both", ":left", and ":right" suffix
+ * @param classify  Feature-specific reading of a value that does not name a side
+ * @return Sides carrying the feature, None when a tag denied it on every side,
+ *         Unknown when no tag of the family was present
+ */
+[[nodiscard]] SideFlags read_sided_tags(const TagMap& tags,
+                                        std::initializer_list<const char*> base_keys,
+                                        std::initializer_list<const char*> side_keys,
+                                        ValueClassifier classify) {
+    struct SideSuffix {
+        const char* suffix;     ///< Key suffix, including the colon
+        bool left;              ///< Suffix covers the left side
+        bool right;             ///< Suffix covers the right side
+    };
+    static constexpr SideSuffix kSideSuffixes[] = {
+        {":both",  true,  true},
+        {":left",  true,  false},
+        {":right", false, true},
+    };
+
+    bool tagged = false;
+    bool left = false;
+    bool right = false;
+
+    for (const char* key : base_keys) {
+        const std::string* raw = find_tag(tags, key);
+        if (!raw) continue;
+
+        const std::string value = normalize_value(*raw);
+        if (value == "both" || value == "left" || value == "right") {
+            tagged = true;
+            left = left || value != "right";
+            right = right || value != "left";
+            continue;
+        }
+
+        switch (classify(value)) {
+            case TagPresence::Positive:
+                tagged = true;
+                left = true;
+                right = true;
+                break;
+            case TagPresence::Negative:
+                tagged = true;
+                break;
+            case TagPresence::Absent:
+                break;
+        }
+    }
+
+    for (const char* key : side_keys) {
+        const std::string prefix(key);
+        for (const auto& side : kSideSuffixes) {
+            const std::string* raw = find_tag(tags, prefix + side.suffix);
+            if (!raw) continue;
+
+            switch (classify(normalize_value(*raw))) {
+                case TagPresence::Positive:
+                    tagged = true;
+                    left = left || side.left;
+                    right = right || side.right;
+                    break;
+                case TagPresence::Negative:
+                    tagged = true;
+                    break;
+                case TagPresence::Absent:
+                    break;
+            }
+        }
+    }
+
+    if (left && right) return SideFlags::Both;
+    if (left) return SideFlags::Left;
+    if (right) return SideFlags::Right;
+    return tagged ? SideFlags::None : SideFlags::Unknown;
+}
+
+/**
+ * @brief Read a sidewalk=* or sidewalk:<side>=* value
+ *
+ * sidewalk=separate means the footway is mapped as its own OSM way elsewhere in
+ * the extract, so it reads as Negative and therefore as SideFlags::None. That
+ * stops the profile builder synthesizing a second sidewalk on top of the way
+ * that is already there, which SideFlags::Unknown would have allowed.
+ *
+ * @param value Normalized tag value
+ * @return Presence of a sidewalk
+ */
+[[nodiscard]] TagPresence classify_sidewalk_value(const std::string& value) {
+    if (value == "no" || value == "none" || value == "separate") return TagPresence::Negative;
+    if (value == "yes" || value == "both" || value == "left" || value == "right")
+        return TagPresence::Positive;
+    return TagPresence::Absent;
+}
+
+/**
+ * @brief Read a cycleway=* or cycleway:<side>=* value
+ *
+ * The value names the kind of cycle infrastructure rather than a side. Only
+ * values that put a cycle lane on the carriageway count as present, so
+ * cycleway=opposite, which allows contraflow without marking a lane, does not.
+ *
+ * @param value Normalized tag value
+ * @return Presence of a cycle lane
+ */
+[[nodiscard]] TagPresence classify_cycleway_value(const std::string& value) {
+    if (value == "no" || value == "none" || value == "separate") return TagPresence::Negative;
+    if (value == "lane" || value == "track" || value == "opposite_lane" ||
+        value == "opposite_track" || value == "share_busway" || value == "shared_lane" ||
+        value == "yes")
+        return TagPresence::Positive;
+    return TagPresence::Absent;
+}
+
+/**
+ * @brief Read a parking:lane:<side>=* or parking:<side>=* value
+ *
+ * The value names the parking arrangement (parallel, diagonal, perpendicular,
+ * on_street, ...), so any value that is not a denial counts as present.
+ *
+ * @param value Normalized tag value
+ * @return Presence of on-street parking
+ */
+[[nodiscard]] TagPresence classify_parking_value(const std::string& value) {
+    if (value.empty()) return TagPresence::Absent;
+    if (value == "no" || value == "none" || value == "separate" ||
+        value == "no_parking" || value == "no_stopping" || value == "no_standing")
+        return TagPresence::Negative;
+    return TagPresence::Positive;
+}
+
+/**
+ * @brief Read a shoulder=* or shoulder:<side>=* value
+ * @param value Normalized tag value
+ * @return Presence of a shoulder
+ */
+[[nodiscard]] TagPresence classify_shoulder_value(const std::string& value) {
+    if (value == "no" || value == "none") return TagPresence::Negative;
+    if (value == "yes" || value == "both" || value == "left" || value == "right")
+        return TagPresence::Positive;
+    return TagPresence::Absent;
+}
+
+/**
+ * @brief Douglas-Peucker over indices rather than points
+ *
+ * Appends the kept indices of points[first..last] inclusive to @p keep. The
+ * result matches geometry::simplify() point for point; only the return form
+ * differs, because a road has to filter node_ids with the same set of survivors
+ * to keep the two vectors parallel.
+ *
+ * @param points  Polyline being simplified
+ * @param epsilon Maximum perpendicular deviation, in metres
+ * @param first   Index of the first point of the span
+ * @param last    Index of the last point of the span, greater than first
+ * @param keep    Receives the surviving indices, in order
+ */
+void simplify_indices(const std::vector<glm::dvec2>& points, double epsilon,
+                      size_t first, size_t last, std::vector<size_t>& keep) {
+    double max_dist = 0.0;
+    size_t max_idx = first;
+
+    for (size_t i = first + 1; i < last; ++i) {
+        const double dist =
+            geometry::point_to_line_distance(points[i], points[first], points[last]);
+        if (dist > max_dist) {
+            max_dist = dist;
+            max_idx = i;
+        }
+    }
+
+    if (max_dist > epsilon) {
+        simplify_indices(points, epsilon, first, max_idx, keep);
+        keep.pop_back();    // max_idx is re-added as the first point of the second half
+        simplify_indices(points, epsilon, max_idx, last, keep);
+    } else {
+        keep.push_back(first);
+        keep.push_back(last);
+    }
+}
+
+/**
+ * @brief What the simplification reference count learns about one OSM node
+ *
+ * Counted across every road, exactly as RoadGraph::build() counts, so the set of
+ * qualifying nodes here is the set the graph will later turn into GraphNodes.
+ */
+struct SimplifyNodeRefs {
+    /// Times any road polyline visits this node. A closed loop counts it twice.
+    uint32_t refs = 0;
+
+    /// True when the node is the first or last point of some road
+    bool endpoint = false;
+
+    /// A node the road graph derives topology from, so simplification must keep it
+    [[nodiscard]] bool qualifies() const { return refs >= 2 || endpoint; }
+};
+
+/// Reference counts by OSM node id, keyed exactly as RoadGraph::build() keys them
+using SimplifyRefMap = std::unordered_map<NodeId, SimplifyNodeRefs>;
+
+/**
+ * @brief Reference count every node visited by @p roads
+ *
+ * Mirrors RoadGraph::build() pass 1: every visit counts, whatever the layer, and
+ * the first and last point of each road are flagged as endpoints.
+ *
+ * @param roads Roads to count over
+ * @return Counts by OSM node id
+ */
+[[nodiscard]] SimplifyRefMap count_road_node_refs(const std::vector<Road>& roads) {
+    SimplifyRefMap refs;
+
+    size_t total_points = 0;
+    for (const auto& road : roads) total_points += road.node_ids.size();
+    refs.reserve(total_points);
+
+    for (const auto& road : roads) {
+        if (road.node_ids.size() != road.polyline.size()) continue;
+        if (road.node_ids.empty()) continue;
+
+        const size_t last = road.node_ids.size() - 1;
+        for (size_t i = 0; i <= last; ++i) {
+            SimplifyNodeRefs& info = refs[road.node_ids[i]];
+            ++info.refs;
+            if (i == 0 || i == last) info.endpoint = true;
+        }
+    }
+
+    return refs;
+}
+
+/**
+ * @brief Simplify a road centerline in place, keeping node_ids parallel
+ *
+ * geometry::simplify() returns points only, so calling it on polyline alone
+ * would leave node_ids the wrong size and RoadGraph::build() would drop the
+ * road. Both vectors are filtered by the same surviving indices instead.
+ *
+ * Parallelism is not the only invariant that matters. Node *identity* is what
+ * the road graph derives every junction from, and Douglas-Peucker guarantees
+ * only that the two ends of a span survive. A junction node interior to a
+ * straight through road deviates 0 m from the chord, so an unconstrained pass
+ * would delete it and turn a T-junction into a dead end floating on top of an
+ * uninterrupted edge. The road is therefore split at every node the graph will
+ * qualify, and Douglas-Peucker runs independently on each span between them:
+ * those nodes are span endpoints, so they are always kept, while the interior
+ * geometry still simplifies.
+ *
+ * @param road      Road to simplify
+ * @param tolerance Douglas-Peucker tolerance in metres
+ * @param refs      Node reference counts over every road, from count_road_node_refs()
+ */
+void simplify_road(Road& road, double tolerance, const SimplifyRefMap& refs) {
+    if (road.polyline.size() <= 2) return;
+
+    const bool has_node_ids = road.node_ids.size() == road.polyline.size();
+    const size_t last = road.polyline.size() - 1;
+
+    // Anchors: the two ends, plus every interior node the graph will qualify.
+    // Without node_ids there is no identity to protect and the whole road is one
+    // span, which is the plain Douglas-Peucker behaviour.
+    std::vector<size_t> anchors;
+    anchors.reserve(8);
+    anchors.push_back(0);
+    if (has_node_ids) {
+        for (size_t i = 1; i < last; ++i) {
+            const auto it = refs.find(road.node_ids[i]);
+            if (it != refs.end() && it->second.qualifies()) {
+                anchors.push_back(i);
+            }
+        }
+    }
+    anchors.push_back(last);
+
+    std::vector<size_t> keep;
+    keep.reserve(road.polyline.size());
+    for (size_t a = 0; a + 1 < anchors.size(); ++a) {
+        simplify_indices(road.polyline, tolerance, anchors[a], anchors[a + 1], keep);
+        if (a + 2 < anchors.size()) {
+            keep.pop_back();    // the next span re-adds this anchor as its first point
+        }
+    }
+    if (keep.size() >= road.polyline.size()) return;
+
+    std::vector<glm::dvec2> polyline;
+    std::vector<NodeId> node_ids;
+    polyline.reserve(keep.size());
+    if (has_node_ids) node_ids.reserve(keep.size());
+
+    for (size_t index : keep) {
+        polyline.push_back(road.polyline[index]);
+        if (has_node_ids) node_ids.push_back(road.node_ids[index]);
+    }
+
+    road.polyline = std::move(polyline);
+    road.node_ids = has_node_ids ? std::move(node_ids) : std::vector<NodeId>{};
+}
+
+} // namespace
+
 void OSMParser::process_roads() {
     if (!m_config.import_roads) return;
 
@@ -331,14 +809,17 @@ void OSMParser::process_roads() {
         // Skip unknown types that we don't want
         if (road_type == RoadType::Unknown) continue;
 
-        // Resolve coordinates
-        auto coords = resolve_way_coords(way);
+        // Resolve coordinates, keeping the node IDs parallel to them
+        std::vector<glm::dvec2> coords;
+        std::vector<NodeId> node_ids;
+        resolve_way_coords_with_ids(way, coords, node_ids);
         if (coords.size() < 2) continue;
 
         // Create road
         Road road;
         road.osm_id = way_id;
         road.polyline = std::move(coords);
+        road.node_ids = std::move(node_ids);
         road.type = road_type;
         road.width = estimate_road_width(road_type, way.tags);
         road.lanes = estimate_road_lanes(road_type, way.tags);
@@ -359,6 +840,34 @@ void OSMParser::process_roads() {
         road.is_bridge = way.tags.count("bridge") > 0 && way.tags.at("bridge") != "no";
         road.is_tunnel = way.tags.count("tunnel") > 0 && way.tags.at("tunnel") != "no";
 
+        // Topology tags. layer keeps a bridge from joining the road beneath it,
+        // and the junction and link flags change how the graph solves the node.
+        if (const auto layer = parse_tag_int(way.tags, "layer")) {
+            road.layer = *layer;
+        }
+
+        const std::string junction = tag_value(way.tags, "junction");
+        road.is_roundabout = (junction == "roundabout" || junction == "circular");
+
+        const std::string highway_value = normalize_value(highway_it->second);
+        road.is_link = highway_value.ends_with("_link");
+
+        // Cross-section tags, read by the profile builder
+        road.lanes_forward = parse_lane_count(way.tags, "lanes:forward");
+        road.lanes_backward = parse_lane_count(way.tags, "lanes:backward");
+
+        road.sidewalk = read_sided_tags(way.tags, {"sidewalk"}, {"sidewalk"},
+                                        classify_sidewalk_value);
+        road.cycleway = read_sided_tags(way.tags, {"cycleway"}, {"cycleway"},
+                                        classify_cycleway_value);
+        road.parking = read_sided_tags(way.tags, {}, {"parking:lane", "parking"},
+                                       classify_parking_value);
+        road.shoulder = read_sided_tags(way.tags, {"shoulder"}, {"shoulder"},
+                                        classify_shoulder_value);
+
+        road.surface = tag_value(way.tags, "surface");
+        road.smoothness = tag_value(way.tags, "smoothness");
+
         // Speed limit
         auto maxspeed_it = way.tags.find("maxspeed");
         if (maxspeed_it != way.tags.end()) {
@@ -367,12 +876,18 @@ void OSMParser::process_roads() {
             } catch (...) {}
         }
 
-        // Optional simplification
-        if (m_config.simplify_geometry && road.polyline.size() > 2) {
-            road.polyline = geometry::simplify(road.polyline, m_config.simplify_tolerance);
-        }
-
         m_data.roads.push_back(std::move(road));
+    }
+
+    // Optional simplification, run as a post-pass rather than inside the loop.
+    // Filters polyline and node_ids together so the two stay parallel, and needs
+    // the reference counts over *every* road to know which nodes the road graph
+    // will turn into junctions; see simplify_road().
+    if (m_config.simplify_geometry) {
+        const SimplifyRefMap refs = count_road_node_refs(m_data.roads);
+        for (auto& road : m_data.roads) {
+            simplify_road(road, m_config.simplify_tolerance, refs);
+        }
     }
 
     spdlog::info("OSM Parser: Processed {} roads", m_data.roads.size());
@@ -500,18 +1015,30 @@ void OSMParser::process_areas() {
 
 std::vector<glm::dvec2> OSMParser::resolve_way_coords(const OSMWay& way) const {
     std::vector<glm::dvec2> coords;
-    coords.reserve(way.node_refs.size());
+    std::vector<NodeId> node_ids;
+    resolve_way_coords_with_ids(way, coords, node_ids);
+    return coords;
+}
+
+void OSMParser::resolve_way_coords_with_ids(const OSMWay& way,
+                                            std::vector<glm::dvec2>& out_coords,
+                                            std::vector<NodeId>& out_node_ids) const {
+    out_coords.clear();
+    out_node_ids.clear();
+    out_coords.reserve(way.node_refs.size());
+    out_node_ids.reserve(way.node_refs.size());
 
     for (NodeId node_id : way.node_refs) {
         auto it = m_data.nodes.find(node_id);
         if (it != m_data.nodes.end()) {
             const auto& node = it->second;
             glm::dvec2 local = m_converter.wgs84_to_local(node.lat, node.lon);
-            coords.push_back(local);
+            // A node with no position is skipped from both outputs together, so
+            // out_node_ids[i] always describes out_coords[i].
+            out_coords.push_back(local);
+            out_node_ids.push_back(node_id);
         }
     }
-
-    return coords;
 }
 
 // ============================================================================
@@ -739,26 +1266,22 @@ float OSMParser::estimate_building_height(const TagMap& tags) const {
 }
 
 float OSMParser::estimate_road_width(RoadType type, const TagMap& tags) {
-    // Check for explicit width tag
-    auto width_it = tags.find("width");
-    if (width_it != tags.end()) {
-        try {
-            std::string w = width_it->second;
-            // Remove 'm' suffix
-            if (!w.empty() && (w.back() == 'm' || w.back() == 'M')) {
-                w.pop_back();
-            }
-            return std::stof(w);
-        } catch (...) {}
+    // Check for explicit width tag. Values carry units in the wild: "12",
+    // "12 m", "30 ft", "30'6\"".
+    if (const std::string* width_value = find_tag(tags, "width")) {
+        const auto meters = parse_length_meters(*width_value);
+        if (meters && *meters > 0.0f) {
+            return *meters;
+        }
     }
 
-    // Check lanes tag
-    auto lanes_it = tags.find("lanes");
-    if (lanes_it != tags.end()) {
-        try {
-            int lanes = std::stoi(lanes_it->second);
-            return static_cast<float>(lanes) * 3.5f;  // 3.5m per lane
-        } catch (...) {}
+    // Check lanes tag, then the directional lane tags when lanes is absent
+    int lanes = parse_lane_count(tags, "lanes");
+    if (lanes < 0) {
+        lanes = directional_lane_total(tags);
+    }
+    if (lanes > 0) {
+        return static_cast<float>(lanes) * 3.5f;  // 3.5m per lane
     }
 
     // Default widths by type
@@ -778,13 +1301,12 @@ float OSMParser::estimate_road_width(RoadType type, const TagMap& tags) {
 }
 
 int OSMParser::estimate_road_lanes(RoadType type, const TagMap& tags) {
-    // Check lanes tag
-    auto lanes_it = tags.find("lanes");
-    if (lanes_it != tags.end()) {
-        try {
-            return std::stoi(lanes_it->second);
-        } catch (...) {}
-    }
+    // Check lanes tag, then the directional lane tags when lanes is absent
+    const int lanes = parse_lane_count(tags, "lanes");
+    if (lanes > 0) return lanes;
+
+    const int directional = directional_lane_total(tags);
+    if (directional > 0) return directional;
 
     // Default lanes by type
     switch (type) {
