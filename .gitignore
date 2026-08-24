@@ -16,6 +16,10 @@ out/
 .cache/
 compile_commands.json
 
+# Machine-local CMake presets. CMakePresets.json IS committed; this one is where
+# per-machine overrides go so they never follow anyone into a commit.
+CMakeUserPresets.json
+
 # ═══════════════════════════════════════════════════════════════════
 # OS
 # ═══════════════════════════════════════════════════════════════════
@@ -42,6 +46,7 @@ docs/generated/
 
 # Keep compile_commands for clangd
 !build/compile_commands.json
+
 imgui.ini
 renderdoc/
 

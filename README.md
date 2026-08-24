@@ -60,11 +60,115 @@ brew install cmake ninja python zlib bzip2 expat
 git clone --recursive https://github.com/yourusername/stratum.git
 cd stratum
 
-# Configure
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+# Configure, build, run
+cmake --preset release
+cmake --build --preset release
+./build/release/bin/stratum
+```
 
-# Build && run
-cmake --build build -j$(nproc) && ./build/bin/stratum
+That is the whole thing. `CMakePresets.json` carries the generator, the build
+type, the compiler and the output directory, so there are no flags to remember
+and no way to end up with a build directory whose settings you have forgotten.
+
+### CMake Presets
+
+Presets need **CMake 3.25 or newer**. The project itself builds with 3.24 — if
+you are on exactly that, configure by hand as described under
+[Configuring without presets](#configuring-without-presets).
+
+```bash
+cmake --list-presets              # what is available
+cmake --preset <name>             # configure
+cmake --build --preset <name>     # build
+ctest --preset <name>             # test, where the preset has tests
+```
+
+Each preset builds into its own directory, `build/<preset-name>`, so a GCC tree
+and a Clang tree coexist without fighting over the same cache.
+
+| Preset | Build type | Toolchain | What it is for |
+| ------ | ---------- | --------- | -------------- |
+| `release` | Release | GCC | The default. Use this unless you have a reason not to. |
+| `debug` | Debug | GCC | Symbols, no optimisation. A city-sized extract is genuinely painful here. |
+| `relwithdebinfo` | RelWithDebInfo | GCC | Profiling, or a bug that only reproduces at speed. |
+| `clang-release` | Release | Clang + LLD | Same output, ~22% faster to build clean. |
+| `clang-debug` | Debug | Clang + LLD | |
+| `tests` | Release | GCC | Adds `stratum_tests` and `stratum_gpu_tests`. |
+| `clang-tests` | Release | Clang + LLD | |
+| `ci` | Release | GCC | What CI runs: tests, with Tracy and Python off. |
+| `docs` | Release | GCC | Adds the `doxygen` target. |
+
+#### Running the tests
+
+```bash
+cmake --workflow --preset tests
+```
+
+One command: configure, build, then run the suite. Or drive the three steps
+yourself if you only want to re-run the last one:
+
+```bash
+cmake --preset tests
+cmake --build --preset tests
+ctest --preset tests                      # everything
+ctest --preset tests -R RoadGraph         # one suite
+./build/tests/bin/stratum_tests RoadGraph # or straight to the binary
+```
+
+`stratum_tests` links `stratum_core` only — no SDL, no window, no device — so it
+runs anywhere. `stratum_gpu_tests` links the editor library; most of its suites
+are pure logic and run headless, and the few that genuinely need an
+`SDL_GPUDevice` skip themselves when there is not one.
+
+The `ci` preset turns off Tracy and Python deliberately. Neither is exercised by
+the suite, both are among the heaviest optional dependencies, and pybind11 wants
+Python development headers that a runner may not have.
+
+#### ccache
+
+The single biggest build-time win, and bigger than the compiler choice: roughly
+845 of 885 objects are vendored dependencies that never change but get rebuilt
+from scratch every time a build directory is wiped.
+
+It is opt-in rather than baked into the presets, because a preset that hardcoded
+it would fail to configure on any machine without it installed:
+
+```bash
+sudo pacman -S ccache            # or apt install ccache
+
+export STRATUM_LAUNCHER=ccache
+cmake --preset release           # picks it up from the environment
+```
+
+Leave `STRATUM_LAUNCHER` unset and the presets simply use no launcher.
+
+#### Local overrides
+
+Anything machine-specific goes in `CMakeUserPresets.json` beside this file. Git
+ignores it, so it will not follow you into a commit:
+
+```json
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "my-release",
+      "inherits": "release",
+      "cacheVariables": { "STRATUM_ENABLE_TRACY": "OFF" }
+    }
+  ]
+}
+```
+
+### Configuring without presets
+
+Presets are a convenience, not a requirement. The equivalent of `--preset tests`
+spelled out:
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATUM_BUILD_TESTS=ON
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
 ```
 
 ### Build Options
@@ -81,9 +185,15 @@ NB: Python scripting will *eventually*(tm) be always on
 | `STRATUM_BUILD_DOCS` | `OFF` | Build Doxygen documentation |
 | `STRATUM_USE_LLD` | `OFF` | Link with LLD instead of the default linker |
 
+Presets set these for you. To override one for a single configure, pass it
+alongside the preset:
+
 ```bash
-cmake -B build -DSTRATUM_ENABLE_TRACY=OFF -DSTRATUM_ENABLE_PYTHON=ON
+cmake --preset release -DSTRATUM_ENABLE_TRACY=OFF
 ```
+
+If you find yourself passing the same override every time, put it in a
+`CMakeUserPresets.json` that inherits the preset instead.
 
 ### Building with Clang
 
@@ -96,12 +206,12 @@ clean builds from an empty build directory:
 | Clang 22.1.8 + LLD | 112s | 7.5 MB |
 
 The compiler has to be chosen before `project()` runs, so it cannot be a
-`STRATUM_*` option — pass it at configure time into its own build directory:
+`STRATUM_*` option. The `clang-*` presets set it, along with LLD, and build into
+their own directory so the two toolchains never share a cache:
 
 ```bash
-cmake -S . -B build-clang -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DSTRATUM_USE_LLD=ON
+cmake --preset clang-release
+cmake --build --preset clang-release
 ```
 
 Notes:
@@ -112,10 +222,8 @@ Notes:
   `STRATUM_USE_LLD` works with GCC too.
 - **mold is not worth installing for this project.** Its advantage over LLD is
   in link time, which is not where the time goes here.
-- The single biggest win is **ccache** (`pacman -S ccache`), not the compiler:
-  roughly 845 of 885 objects are vendored dependencies that never change but get
-  rebuilt from scratch whenever the build directory is wiped.
-  Add `-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache`.
+- The single biggest win is **ccache**, not the compiler. See
+  [ccache](#ccache) above; it is a one-line environment variable with the presets.
 - Keep a GCC build dir around. GCC 16 caught two real problems in vendored
   dependencies that Clang did not, and CI builds with GCC.
 
@@ -128,11 +236,9 @@ To generate the API documentation using Doxygen:
 # Arch: sudo pacman -S doxygen graphviz
 # Ubuntu: sudo apt install doxygen graphviz
 
-# Configure with docs enabled
-cmake -B build -DSTRATUM_BUILD_DOCS=ON
-
-# Generate documentation
-cmake --build build --target docs
+# Configure and generate
+cmake --preset docs
+cmake --build --preset docs
 
 # Open in browser
 xdg-open docs/generated/html/index.html

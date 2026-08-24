@@ -1,0 +1,182 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+
+        "CMAKE_C_COMPILER_LAUNCHER": "$env{STRATUM_LAUNCHER}",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "$env{STRATUM_LAUNCHER}"
+      }
+    },
+
+    {
+      "name": "gcc",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+
+    {
+      "name": "clang",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "STRATUM_USE_LLD": "ON"
+      }
+    },
+
+    {
+      "name": "release",
+      "displayName": "Release (GCC)",
+      "description": "Default build. GCC catches things Clang does not, and CI uses it.",
+      "inherits": "gcc",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (GCC)",
+      "description": "Unoptimised with symbols. Expect a large, slow binary; a city extract is painful here.",
+      "inherits": "gcc",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "RelWithDebInfo (GCC)",
+      "description": "Optimised with symbols. Use this to profile or to debug something that only reproduces at speed.",
+      "inherits": "gcc",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+
+    {
+      "name": "clang-release",
+      "displayName": "Release (Clang + LLD)",
+      "description": "About 22% faster to build clean than GCC. The saving is Clang's front end, not the linker.",
+      "inherits": "clang",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "clang-debug",
+      "displayName": "Debug (Clang + LLD)",
+      "inherits": "clang",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+
+    {
+      "name": "tests",
+      "displayName": "Tests (GCC)",
+      "description": "Release plus the test targets. Builds stratum_tests and stratum_gpu_tests.",
+      "inherits": "gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STRATUM_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "clang-tests",
+      "displayName": "Tests (Clang + LLD)",
+      "inherits": "clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STRATUM_BUILD_TESTS": "ON"
+      }
+    },
+
+    {
+      "name": "ci",
+      "displayName": "CI",
+      "description": "Tests with the two heaviest optional dependencies off. Neither Tracy nor pybind11 is exercised by the suite, and pybind11 needs Python dev headers a runner may not have.",
+      "inherits": "gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STRATUM_BUILD_TESTS": "ON",
+        "STRATUM_ENABLE_TRACY": "OFF",
+        "STRATUM_ENABLE_PYTHON": "OFF"
+      }
+    },
+
+    {
+      "name": "docs",
+      "displayName": "Docs (Doxygen)",
+      "description": "Adds the docs target. Needs doxygen and graphviz on PATH.",
+      "inherits": "gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STRATUM_BUILD_DOCS": "ON"
+      }
+    }
+  ],
+
+  "buildPresets": [
+    { "name": "release",         "configurePreset": "release" },
+    { "name": "debug",           "configurePreset": "debug" },
+    { "name": "relwithdebinfo",  "configurePreset": "relwithdebinfo" },
+    { "name": "clang-release",   "configurePreset": "clang-release" },
+    { "name": "clang-debug",     "configurePreset": "clang-debug" },
+    { "name": "tests",           "configurePreset": "tests" },
+    { "name": "clang-tests",     "configurePreset": "clang-tests" },
+    { "name": "ci",              "configurePreset": "ci" },
+    {
+      "name": "docs",
+      "configurePreset": "docs",
+      "targets": ["docs"]
+    }
+  ],
+
+  "testPresets": [
+    {
+      "name": "tests",
+      "configurePreset": "tests",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "clang-tests",
+      "configurePreset": "clang-tests",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci",
+      "output": { "outputOnFailure": true, "verbosity": "default" },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    }
+  ],
+
+  "workflowPresets": [
+    {
+      "name": "tests",
+      "displayName": "Configure, build and run the test suite",
+      "steps": [
+        { "type": "configure", "name": "tests" },
+        { "type": "build",     "name": "tests" },
+        { "type": "test",      "name": "tests" }
+      ]
+    },
+    {
+      "name": "ci",
+      "displayName": "What CI runs",
+      "steps": [
+        { "type": "configure", "name": "ci" },
+        { "type": "build",     "name": "ci" },
+        { "type": "test",      "name": "ci" }
+      ]
+    }
+  ]
+}
