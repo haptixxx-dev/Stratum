@@ -12,7 +12,9 @@
 #pragma once
 
 #include "renderer/gpu_buffer_pool.hpp"
+#include "renderer/material_library.hpp"
 #include "renderer/mesh.hpp"
+#include "renderer/texture.hpp"
 
 #include <SDL3/SDL.h>
 #include <glm/glm.hpp>
@@ -136,18 +138,23 @@ struct alignas(16) SceneUniforms {
     glm::vec4 sun_color;         // rgb = color, a = ambient intensity
     glm::vec4 fog_params;        // x = start, y = end, z = density, w = enabled
     glm::vec4 fog_color;         // rgb = color, a = unused
-    glm::vec4 pbr_params;        // x = metallic, y = roughness, z = ao, w = unused
+    /// RESERVED. Nothing reads this: mesh_pbr.frag takes metallic, roughness and
+    /// ao from the per-material block (MaterialUniforms::pbr_params) instead, so
+    /// this member exists only to keep the std140 layout of the block matching the
+    /// shader's. Do not add a control for it without adding a shader read first.
+    glm::vec4 pbr_params;
 };
 
-/**
- * @brief PBR Material data for material buffer
- */
-struct alignas(16) GPUMaterial {
-    glm::vec4 base_color;        // rgb = albedo, a = alpha
-    glm::vec4 pbr_params;        // r = metallic, g = roughness, b = ao, a = emissive
-    glm::vec4 emissive_color;    // rgb = emissive, a = intensity
-    glm::uvec4 texture_indices;  // x = albedo, y = normal, z = metallic_roughness, w = emissive
-};
+// GPUMaterial used to be declared here: a four-vec4 block with bindless texture
+// indices, never constructed, never pushed, never read by any shader. It has been
+// REMOVED rather than left as a second, plausible-looking definition of the same
+// thing. The real per-draw material block is MaterialUniforms in
+// material_library.hpp, which is three vec4s, matches an actual uniform block in
+// assets/shaders/mesh_pbr.frag, and binds real textures through
+// GPUTextureManager. Its bindless texture_indices were aspirational: SDL_GPU has
+// no bindless path, textures are bound per draw through
+// SDL_BindGPUFragmentSamplers, and pretending otherwise is what kept the texture
+// work looking half-done for longer than it was.
 
 /**
  * @brief Shader rendering mode - can be switched at runtime
@@ -526,6 +533,10 @@ public:
     struct FrameStats {
         uint32_t draw_calls = 0;
         uint32_t triangles = 0;
+        /// Material binds actually issued. Compare against draw_calls: a value
+        /// approaching it means the submesh ranges are not sorted by material and
+        /// every range is paying for a uniform push and a sampler bind.
+        uint32_t material_binds = 0;
     };
     /// Stats for the last COMPLETED frame. The UI panels draw before render_3d,
     /// so reporting the in-progress frame would always show zero.
@@ -554,17 +565,14 @@ public:
      */
     ShaderMode get_shader_mode() const { return m_current_shader_mode; }
 
-    /**
-     * @brief Set PBR material parameters (only used in PBR mode)
-     */
-    void set_pbr_params(float metallic, float roughness, float ao = 1.0f);
-
-    /**
-     * @brief Get current PBR parameters
-     */
-    glm::vec3 get_pbr_params() const { 
-        return glm::vec3(m_scene_uniforms.pbr_params); 
-    }
+    // set_pbr_params()/get_pbr_params() used to live here, driving
+    // SceneUniforms::pbr_params from three Render Settings sliders. They have been
+    // REMOVED, not deprecated: mesh_pbr.frag reads metallic, roughness and ao from
+    // the MATERIAL block now, and never touches scene.pbr_params -- the compiled
+    // module does not contain a single access to member 5 of the scene struct, as
+    // the MaterialUniforms suite asserts. The sliders moved no pixel at any value.
+    // The uniform FIELD stays in SceneUniforms because it is part of the block's
+    // std140 layout; see its declaration.
 
     /**
      * @brief Set MSAA level
@@ -592,15 +600,233 @@ public:
     }
 
     /**
-     * @brief Draw a mesh with the given transform
-     * @param mesh_id Mesh handle from upload_mesh()
-     * @param model Model transform matrix
-     * @param color_tint Optional color tint (default white = no tint)
-     * @param material_id Material index for PBR (default 0)
+     * @brief Draw a mesh with the given transform, one draw per material range
+     *
+     * The mesh's SubMesh ranges tile its index buffer, and each range is bound to
+     * its own material before being drawn -- see bind_material(). A mesh with no
+     * ranges is one implicit range of @p default_material.
+     *
+     * @param mesh_id    Mesh handle from upload_mesh()
+     * @param model      Model transform matrix
+     * @param color_tint Optional color tint (default white = no tint). Multiplied
+     *                   into the material's base_color, not a replacement for it.
+     * @param default_material Material for geometry that carries no tag of its own
+     *
+     * @par The parameter this replaces
+     * draw_mesh() used to take `uint32_t material_id = 0`, which was threaded
+     * through the whole call chain and never read by anything: no shader had a
+     * material index, no material table existed, and every caller left it at 0.
+     * It is REPLACED rather than deleted because there is a real need behind it --
+     * terrain, water and building meshes are produced by builders that predate
+     * MaterialId and emit no submeshes at all, so without a per-draw default they
+     * would every one of them draw as MaterialId::Default grey. A MaterialKey is
+     * the honest form of what the uint32_t was pretending to be.
+     *
+     * @p default_material substitutes in exactly two places, and nowhere else:
+     * for the implicit whole-mesh range of a mesh with no submeshes, and for an
+     * explicit range whose key is {MaterialId::Default, 0}. A range that was
+     * deliberately tagged always wins over it.
+     *
+     * @note Materials are only bound in ShaderMode::PBR. The simple shader has no
+     *       samplers and no material uniform block, so in ShaderMode::Simple this
+     *       behaves exactly as before: every range draws with the bound pipeline.
      */
     void draw_mesh(uint32_t mesh_id, const glm::mat4& model = glm::mat4(1.0f),
                    const glm::vec4& color_tint = glm::vec4(1.0f),
-                   uint32_t material_id = 0);
+                   MaterialKey default_material = MaterialKey{});
+
+    // === Materials ===
+
+    /**
+     * @brief Install the material library draw_mesh() resolves keys against
+     *
+     * Not owned; must outlive the renderer or be cleared with nullptr first.
+     * With no library installed, materials are not bound at all and drawing is
+     * unchanged from before this phase -- which is also the fallback if
+     * initialisation of the material system fails, so a broken material set
+     * degrades to the old untextured look instead of to a black screen.
+     */
+    void set_material_library(MaterialLibrary* library);
+
+    /// The installed library, or nullptr.
+    [[nodiscard]] MaterialLibrary* material_library() const { return m_material_library; }
+
+    /**
+     * @brief Install the texture manager whose handles the materials name
+     *
+     * Not owned. Also gives the renderer the manager to drive: its staged texture
+     * copies are flushed inside the renderer's existing per-frame copy pass, and
+     * its retired transfer buffers are drained alongside the renderer's own
+     * retired buffer ranges. See GPUTextureManager's class note.
+     */
+    void set_texture_manager(GPUTextureManager* textures);
+
+    /// The installed texture manager, or nullptr.
+    [[nodiscard]] GPUTextureManager* texture_manager() const { return m_texture_manager; }
+
+    /**
+     * @brief Bind the material for a key: push its uniforms and bind its samplers
+     *
+     * Called per submesh range from draw_mesh(). Resolves @p key through
+     * MaterialLibrary::resolve(), pushes MaterialUniforms to fragment uniform slot
+     * kMaterialUniformSlot, and binds albedo, normal and ORM as one
+     * SDL_BindGPUFragmentSamplers call at first slot kAlbedoSamplerSlot.
+     *
+     * Redundant binds are skipped: a mesh whose ranges are already sorted by
+     * material (Mesh::sort_submeshes_by_material) issues at most one bind per
+     * distinct material, and consecutive meshes sharing a material issue none.
+     * The cached key is invalidated whenever a render pass opens, because SDL_GPU
+     * bindings do not survive a pass.
+     *
+     * Switching between an opaque material and one that needs the decal pipeline
+     * rebinds the pipeline, since blending and depth bias are pipeline state in
+     * SDL_GPU and cannot be changed by a bind.
+     *
+     * @param key (slot, variant) to bind. Resolution never fails.
+     *
+     * @note No-op outside a render pass and in ShaderMode::Simple. With materials
+     *       disabled or no library installed it binds the NEUTRAL set instead of
+     *       doing nothing -- see @ref MaterialBindMode.
+     */
+    void bind_material(MaterialKey key);
+
+    /**
+     * @brief What bind_material() must do for a given renderer state
+     *
+     * Split out of bind_material() because getting it wrong is a HARD CRASH rather
+     * than a wrong pixel, and because a pure function of five booleans can be
+     * tested without a device, a window or a render pass.
+     *
+     * The PBR fragment shader is created with num_samplers = kMaterialSamplerCount
+     * and num_uniform_buffers = kPbrFragmentUniformBufferCount. SDL takes those
+     * counts at their word and builds a pipeline layout from them, so EVERY draw
+     * through the PBR pipeline must leave all three sampler slots and both uniform
+     * slots written. SDL's own frontend enforces it:
+     * SDL_GPU_CheckGraphicsBindings() fires
+     * `SDL_assert_release(!"Missing fragment sampler binding!")` once per unbound
+     * slot per draw, under `debug_mode`, which GPURenderer::init() passes as a
+     * literal true in every build -- and SDL_assert_release survives NDEBUG. The
+     * Vulkan backend behind it writes VK_NULL_HANDLE image views into a
+     * COMBINED_IMAGE_SAMPLER descriptor, which is invalid Vulkan.
+     *
+     * So "materials are off" can never mean "bind nothing" while the PBR pipeline
+     * is bound. It means bind the NEUTRAL set: a default-constructed
+     * MaterialUniforms and the texture manager's three built-in 1x1 maps.
+     */
+    enum class MaterialBindMode : uint8_t {
+        Skip,       ///< Not the PBR pipeline; the simple shader declares no material resources
+        Neutral,    ///< PBR pipeline bound but no material to resolve: bind the built-in set
+        Full        ///< Resolve the key and bind its material
+    };
+
+    /**
+     * @brief Decide the bind mode for a renderer state
+     *
+     * @param mode                    Current shader mode
+     * @param pbr_pipeline_available  Whether the PBR pipelines AND a texture
+     *                                manager exist, i.e. GPURenderer::pbr_path_available()
+     * @param materials_enabled       The set_materials_enabled() debug toggle
+     * @param has_library             Whether a MaterialLibrary is installed
+     * @return The mode bind_material() must take
+     */
+    [[nodiscard]] static constexpr MaterialBindMode material_bind_mode(
+            ShaderMode mode, bool pbr_pipeline_available, bool materials_enabled,
+            bool has_library) {
+        if (mode != ShaderMode::PBR || !pbr_pipeline_available) return MaterialBindMode::Skip;
+        if (!materials_enabled || !has_library) return MaterialBindMode::Neutral;
+        return MaterialBindMode::Full;
+    }
+
+    /**
+     * @brief Whether the PBR path can be drawn at all
+     *
+     * Both PBR pipelines AND a texture manager. The texture manager is part of the
+     * answer because the PBR fragment shader declares three samplers that SOMETHING
+     * must fill on every draw, and with no manager there is not one legal texture
+     * to bind -- so PBR is refused rather than entered and crashed out of. This is
+     * the single predicate behind set_shader_mode(), bind_mesh_pipeline(),
+     * draw_mesh()'s uniform layout choice and bind_material(), so they cannot
+     * disagree about which pipeline is bound.
+     */
+    [[nodiscard]] bool pbr_path_available() const {
+        return m_pbr_pipeline != nullptr && m_pbr_pipeline_wireframe != nullptr
+            && m_texture_manager != nullptr;
+    }
+
+    /// Whether this frame's meshes are drawing through the PBR pipeline.
+    [[nodiscard]] bool using_pbr() const {
+        return m_current_shader_mode == ShaderMode::PBR && pbr_path_available();
+    }
+
+    /**
+     * @brief The depth-bias factors a decal pipeline gets for an authored bias
+     *
+     * @warning The SIGN is set by REVERSE-Z and both terms must carry it. The depth
+     *          test is GREATER and the near plane is at depth 1, so "towards the
+     *          viewer" is a LARGER depth value. MaterialDef::depth_bias is authored
+     *          negative for that reason (kMarkingDepthBias = -2) and is negated
+     *          here. The SLOPE factor was left at a hardcoded -1 while the constant
+     *          was negated, so the two terms opposed -- and the slope term is the
+     *          larger by two orders of magnitude at exactly the grazing angles the
+     *          bias exists for (Vulkan computes `o = m * slope + r * constant`;
+     *          with D32_FLOAT, r is ~5e-10 while m is ~4.5e-5 for a road surface
+     *          seen near ground level). The result was markings pushed AWAY from
+     *          the camera and occluded by their own carriageway beyond ~13 m,
+     *          strictly worse than no bias at all.
+     *
+     * @param authored MaterialDef::depth_bias, negative to pull towards the camera
+     * @return {constant, slope}, both in SDL_GPURasterizerState's units
+     */
+    struct DecalDepthBias {
+        float constant = 0.0f;
+        float slope = 0.0f;
+    };
+    [[nodiscard]] static constexpr DecalDepthBias decal_depth_bias(float authored) {
+        if (authored == 0.0f) return DecalDepthBias{ 0.0f, 0.0f };
+        const float sign = (authored < 0.0f) ? 1.0f : -1.0f;
+        return DecalDepthBias{ -authored, sign };
+    }
+
+    /**
+     * @brief Cache key for a decal pipeline's depth bias
+     *
+     * Quantised to 1/16 over the panel's [-16, 16] range so a slider DRAG cannot
+     * mint a pipeline per pixel of mouse travel, and so two biases that differ
+     * below the quantum share one pipeline instead of two identical ones.
+     *
+     * @param depth_bias MaterialDef::depth_bias
+     * @return A key; equal keys mean an interchangeable pipeline
+     */
+    [[nodiscard]] static uint32_t decal_bias_key(float depth_bias);
+
+    /// Quantised bias a decal_bias_key() names. The value actually baked in.
+    [[nodiscard]] static float decal_bias_from_key(uint32_t key);
+
+    /// Largest depth-bias magnitude a decal pipeline is built for. Matches the
+    /// Materials panel's DragFloat range.
+    static constexpr float kMaxDecalDepthBias = 16.0f;
+
+    /// Distinct decal pipelines kept alive at once. A drag past this many distinct
+    /// quantised values falls back to the markings pipeline and says so once.
+    static constexpr size_t kMaxDecalPipelines = 32;
+
+    /**
+     * @brief Turn material binding off without tearing the library down
+     *
+     * A debug toggle for the stats panel: with materials disabled every range
+     * draws with the NEUTRAL material -- a default MaterialUniforms and the three
+     * built-in 1x1 maps -- which is the closest legal thing to the pre-material
+     * look and therefore the A/B a bug report needs. Enabled by default.
+     *
+     * @note It cannot mean "bind nothing". The PBR pipeline declares three
+     *       fragment samplers and two fragment uniform buffers whatever this flag
+     *       says; leaving them unwritten aborts the process inside
+     *       SDL_DrawGPUIndexedPrimitives. See @ref MaterialBindMode.
+     */
+    void set_materials_enabled(bool enabled);
+
+    /// Whether material binding is active. False also when no library is installed.
+    [[nodiscard]] bool materials_enabled() const;
 
     /**
      * @brief Draw a mesh directly without caching (for dynamic geometry)
@@ -647,16 +873,68 @@ public:
      * @param stage Vertex or fragment stage
      * @param num_uniform_buffers Uniform buffer count declared by the shader
      * @param num_storage_buffers Storage buffer count declared by the shader
+     * @param num_samplers Combined image samplers declared by the shader
      * @return Shader handle, or nullptr on failure (caller owns it)
+     *
+     * The counts are not advisory: SDL validates them against the SPIR-V and
+     * SDL_CreateGPUShader fails outright if a shader declares more resources than
+     * it is told about. mesh_pbr.frag now declares two fragment uniform buffers
+     * (scene at set 3 binding 0, material at set 3 binding 1) and three fragment
+     * samplers (set 2 bindings 0-2), so it must be loaded with
+     * kPbrFragmentUniformBufferCount and kMaterialSamplerCount from
+     * material_library.hpp rather than with literals -- those constants are the
+     * ones the GLSL is documented against.
+     *
+     * @p num_samplers defaults to 0, so the existing simple-shader and Im3d call
+     * sites need no change.
+     *
      * @note Public so auxiliary backends (e.g. the Im3d backend) can reuse it.
      */
     SDL_GPUShader* load_shader(const char* path, SDL_GPUShaderStage stage,
-                                int num_uniform_buffers, int num_storage_buffers);
+                                int num_uniform_buffers, int num_storage_buffers,
+                                int num_samplers = 0);
 
 private:
     bool create_pipelines();
     bool create_simple_pipelines();
     bool create_pbr_pipelines();
+
+    /**
+     * @brief Build the decal variant of the PBR pipeline
+     *
+     * Identical to the PBR pipeline except for alpha blending
+     * (SRC_ALPHA / ONE_MINUS_SRC_ALPHA, depth writes off, depth test on) and a
+     * constant depth bias.
+     *
+     * It exists because MaterialDef::alpha_blend and MaterialDef::depth_bias are
+     * PIPELINE state in SDL_GPU -- SDL_GPUColorTargetBlendState and
+     * SDL_GPURasterizerState are baked into SDL_CreateGPUGraphicsPipeline and
+     * there is no command to change either inside a render pass. A material system
+     * that treats them as per-draw values would silently draw every marking opaque
+     * and z-fighting. Two pipelines, switched by
+     * MaterialDef::needs_decal_pipeline(), is the whole mechanism.
+     *
+     * @note MSAA rebuilds pipelines, so this one is created and released with the
+     *       rest of the PBR set, never separately.
+     */
+    /// @param depth_bias Authored MaterialDef::depth_bias this pipeline bakes in
+    /// @return The pipeline, or nullptr after logging
+    SDL_GPUGraphicsPipeline* create_decal_pipeline(float depth_bias);
+
+    /**
+     * @brief The decal pipeline for an authored depth bias, created on demand
+     *
+     * MaterialDef::depth_bias is PIPELINE state, so honouring an edited value
+     * means a pipeline per distinct value rather than a uniform. The cache is
+     * keyed on decal_bias_key() and capped at kMaxDecalPipelines; the markings
+     * bias is created eagerly with the rest of the PBR set so that a failure is
+     * reported at init rather than on the first marking drawn.
+     *
+     * @param depth_bias Authored bias, negative to pull towards the camera
+     * @return A pipeline, or nullptr if none could be built
+     */
+    SDL_GPUGraphicsPipeline* decal_pipeline_for(float depth_bias);
+
     bool load_shaders();
     bool load_simple_shaders();
     bool load_pbr_shaders();
@@ -681,6 +959,55 @@ private:
     SDL_GPUGraphicsPipeline* m_pbr_pipeline_wireframe = nullptr;
     SDL_GPUShader* m_pbr_vertex_shader = nullptr;
     SDL_GPUShader* m_pbr_fragment_shader = nullptr;
+
+    /// Alpha-blended, depth-biased variants of m_pbr_pipeline, one per distinct
+    /// quantised MaterialDef::depth_bias. See decal_pipeline_for(). Owns every
+    /// pipeline in it; release_pipelines() is the only place they are destroyed.
+    std::unordered_map<uint32_t, SDL_GPUGraphicsPipeline*> m_decal_pipelines;
+
+    /// The decal pipeline for MaterialLibrary::kMarkingDepthBias, built eagerly
+    /// with the rest of the PBR set and also owned by m_decal_pipelines. Non-null
+    /// is what "the decal path is available" means.
+    SDL_GPUGraphicsPipeline* m_pbr_pipeline_decal = nullptr;
+
+    /// Whether the "too many decal pipelines" warning has already been logged.
+    bool m_decal_cap_warned = false;
+
+    // === Material state ===
+
+    MaterialLibrary* m_material_library = nullptr;   ///< Not owned
+    GPUTextureManager* m_texture_manager = nullptr;  ///< Not owned
+
+    /// Debug toggle behind set_materials_enabled().
+    bool m_materials_enabled = true;
+
+    /**
+     * @brief The material currently bound, for redundant-bind elimination
+     *
+     * Valid only while m_material_bound is true. Both are cleared by
+     * reset_material_binding() whenever a render pass opens or the pipeline is
+     * rebound, because SDL_GPU bindings do not survive either and a stale cache
+     * would skip the bind that the new pass needs.
+     */
+    MaterialKey m_bound_material{};
+    bool m_material_bound = false;
+
+    /// True when the last bind was the NEUTRAL set rather than a resolved key, so
+    /// that re-enabling materials cannot be skipped by a cached MaterialKey{} that
+    /// happens to equal the next key asked for.
+    bool m_neutral_material_bound = false;
+
+    /// The pipeline bind_mesh_pipeline() or bind_material() last bound, so a
+    /// switch between the opaque pipeline and one of several decal pipelines is
+    /// decided by identity rather than by a boolean that cannot tell two decal
+    /// pipelines apart.
+    SDL_GPUGraphicsPipeline* m_bound_pipeline = nullptr;
+
+    /// Bind the built-in neutral material. See @ref MaterialBindMode.
+    void bind_neutral_material();
+
+    /// Forget the cached material bind. Called when a render pass opens.
+    void reset_material_binding();
 
     // Render state
     FillMode m_current_fill_mode = FillMode::Solid;
@@ -885,6 +1212,24 @@ public:
     [[nodiscard]] size_t upload_failures() const { return m_upload_failures; }
     /// Meshes staged but not yet copied to the GPU.
     [[nodiscard]] size_t pending_upload_count() const { return m_pending_uploads.size(); }
+
+    /**
+     * @brief Device bytes held by the installed texture manager, 0 if none
+     *
+     * Deliberately SEPARATE from resident_bytes() rather than added into it.
+     * resident_bytes() is not merely a stat: it is the quantity evict_to_budget()
+     * drives against MemoryBudget::max_resident_bytes by releasing MESHES.
+     * Folding texture bytes into it would let a large material set push the
+     * renderer over budget and make it evict geometry to reclaim bytes that no
+     * amount of mesh eviction can free -- geometry would stream out, the number
+     * would not move, and the renderer would thrash until the budget warning
+     * fired every 300 frames. The panel that wants a single VRAM figure should
+     * add the two itself.
+     */
+    [[nodiscard]] size_t texture_bytes() const;
+
+    /// Live texture count in the installed manager, including its four fallbacks.
+    [[nodiscard]] size_t texture_count() const;
 
     /**
      * @brief Meshes evicted to stay inside the budget since startup

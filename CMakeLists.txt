@@ -162,12 +162,16 @@ add_library(stratum_editor_lib STATIC
     # Renderer
     src/renderer/gpu_renderer.cpp
     src/renderer/gpu_buffer_pool.cpp
+    src/renderer/texture.cpp
+    src/renderer/material_library.cpp
+    src/renderer/procedural_texture.cpp
 
     # Editor
     src/editor/editor.cpp
     src/editor/camera.cpp
     src/editor/im3d_impl.cpp
     src/editor/panels/procgen_panel.cpp
+    src/editor/panels/material_panel.cpp
 )
 
 target_include_directories(stratum_editor_lib PUBLIC
@@ -218,6 +222,93 @@ endif()
 # ═══════════════════════════════════════════════════════════════════
 add_executable(stratum src/main.cpp)
 target_link_libraries(stratum PRIVATE stratum_editor_lib)
+
+# ═══════════════════════════════════════════════════════════════════
+# SHADERS (GLSL -> SPIR-V)
+# ═══════════════════════════════════════════════════════════════════
+# assets/shaders holds GLSL sources AND the .spv the runtime actually loads, and
+# until now nothing connected them: editing mesh_pbr.frag changed nothing until
+# somebody remembered to run glslc by hand. A checked-in .spv that no longer
+# matches its source is a trap that costs an afternoon, so the compile is a build
+# step.
+#
+# Three things here look wrong and are deliberate:
+#
+#  1. The .spv is written back into the SOURCE tree, not the build tree. The
+#     runtime path is SDL_GetBasePath() + "../../assets/shaders/...", and the
+#     .spv are checked in, so a build-tree output would compile shaders nobody
+#     loads.
+#  2. glslc is OPTIONAL. A checkout without it must still build against the
+#     committed .spv, hence the find_program guard and the message below rather
+#     than a REQUIRED that fails configuration.
+#  3. --target-env=vulkan1.0 matches what SDL's Vulkan backend consumes. A newer
+#     target env emits SPIR-V that SDL_CreateGPUShader may reject.
+#
+# Incremental by construction: add_custom_command re-runs only when its DEPENDS
+# source is newer than its OUTPUT. No depfile is generated -- glslc's -MD writes
+# the .d next to the output, which would litter the source tree, and none of
+# these four shaders uses #include. Add one here if that ever changes.
+find_program(STRATUM_GLSLC NAMES glslc HINTS /usr/bin /usr/sbin /usr/local/bin)
+
+set(STRATUM_SHADER_SOURCES
+    mesh.vert
+    mesh.frag
+    mesh_pbr.vert
+    mesh_pbr.frag
+)
+
+set(STRATUM_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders)
+
+if(STRATUM_GLSLC)
+    message(STATUS "Shader compiler: ${STRATUM_GLSLC}")
+
+    set(STRATUM_SPV_OUTPUTS "")
+    foreach(shader IN LISTS STRATUM_SHADER_SOURCES)
+        add_custom_command(
+            OUTPUT  ${STRATUM_SHADER_DIR}/${shader}.spv
+            COMMAND ${STRATUM_GLSLC}
+                    --target-env=vulkan1.0
+                    -O
+                    ${STRATUM_SHADER_DIR}/${shader}
+                    -o ${STRATUM_SHADER_DIR}/${shader}.spv
+            DEPENDS ${STRATUM_SHADER_DIR}/${shader}
+            COMMENT "glslc ${shader}"
+            VERBATIM
+        )
+        list(APPEND STRATUM_SPV_OUTPUTS ${STRATUM_SHADER_DIR}/${shader}.spv)
+    endforeach()
+
+    add_custom_target(stratum_shaders ALL DEPENDS ${STRATUM_SPV_OUTPUTS})
+
+    # The editor library loads the .spv at runtime, so the executable is what has
+    # to wait for them. A link-time dependency is not needed and would serialise
+    # the build for no reason.
+    add_dependencies(stratum stratum_shaders)
+else()
+    # Say exactly what is missing, what the consequence is, and how to fix it.
+    # A build that silently used stale SPIR-V is the failure mode this avoids.
+    set(STRATUM_MISSING_SPV "")
+    foreach(shader IN LISTS STRATUM_SHADER_SOURCES)
+        if(NOT EXISTS ${STRATUM_SHADER_DIR}/${shader}.spv)
+            list(APPEND STRATUM_MISSING_SPV ${shader}.spv)
+        endif()
+    endforeach()
+
+    if(STRATUM_MISSING_SPV)
+        list(JOIN STRATUM_MISSING_SPV ", " STRATUM_MISSING_SPV_TEXT)
+        message(FATAL_ERROR
+            "glslc was not found and these pre-compiled shaders are missing: "
+            "${STRATUM_MISSING_SPV_TEXT}. Stratum cannot start without them. Install "
+            "shaderc (Arch: pacman -S shaderc) and re-configure, or pass "
+            "-DSTRATUM_GLSLC=/path/to/glslc.")
+    else()
+        message(WARNING
+            "glslc was not found, so assets/shaders/*.glsl will NOT be compiled. "
+            "The build will use the committed .spv, which may be older than the "
+            "GLSL sources next to them. Install shaderc (Arch: pacman -S shaderc) "
+            "and re-configure, or pass -DSTRATUM_GLSLC=/path/to/glslc.")
+    endif()
+endif()
 
 # ═══════════════════════════════════════════════════════════════════
 # TESTS
