@@ -34,7 +34,15 @@ void main() {
     mat3 normal_mat = mat3(uniforms.normal_matrix);
     frag_normal = normalize(normal_mat * in_normal);
     
-    // Tangent space for normal mapping
+    // Tangent space for normal mapping.
+    //
+    // HANDEDNESS, verified against Mesh::compute_tangents() in
+    // src/renderer/mesh.hpp rather than assumed. That function stores
+    //     w = (dot(cross(N, T), B) < 0) ? -1 : +1
+    // for the per-triangle T and B it derives from the UV gradient, so the
+    // bitangent it encodes is B = cross(N, T) * w. That is the reconstruction
+    // below, and it is also the glTF / MikkTSpace convention. Reversing the
+    // cross operands, or dropping w, mirrors every normal-map detail.
     frag_tangent = normalize(normal_mat * in_tangent.xyz);
     frag_bitangent = cross(frag_normal, frag_tangent) * in_tangent.w;
     

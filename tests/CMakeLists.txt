@@ -199,16 +199,107 @@ endif()
 # Guarded on the implementation file existing so that a tree without
 # gpu_buffer_pool.cpp still configures and still builds stratum_tests.
 if(TARGET stratum_editor_lib AND EXISTS ${CMAKE_SOURCE_DIR}/src/renderer/gpu_buffer_pool.cpp)
-    add_executable(stratum_gpu_tests
+    set(STRATUM_GPU_TEST_SOURCES
         framework.cpp
         renderer/test_gpu_buffer_pool.cpp
         renderer/test_gpu_upload_batch.cpp
     )
 
+    # Suites needing no SDL_GPUDevice. GPUBufferPool is the only one that does,
+    # and it skips itself when no backend is available; everything listed here
+    # runs unconditionally, so none of them is labelled "gpu".
+    set(STRATUM_GPU_TEST_SUITES
+        GPUUploadBatch
+    )
+
+    # ── Material system ────────────────────────────────────────────────────
+    # MaterialUniforms is a header-only struct, so its layout suite compiles and
+    # links with nothing more than material_library.hpp. It is the cheapest
+    # possible guard against the one failure that is neither a compile error nor
+    # a validation error: the C++ block and the GLSL block drifting apart.
+    if(EXISTS ${CMAKE_SOURCE_DIR}/src/renderer/material_library.hpp)
+        list(APPEND STRATUM_GPU_TEST_SOURCES renderer/test_material_uniforms.cpp)
+        list(APPEND STRATUM_GPU_TEST_SUITES MaterialUniforms)
+    endif()
+
+    # The MaterialLibrary and ProceduralTexture suites need their implementation
+    # translation units linked in. Guarded on the sources existing so a tree
+    # part-way through this phase still configures and still builds everything
+    # else, exactly as the gpu_buffer_pool.cpp guard above does.
+    #
+    # Both suites are DEVICE-INDEPENDENT despite living in this executable:
+    # material_library.hpp and procedural_texture.hpp include SDL through
+    # texture.hpp, which keeps them out of stratum_tests, but neither suite
+    # creates a device, a window, or an SDL subsystem.
+    if(EXISTS ${CMAKE_SOURCE_DIR}/src/renderer/material_library.cpp)
+        list(APPEND STRATUM_GPU_TEST_SOURCES renderer/test_material_library.cpp)
+        list(APPEND STRATUM_GPU_TEST_SUITES MaterialLibrary)
+    endif()
+
+    if(EXISTS ${CMAKE_SOURCE_DIR}/src/renderer/procedural_texture.cpp)
+        list(APPEND STRATUM_GPU_TEST_SOURCES renderer/test_procedural_texture.cpp)
+        list(APPEND STRATUM_GPU_TEST_SUITES ProceduralTexture)
+    endif()
+
+    # VariantAgreement is the seam between the two halves of the MaterialKey
+    # contract: osm/road/road_style.hpp assigns variant numbers from OSM tags and
+    # renderer/material_library.hpp mirrors them. Neither includes the other, so
+    # the mirror can drift, and drift is silent -- a worn road just draws as new.
+    # This suite is mostly static_asserts, so a disagreement fails the BUILD.
+    # It needs both libraries, which only this executable links.
+    if(EXISTS ${CMAKE_SOURCE_DIR}/src/renderer/material_library.cpp
+       AND EXISTS ${CMAKE_SOURCE_DIR}/src/osm/road/road_style.cpp)
+        list(APPEND STRATUM_GPU_TEST_SOURCES renderer/test_variant_agreement.cpp)
+        list(APPEND STRATUM_GPU_TEST_SUITES VariantAgreement)
+    endif()
+
+    # MaterialBinding is pure: three small functions lifted out of GPURenderer's
+    # draw path -- which bind_material() mode a renderer state demands, the
+    # reverse-Z decal depth-bias factors, and the decal pipeline cache key. Each
+    # guards a defect that is a crash or an inverted sign rather than a wrong
+    # pixel, and none of them needs a device.
+    list(APPEND STRATUM_GPU_TEST_SOURCES renderer/test_material_binding.cpp)
+    list(APPEND STRATUM_GPU_TEST_SUITES MaterialBinding)
+
+    # TextureUpload and PbrShader DO need a real SDL_GPU device, and both skip
+    # themselves with a line on stderr when there is no backend, exactly as
+    # GPUBufferPool does. They are labelled "gpu" below for that reason.
+    #
+    # TextureUpload covers what only a real upload shows: readiness being
+    # contingent on the submit, the built-in fallback texels, and what
+    # install_procedural_textures() does to base_color.
+    #
+    # PbrShader renders one pixel through the checked-in mesh_pbr .spv with the
+    # renderer's own vertex layout, uniform slots and sampler set. It is the only
+    # place a NaN tangent frame or a metallic scalar multiplied by a zero ORM
+    # channel is observable at all.
+    if(EXISTS ${CMAKE_SOURCE_DIR}/src/renderer/texture.cpp)
+        list(APPEND STRATUM_GPU_TEST_SOURCES renderer/test_texture_upload.cpp)
+        list(APPEND STRATUM_GPU_DEVICE_SUITES TextureUpload)
+    endif()
+
+    list(APPEND STRATUM_GPU_TEST_SOURCES renderer/test_pbr_shader.cpp)
+    list(APPEND STRATUM_GPU_DEVICE_SUITES PbrShader)
+
+    add_executable(stratum_gpu_tests ${STRATUM_GPU_TEST_SOURCES})
+
     target_link_libraries(stratum_gpu_tests PRIVATE stratum_editor_lib Threads::Threads)
 
     target_include_directories(stratum_gpu_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    # STRATUM_TEST_SHADER_DIR points at the SOURCE tree because that is where the
+    # runtime loads shaders from: the .spv are checked in and resolved relative to
+    # SDL_GetBasePath(). A copy under the build tree would let the suite pass
+    # against a stale duplicate of the file the application never reads.
+    #
+    # STRATUM_TEST_TMP_DIR is under the BUILD tree, for the same reason
+    # STRATUM_TEST_DUMP_DIR is: material set files written by the round-trip test
+    # are throwaway output and must never be mistaken for a committed fixture.
+    target_compile_definitions(stratum_gpu_tests PRIVATE
+        STRATUM_TEST_SHADER_DIR="${CMAKE_SOURCE_DIR}/assets/shaders"
+        STRATUM_TEST_TMP_DIR="${CMAKE_BINARY_DIR}/material_test"
     )
 
     target_compile_features(stratum_gpu_tests PRIVATE cxx_std_20)
@@ -217,19 +308,24 @@ if(TARGET stratum_editor_lib AND EXISTS ${CMAKE_SOURCE_DIR}/src/renderer/gpu_buf
         target_compile_options(stratum_gpu_tests PRIVATE -Wall -Wextra)
     endif()
 
-    add_test(NAME GPUBufferPool COMMAND stratum_gpu_tests GPUBufferPool)
-    set_tests_properties(GPUBufferPool PROPERTIES
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        LABELS "unit;gpu"
-    )
+    # Suites that need an SDL_GPUDevice and skip themselves without one.
+    list(APPEND STRATUM_GPU_DEVICE_SUITES GPUBufferPool)
 
-    # The upload batch arithmetic is pure and needs no device, so it is not
-    # labelled gpu and never skips.
-    add_test(NAME GPUUploadBatch COMMAND stratum_gpu_tests GPUUploadBatch)
-    set_tests_properties(GPUUploadBatch PROPERTIES
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        LABELS "unit"
-    )
+    foreach(suite IN LISTS STRATUM_GPU_DEVICE_SUITES)
+        add_test(NAME ${suite} COMMAND stratum_gpu_tests ${suite})
+        set_tests_properties(${suite} PROPERTIES
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            LABELS "unit;gpu"
+        )
+    endforeach()
+
+    foreach(suite IN LISTS STRATUM_GPU_TEST_SUITES)
+        add_test(NAME ${suite} COMMAND stratum_gpu_tests ${suite})
+        set_tests_properties(${suite} PROPERTIES
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            LABELS "unit"
+        )
+    endforeach()
 endif()
 
 # ───────────────────────────────────────────────────────────────────

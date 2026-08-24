@@ -23,11 +23,28 @@ namespace stratum {
 
 // Forward declaration
 class GPURenderer;
+class MaterialLibrary;
+class GPUTextureManager;
+
+// Forward-declared for the Materials panel's helper signatures. material_library.hpp
+// pulls in SDL through texture.hpp, and editor.hpp is included by nearly every
+// editor translation unit; the panel's own .cpp includes the real headers.
+struct MaterialDef;
 
 class Editor {
 public:
-    Editor() = default;
-    ~Editor() = default;
+    Editor();
+
+    /**
+     * @brief Out-of-line so the unique_ptr members can hold incomplete types
+     *
+     * m_texture_manager and m_material_library are forward-declared above to keep
+     * material_library.hpp and texture.hpp -- both of which pull in SDL -- out of
+     * every translation unit that includes editor.hpp. unique_ptr's deleter needs
+     * the complete type at the point the destructor is DEFINED, so it cannot be
+     * `= default` in the header.
+     */
+    ~Editor();
 
     void init();
     void shutdown();
@@ -44,6 +61,15 @@ public:
      *       cannot happen in init() - that runs before the renderer is attached.
      */
     void set_renderer(GPURenderer* renderer);
+
+    /**
+     * @brief Create the texture manager and material library and install them
+     *
+     * Called from set_renderer(), the first point at which a device exists.
+     * Every failure path is non-fatal and leaves the renderer with no material
+     * library, which draws exactly as it did before materials existed.
+     */
+    void init_materials(GPURenderer& renderer);
 
     /**
      * @brief End the Im3d frame and upload its geometry
@@ -67,6 +93,46 @@ private:
     void draw_toolbar();
     void draw_render_settings();
     void draw_memory_panel();
+
+    /**
+     * @brief The material library editor
+     *
+     * Defined in src/editor/panels/material_panel.cpp, together with the five
+     * helpers below. Draws nothing but a notice when the material system failed to
+     * come up, which is a survivable state -- see init_materials().
+     */
+    void draw_material_panel();
+
+    /**
+     * @brief Which of a material's three maps a map row edits
+     *
+     * Mirrors MaterialLibrary::TextureMap, which cannot be named here: it is
+     * nested in a class this header only forward-declares, and including
+     * material_library.hpp would drag SDL into every translation unit that
+     * includes editor.hpp. The two are converted in one switch in the panel.
+     */
+    enum class MaterialMapSlot { Albedo = 0, Normal, Orm };
+
+    /// Panel header: the two switches between an edit and a pixel, the fallback
+    /// count, the texture stats, and save/load.
+    void draw_material_panel_header();
+
+    /// The keys resolve() could not answer exactly, with a button to promote one.
+    void draw_material_fallback_list();
+
+    /// Left pane: every MaterialId slot, with its installed variants under it.
+    void draw_material_slot_tree();
+
+    /// Right pane: every field of the selected MaterialDef, applied live.
+    void draw_material_editor();
+
+    /// Albedo, normal and ORM swatches for @p def.
+    void draw_material_preview(const MaterialDef& def);
+
+    /// One map's name, source, Load and Clear controls.
+    /// @return true when @p def was edited in place and needs writing back.
+    bool draw_material_map_row(const char* label, MaterialDef& def, MaterialMapSlot map,
+                               MaterialKey key);
     
     // Procgen helpers
     void generate_terrain();
@@ -90,6 +156,7 @@ private:
     bool m_show_procgen_panel = true;
     bool m_show_render_settings = false;
     bool m_show_memory_panel = false;
+    bool m_show_material_panel = false;
 
     // Render toggles
     bool m_render_areas = true;
@@ -121,6 +188,22 @@ private:
     int m_drag_start_window_y = 0;
 
     GPURenderer* m_gpu_renderer = nullptr;
+
+    /**
+     * @brief The texture set and the material set, owned here
+     *
+     * The Editor owns them because GPURenderer deliberately does not: it takes
+     * both as non-owning pointers so that a tool, a test, or a headless exporter
+     * can install a different material set without the renderer having an opinion
+     * about where it came from.
+     *
+     * Both are created in set_renderer(), which is the first point at which an
+     * SDL_GPUDevice exists, and torn down in shutdown(), which Application runs
+     * BEFORE GPURenderer::shutdown() -- every SDL_GPUTexture and SDL_GPUSampler
+     * inside them is a child of that device and cannot outlive it.
+     */
+    std::unique_ptr<GPUTextureManager> m_texture_manager;
+    std::unique_ptr<MaterialLibrary> m_material_library;
 
     // Window resizing state
     enum ResizeEdge { RESIZE_NONE = 0, RESIZE_LEFT, RESIZE_RIGHT, RESIZE_TOP, RESIZE_BOTTOM,
@@ -294,8 +377,76 @@ private:
     FilePickResult m_file_pick;
     char m_osm_filepath[512] = "";
 
+    /**
+     * @brief What the in-flight file dialog is FOR
+     *
+     * There is ONE file-dialog path in this editor -- one FilePickResult, one
+     * callback, one poll_file_dialog() -- and several things that want to use it.
+     * The target says where poll_file_dialog() delivers the path it collected,
+     * rather than a second copy of the mutex-and-park machinery existing per
+     * feature.
+     *
+     * Written on the main thread in open_file_dialog() BEFORE the dialog is
+     * marked pending, and read on the main thread in poll_file_dialog() after the
+     * result lands. It is not under the mutex because it never races: the pending
+     * flag means at most one dialog exists at a time, and the SDL callback does
+     * not touch it.
+     */
+    enum class FilePickTarget {
+        OsmFile = 0,     ///< The OSM/PBF extract to import
+        MaterialAlbedo,  ///< Albedo map for m_material_pick_key
+        MaterialNormal,  ///< Normal map for m_material_pick_key
+        MaterialOrm,     ///< ORM map for m_material_pick_key
+        MaterialSetLoad, ///< A material set JSON to replace the whole library
+        MaterialSetSave, ///< Destination to write the whole library to
+    };
+    FilePickTarget m_file_pick_target = FilePickTarget::OsmFile;
+
+    /**
+     * @brief The material a texture-load dialog was opened for
+     *
+     * Captured at open time rather than read at poll time. A native dialog is
+     * modal to the window but the editor keeps running behind it on some
+     * platforms, and applying a texture to whatever happens to be selected when
+     * the user finally clicks Open is a way to quietly overwrite the wrong
+     * material.
+     */
+    MaterialKey m_material_pick_key{};
+
+    /**
+     * @brief Open the ONE native file dialog, for @p target
+     *
+     * Asynchronous: returns immediately and does nothing if a dialog is already
+     * open. FilePickTarget::MaterialSetSave uses SDL_ShowSaveFileDialog and every
+     * other target uses SDL_ShowOpenFileDialog; both land in the same callback and
+     * are collected by the same poll_file_dialog().
+     */
+    void open_file_dialog(FilePickTarget target);
+
+    /// Shorthand for open_file_dialog(FilePickTarget::OsmFile), kept because the
+    /// OSM panel reads better for it.
     void open_osm_file_dialog();
+
+    /// Apply a landed dialog result on the main thread, routed by m_file_pick_target.
     void poll_file_dialog();
+
+    // ── Material library ────────────────────────────────────────────────────
+
+    /**
+     * @brief The material draw_material_panel() is editing
+     *
+     * A key, not an index or a pointer: MaterialLibrary::set() rehashes and
+     * MaterialDef references are invalidated by it, so the panel re-resolves the
+     * key every frame rather than holding anything across one.
+     */
+    MaterialKey m_selected_material{};
+
+    /// Last path a material set was saved to or loaded from. Shown in the panel
+    /// and used as the save dialog's starting location.
+    std::string m_material_set_path;
+
+    /// Result of the last material-set save or load, shown under the buttons.
+    std::string m_material_set_status;
 
     // ── Road network export ─────────────────────────────────────────────────
     //

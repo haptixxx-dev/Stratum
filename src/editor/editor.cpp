@@ -1,6 +1,9 @@
 #include "editor/editor.hpp"
 #include "editor/im3d_impl.hpp"
 #include "renderer/gpu_renderer.hpp"
+#include "renderer/material_library.hpp"
+#include "renderer/procedural_texture.hpp"
+#include "renderer/texture.hpp"
 #include <im3d.h>
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -21,6 +24,11 @@ namespace stratum {
 
 static ImVec4 s_viewport_rect;
 
+// Defined here, not in the header: the unique_ptr members hold types that are
+// only forward-declared there. See the note on ~Editor().
+Editor::Editor() = default;
+Editor::~Editor() = default;
+
 void Editor::init() {
     spdlog::info("Editor initialized");
     Im3D_Init();
@@ -39,7 +47,78 @@ void Editor::set_renderer(GPURenderer* renderer) {
         // on the horizon.
         renderer->set_mesh_distance_fn([this](uint32_t id) { return mesh_distance_to_camera(id); });
         renderer->set_mesh_evicted_fn([this](uint32_t id) { on_mesh_evicted(id); });
+
+        init_materials(*renderer);
     }
+}
+
+void Editor::init_materials(GPURenderer& renderer) {
+    SDL_GPUDevice* device = renderer.get_device();
+    if (!device) {
+        spdlog::warn("No GPU device; roads will draw untextured");
+        return;
+    }
+
+    // Every failure below is NON-FATAL and leaves the renderer with no material
+    // library installed, which it treats as "draw exactly as before materials
+    // existed". A broken material set must degrade to the old untextured look,
+    // never to a black screen or a missing scene.
+    auto textures = std::make_unique<GPUTextureManager>();
+    if (!textures->init(device)) {
+        spdlog::error("Texture manager init failed; roads will draw untextured");
+        return;
+    }
+
+    auto materials = std::make_unique<MaterialLibrary>();
+    if (!materials->init(textures.get())) {
+        spdlog::error("Material library init failed; roads will draw untextured");
+        textures->shutdown();
+        return;
+    }
+
+    // The frozen slot table first, so every MaterialId is at least the right
+    // colour and roughness even if texture generation below fails.
+    materials->load_defaults();
+
+    // Then the generated tiling detail. install_procedural_textures() also
+    // installs the variant table, because a cobblestone variant without its stone
+    // texture is only a slightly different shade of grey. Failure here is
+    // survivable: the flat defaults above remain.
+    if (!materials->install_procedural_textures()) {
+        spdlog::warn("Procedural texture generation failed; materials stay flat");
+    }
+
+    m_texture_manager = std::move(textures);
+    m_material_library = std::move(materials);
+
+    // Order matters only in that both must be installed before the first draw.
+    renderer.set_texture_manager(m_texture_manager.get());
+    renderer.set_material_library(m_material_library.get());
+
+    // Materials are a PBR-ONLY path by construction: the simple shader declares no
+    // material uniform block and no samplers, so GPURenderer::bind_material()
+    // returns immediately in ShaderMode::Simple. The renderer starts in Simple, so
+    // without this the whole material system would be installed, populated, and
+    // completely invisible until someone found the Render Settings combo -- which
+    // is exactly the "threaded through and never read" failure this phase exists to
+    // end. Switching here, and only once the library actually came up, is what
+    // makes the world materially distinct at startup.
+    //
+    // set_shader_mode() refuses if the PBR pipelines failed to build and says so;
+    // that leaves the editor in Simple mode drawing untextured, which is the
+    // correct degraded state rather than a black screen.
+    if (!renderer.set_shader_mode(ShaderMode::PBR)) {
+        spdlog::warn("Materials installed but PBR is unavailable; roads draw untextured");
+    }
+
+    // The panel is worth opening by default the first time there is something in
+    // it. It is a normal dockable panel afterwards and remembers nothing, so this
+    // costs a keystroke to undo and saves a hunt through the View menu.
+    m_show_material_panel = true;
+
+    const auto stats = m_texture_manager->stats();
+    spdlog::info("Materials ready: {} materials, {} textures, {} KB",
+                 m_material_library->size(), stats.textures, stats.bytes / 1024);
 }
 
 void Editor::im3d_end_frame_and_upload(GPURenderer& renderer) {
@@ -48,6 +127,24 @@ void Editor::im3d_end_frame_and_upload(GPURenderer& renderer) {
 
 void Editor::shutdown() {
     Im3D_Shutdown();
+
+    // Before GPURenderer::shutdown() destroys the device these textures and
+    // samplers belong to. Application calls us first, which is what makes this
+    // the right place; the renderer also tears them down defensively if some
+    // other caller skips this path.
+    if (m_gpu_renderer) {
+        m_gpu_renderer->set_material_library(nullptr);
+        m_gpu_renderer->set_texture_manager(nullptr);
+    }
+    if (m_material_library) {
+        m_material_library->shutdown();
+        m_material_library.reset();
+    }
+    if (m_texture_manager) {
+        m_texture_manager->shutdown();
+        m_texture_manager.reset();
+    }
+
     spdlog::info("Editor shutdown");
 }
 
@@ -117,6 +214,7 @@ void Editor::render() {
     if (m_show_procgen_panel) draw_procgen_panel();
     if (m_show_render_settings) draw_render_settings();
     if (m_show_memory_panel) draw_memory_panel();
+    if (m_show_material_panel) draw_material_panel();
 }
 
 void Editor::setup_dockspace() {
@@ -265,6 +363,7 @@ void Editor::draw_menu_bar() {
             ImGui::MenuItem("Procgen Panel", nullptr, &m_show_procgen_panel);
             ImGui::MenuItem("Render Settings", nullptr, &m_show_render_settings);
             ImGui::MenuItem("GPU Memory", nullptr, &m_show_memory_panel);
+            ImGui::MenuItem("Materials", nullptr, &m_show_material_panel);
             ImGui::Separator();
             ImGui::MenuItem("ImGui Demo", nullptr, &m_show_demo_window);
             ImGui::MenuItem("Style Editor", nullptr, &m_show_style_editor);
@@ -1246,17 +1345,18 @@ void Editor::draw_render_settings() {
         // PBR settings (only visible in PBR mode)
         if (m_gpu_renderer->get_shader_mode() == ShaderMode::PBR) {
             ImGui::Separator();
-            ImGui::Text("PBR Material");
-            
-            glm::vec3 pbr = m_gpu_renderer->get_pbr_params();
-            bool changed = false;
-            changed |= ImGui::SliderFloat("Metallic", &pbr.x, 0.0f, 1.0f);
-            changed |= ImGui::SliderFloat("Roughness", &pbr.y, 0.04f, 1.0f);
-            changed |= ImGui::SliderFloat("Ambient Occlusion", &pbr.z, 0.0f, 1.0f);
-            if (changed) {
-                m_gpu_renderer->set_pbr_params(pbr.x, pbr.y, pbr.z);
+
+            // The global Metallic / Roughness / Ambient Occlusion sliders that used
+            // to sit here have been REMOVED rather than left as decoration. They
+            // drove SceneUniforms::pbr_params, and mesh_pbr.frag stopped reading it
+            // the moment materials owned those three values: the compiled module
+            // contains no access to that member at all, so the sliders moved no
+            // pixel at any value. They are per-material controls now.
+            ImGui::TextDisabled("Metallic, roughness and AO are per-material.");
+            if (ImGui::SmallButton("Open Materials panel")) {
+                m_show_material_panel = true;
             }
-            
+
             ImGui::Separator();
             ImGui::Text("Lighting");
             
@@ -1541,23 +1641,60 @@ void Editor::handle_window_resize() {
 }
 
 void Editor::open_osm_file_dialog() {
+    open_file_dialog(FilePickTarget::OsmFile);
+}
+
+void Editor::open_file_dialog(FilePickTarget target) {
     if (m_file_pick.pending) return;  // a dialog is already up
 
-    // Must outlive the call: SDL requires the filter array stay valid until the
-    // callback fires, and this function returns immediately.
-    static const SDL_DialogFileFilter kFilters[] = {
+    // These must outlive the call: SDL requires the filter array stay valid until
+    // the callback fires, and this function returns immediately.
+    static const SDL_DialogFileFilter kOsmFilters[] = {
         { "OpenStreetMap data", "osm;pbf;osm.bz2;osm.gz" },
         { "OSM XML",            "osm" },
         { "OSM PBF",            "pbf" },
         { "All files",          "*" },
     };
+    // KTX2 first because it is the format the texture manager reads without
+    // recompressing; the stb formats are accepted but arrive uncompressed.
+    static const SDL_DialogFileFilter kTextureFilters[] = {
+        { "Textures",     "ktx2;ktx;png;jpg;jpeg;tga;bmp;hdr" },
+        { "KTX2",         "ktx2;ktx" },
+        { "All files",    "*" },
+    };
+    static const SDL_DialogFileFilter kMaterialSetFilters[] = {
+        { "Stratum material set", "json" },
+        { "All files",            "*" },
+    };
 
+    const SDL_DialogFileFilter* filters = kOsmFilters;
+    int filter_count = static_cast<int>(SDL_arraysize(kOsmFilters));
+    switch (target) {
+        case FilePickTarget::MaterialAlbedo:
+        case FilePickTarget::MaterialNormal:
+        case FilePickTarget::MaterialOrm:
+            filters = kTextureFilters;
+            filter_count = static_cast<int>(SDL_arraysize(kTextureFilters));
+            break;
+        case FilePickTarget::MaterialSetLoad:
+        case FilePickTarget::MaterialSetSave:
+            filters = kMaterialSetFilters;
+            filter_count = static_cast<int>(SDL_arraysize(kMaterialSetFilters));
+            break;
+        case FilePickTarget::OsmFile:
+            break;
+    }
+
+    // Set the target BEFORE marking pending: poll_file_dialog() only reads it once
+    // a result has landed, and a result cannot land before the dialog is shown.
+    m_file_pick_target = target;
     m_file_pick.pending = true;
 
-    SDL_ShowOpenFileDialog(
+    // One callback for every target. It may run on a different thread than the
+    // main loop, so it does nothing but record the outcome; poll_file_dialog()
+    // applies it on the main thread next frame.
+    const SDL_DialogFileCallback callback =
         [](void* userdata, const char* const* filelist, int /*filter*/) {
-            // May run on a different thread than the main loop, so do nothing here
-            // except record the outcome. poll_file_dialog() applies it.
             auto* self = static_cast<Editor*>(userdata);
             std::lock_guard<std::mutex> lock(self->m_file_pick.mutex);
             self->m_file_pick.has_result = true;
@@ -1572,13 +1709,22 @@ void Editor::open_osm_file_dialog() {
             }
             // filelist non-null with a null first entry means the user cancelled;
             // both strings stay empty and the UI simply does nothing.
-        },
-        this,
-        static_cast<SDL_Window*>(m_window_handle),  // parent, for modality
-        kFilters,
-        static_cast<int>(SDL_arraysize(kFilters)),
-        nullptr,   // start in the platform's default location
-        false);    // single selection
+        };
+
+    auto* parent = static_cast<SDL_Window*>(m_window_handle);  // for modality
+
+    if (target == FilePickTarget::MaterialSetSave) {
+        // Start in the directory the set was last saved to or loaded from, so a
+        // re-save lands beside its textures rather than in the home directory --
+        // the paths inside the file are written RELATIVE to it.
+        SDL_ShowSaveFileDialog(callback, this, parent, filters, filter_count,
+                               m_material_set_path.empty() ? nullptr
+                                                           : m_material_set_path.c_str());
+    } else {
+        SDL_ShowOpenFileDialog(callback, this, parent, filters, filter_count,
+                               nullptr,  // platform default location
+                               false);   // single selection
+    }
 }
 
 void Editor::poll_file_dialog() {
@@ -1596,19 +1742,78 @@ void Editor::poll_file_dialog() {
 
     if (!error.empty()) {
         // Most likely on Linux with no XDG desktop portal and no zenity/kdialog.
-        // The path field is still there to type into, so this is not fatal.
+        // The OSM path field is still there to type into, so this is not fatal
+        // there; for the material targets it means the button simply does nothing,
+        // which is why the reason is put on the console rather than only in the log.
         spdlog::error("File dialog unavailable: {}", error);
         char msg[512];
         snprintf(msg, sizeof(msg),
-                 "[OSM] File dialog unavailable (%s) - type a path instead\n", error.c_str());
+                 "[Editor] File dialog unavailable (%s) - type a path instead\n",
+                 error.c_str());
         m_console_buffer.append(msg);
         m_console_scroll_to_bottom = true;
+        if (m_file_pick_target != FilePickTarget::OsmFile) {
+            m_material_set_status = "file dialog unavailable: " + error;
+        }
         return;
     }
 
-    if (!path.empty()) {
-        std::snprintf(m_osm_filepath, sizeof(m_osm_filepath), "%s", path.c_str());
-        spdlog::info("Selected OSM file: {}", path);
+    // Cancelled. Every target treats that as "do nothing", so it is handled once
+    // here rather than in each branch below.
+    if (path.empty()) return;
+
+    switch (m_file_pick_target) {
+        case FilePickTarget::OsmFile:
+            std::snprintf(m_osm_filepath, sizeof(m_osm_filepath), "%s", path.c_str());
+            spdlog::info("Selected OSM file: {}", path);
+            break;
+
+        case FilePickTarget::MaterialAlbedo:
+        case FilePickTarget::MaterialNormal:
+        case FilePickTarget::MaterialOrm: {
+            if (!m_material_library) break;
+            const auto map =
+                m_file_pick_target == FilePickTarget::MaterialAlbedo
+                    ? MaterialLibrary::TextureMap::Albedo
+                    : m_file_pick_target == FilePickTarget::MaterialNormal
+                          ? MaterialLibrary::TextureMap::Normal
+                          : MaterialLibrary::TextureMap::Orm;
+            // Goes through the library, not through GPUTextureManager directly, so
+            // the source path is recorded and survives the next save. See
+            // MaterialLibrary::load_map_from_file().
+            if (m_material_library->load_map_from_file(m_material_pick_key, map, path)) {
+                m_material_set_status = "loaded " + path;
+            } else {
+                m_material_set_status = "failed to load " + path;
+            }
+            break;
+        }
+
+        case FilePickTarget::MaterialSetLoad: {
+            if (!m_material_library) break;
+            if (m_material_library->load_from_file(path)) {
+                m_material_set_path = path;
+                m_material_set_status =
+                    "loaded " + std::to_string(m_material_library->size()) + " materials";
+                // The new set is a different set: counts collected against the old
+                // one describe materials that no longer exist.
+                m_material_library->reset_resolve_stats();
+            } else {
+                m_material_set_status = "load failed - see console";
+            }
+            break;
+        }
+
+        case FilePickTarget::MaterialSetSave: {
+            if (!m_material_library) break;
+            if (m_material_library->save_to_file(path)) {
+                m_material_set_path = path;
+                m_material_set_status = "saved to " + path;
+            } else {
+                m_material_set_status = "save failed - see console";
+            }
+            break;
+        }
     }
 }
 
@@ -1926,6 +2131,56 @@ void Editor::draw_memory_panel() {
 
     const GPURenderer::FrameStats frame = renderer.get_frame_stats();
     ImGui::Text("Last frame: %u draw calls, %u triangles", frame.draw_calls, frame.triangles);
+
+    // material_binds next to draw_calls is the diagnostic for the redundant-bind
+    // cache. Far below draw_calls is healthy -- the submesh ranges are sorted and
+    // consecutive meshes share materials. Creeping up towards draw_calls means the
+    // sorting has stopped happening somewhere upstream and every range is paying
+    // for a uniform push and three sampler binds it did not need.
+    ImGui::Text("Material binds: %u (of %u draws)", frame.material_binds, frame.draw_calls);
+
+    // ── Textures ────────────────────────────────────────────────────────────
+    //
+    // Read straight off the manager rather than through GPURenderer::texture_*(),
+    // because load_failures has no renderer accessor and should not get one: the
+    // renderer does not load textures, it binds them. Deliberately reported as a
+    // SEPARATE figure from the mesh budget above -- resident_bytes() is what
+    // evict_to_budget() drives against, and a texture set folded into it would make
+    // the renderer evict geometry to reclaim bytes no mesh eviction can free.
+    if (m_texture_manager) {
+        const auto tex = m_texture_manager->stats();
+        ImGui::Separator();
+        ImGui::Text("Textures: %zu resident, %.1f MB",
+                    tex.textures, static_cast<double>(tex.bytes) / (1024.0 * 1024.0));
+
+        if (tex.load_failures > 0) {
+            // Not a warning-coloured line by accident: every failed load left a
+            // material with an unbound map that is silently drawing plain white,
+            // flat-normal or unit-ORM instead. Nothing else on screen says so.
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.25f, 1.0f),
+                               "Texture load failures: %zu", tex.load_failures);
+        } else {
+            ImGui::TextDisabled("Texture load failures: 0");
+        }
+
+        const size_t pending = m_texture_manager->pending_upload_count();
+        if (pending > 0) {
+            ImGui::TextDisabled("%zu texture uploads staged", pending);
+        }
+    } else if (renderer.texture_bytes() > 0) {
+        // No manager owned here, but one is installed on the renderer from
+        // somewhere else -- a tool or a test harness. Report what is reachable.
+        ImGui::Separator();
+        ImGui::Text("Textures: %zu, %.1f MB", renderer.texture_count(),
+                    static_cast<double>(renderer.texture_bytes()) / (1024.0 * 1024.0));
+    }
+
+    // The material system's own headline number lives in the Materials panel; this
+    // is the pointer to it, because a stale material set shows up here first as
+    // material_binds behaving oddly.
+    if (m_material_library && ImGui::SmallButton("Open Materials panel")) {
+        m_show_material_panel = true;
+    }
 
     // ── Export ──────────────────────────────────────────────────────────────
     ImGui::Spacing();
@@ -3059,14 +3314,24 @@ void Editor::render_3d(GPURenderer& renderer) {
             sync_node_road_lod(*node, renderer, std::sqrt(dist_sq));
             record_road_lod_residency(*node);
 
+            // The trailing MaterialKey is the DEFAULT for geometry that carries no
+            // material tag of its own -- these builders predate MaterialId and emit
+            // no submeshes at all. Road meshes from the new road network DO carry
+            // tagged ranges, and those always win over the default; passing Asphalt
+            // here only affects the legacy flat road ribbons.
             if (m_render_areas) {
-                for (uint32_t id : node->area_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
+                for (uint32_t id : node->area_gpu_ids)
+                    renderer.draw_mesh(id, model, glm::vec4(1.0f), MaterialKey{MaterialId::Grass, 0});
             }
             if (m_render_roads) {
-                for (uint32_t id : node->road_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
+                for (uint32_t id : node->road_gpu_ids)
+                    renderer.draw_mesh(id, model, glm::vec4(1.0f), MaterialKey{MaterialId::Asphalt, 0});
             }
             if (m_render_buildings) {
-                for (uint32_t id : node->building_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
+                // Buildings are not a road surface. Concrete is the closest of the
+                // eleven slots and is at least not the untagged grey.
+                for (uint32_t id : node->building_gpu_ids)
+                    renderer.draw_mesh(id, model, glm::vec4(1.0f), MaterialKey{MaterialId::Concrete, 0});
             }
         }
     );
@@ -3136,10 +3401,13 @@ void Editor::render_3d(GPURenderer& renderer) {
                 
                 // Draw terrain
                 if (chunk->terrain_gpu_id != 0) {
-                    renderer.draw_mesh(chunk->terrain_gpu_id, model, glm::vec4(1.0f));
+                    renderer.draw_mesh(chunk->terrain_gpu_id, model, glm::vec4(1.0f),
+                                       MaterialKey{MaterialId::Grass, 0});
                 }
-                
-                // Draw water
+
+                // Draw water. No water slot exists in MaterialId -- it is a road
+                // material set -- so water keeps the untagged default rather than
+                // borrowing a surface that would make it look like wet tarmac.
                 if (m_render_water && chunk->water_gpu_id != 0) {
                     renderer.draw_mesh(chunk->water_gpu_id, model, glm::vec4(1.0f));
                 }
@@ -3148,7 +3416,8 @@ void Editor::render_3d(GPURenderer& renderer) {
     } else {
         // Legacy single terrain rendering
         if (m_render_terrain && m_terrain_gpu_id != 0) {
-            renderer.draw_mesh(m_terrain_gpu_id, model, glm::vec4(1.0f));
+            renderer.draw_mesh(m_terrain_gpu_id, model, glm::vec4(1.0f),
+                               MaterialKey{MaterialId::Grass, 0});
         }
         if (m_render_water && m_water_gpu_id != 0) {
             renderer.draw_mesh(m_water_gpu_id, model, glm::vec4(1.0f));
