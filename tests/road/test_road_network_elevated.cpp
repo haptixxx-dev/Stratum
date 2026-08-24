@@ -647,6 +647,13 @@ TEST(RoadNetworkElevated, carve_target_sits_one_surface_offset_below_the_road) {
     // reference path that can express it. See RoadNetworkConfig::solve_junctions.
     cfg.solve_junctions = false;
 
+    // The longitudinal decimation breaks the same parallelism for the same
+    // reason: it drops stations, so the ribbon carries fewer heights than the
+    // solve produced. The arithmetic asserted below is per station and is
+    // unchanged by which stations survive, so it is asserted on the path that can
+    // express it. See RoadNetworkConfig::reduce_tessellation.
+    cfg.reduce_tessellation = false;
+
     RoadNetworkBuilder builder;
     const RoadNetwork network = builder.build(*parsed, cfg);
 

@@ -99,6 +99,45 @@ struct FilletConfig {
      * is about 8.6 degrees.
      */
     double min_arc_angle = 0.15;
+
+    /**
+     * @brief How far past the node a corner point may lie, in combined widths
+     *
+     * Every corner of the ring is built from the point C where the two arms'
+     * facing carriageway edges meet. C normally sits between the two cut faces
+     * and the node -- that is what makes it a corner OF this junction -- and the
+     * fillet is drawn tangent to both edges around it.
+     *
+     * Two nearly parallel arms break that. Their edges meet at a vanishing angle,
+     * so C runs off to a kilometre away, and the arc built around it is tangent
+     * over `radius * tan(theta / 2)`, which for a turn approaching half a circle
+     * is hundreds of times the radius. Measured on a Dublin extract, one node
+     * whose two arms left 0.26 degrees apart produced a junction polygon of
+     * 38,000 m^2 whose ring ran 2.5 KILOMETRES away from the node and came back.
+     * The trim solve already bounds its own mirror of that reserve; this is the
+     * same bound on the polygon side.
+     *
+     * A corner point further behind a cut face than that arm's own trim plus this
+     * many COMBINED carriageway half widths is therefore not treated as a corner
+     * at all, and the corner is closed with its chord.
+     *
+     * The same bound governs the one REFLEX corner a node can have -- the
+     * wrap-around pair at a node whose arms all leave within one half plane, an
+     * acute fork or a slip road. That corner spans the BACK of the node, where no
+     * arm arrives, and taking the ring through C wraps the fill around the back
+     * of the node exactly as the cut faces wrap around its front. Closing it with
+     * the bare chord instead, which is what this file used to do, draws a
+     * diagonal across the junction that passes on the WRONG SIDE of the node -- so
+     * the polygon does not contain the node it was built for, the terrain carve
+     * leaves the ground under it unflattened, and on a three-arm fork the diagonal
+     * crosses the opposite corner's fillet. A reflex corner is never rounded: an
+     * arc through it would bulge into the junction rather than out of it.
+     *
+     * The default 1.0 allows a corner about one carriageway clear of the node.
+     * Zero allows only a corner between the cut faces and the node; a negative
+     * value is treated as zero.
+     */
+    double max_corner_reach_factor = 1.0;
 };
 
 /**
@@ -202,12 +241,48 @@ struct JunctionPolygon {
      * junction always contains exactly collinear runs whose determinants come out
      * as rounding noise of either sign.
      *
-     * A ring that is simple but CLOCKWISE is a caller error -- arms not handed
-     * over in ascending bearing order -- and is logged rather than flagged here,
-     * because the fill still comes out correct while an outward curb offset would
-     * not.
+     * A ring that is simple but CLOCKWISE is reported by `inverted`, not here, so
+     * that this flag keeps meaning exactly "the ring crosses itself".
      */
     bool self_intersecting = false;
+
+    /**
+     * @brief The ring is wound CLOCKWISE, so it does not bound what it looks like
+     *
+     * Two things produce it. Arms handed over out of bearing order is the caller
+     * error the header always warned about. The other is internal: the adjacent
+     * cut-face clipping collapses an over-clipped arm onto its own midpoint, but
+     * its two NEIGHBOURS keep the crossing points they were given, so on a
+     * trident node -- three or more arms inside one narrow fan, nothing opposing
+     * them -- the walk reverses between them and the ring comes back with
+     * negative area while remaining perfectly simple.
+     *
+     * `self_intersecting` cannot catch that, because the ring really is simple.
+     * Without a separate flag the whole junction would be handed on as a valid
+     * outline: a backwards sliver metres from the node, used as the asphalt fill
+     * AND as the terrain carve's winding test, with every arm still trimmed back
+     * to make room for a junction that is not there.
+     *
+     * Consumers must treat it exactly as they treat `self_intersecting`:
+     * triangulate_junction() falls back to the CONVEX HULL, build_curb_ring()
+     * refuses the ring, and the terrain carve falls back to the CarveDisc path.
+     * Use needs_hull_fallback() rather than testing either flag alone.
+     *
+     * Tested strictly negative: a ring of exactly zero area is a junction whose
+     * arms all collapsed onto the node, which is degenerate but not mis-wound.
+     * Always false when the ring is empty.
+     */
+    bool inverted = false;
+
+    /**
+     * @brief True when the ring may not be used as a simple CCW outline
+     *
+     * The one predicate every consumer of a JunctionPolygon should ask. A ring
+     * that crosses itself has no meaningful interior; a ring wound clockwise
+     * bounds the complement of what it appears to. Neither can be filled by
+     * earcut, offset outward, or used as a winding test.
+     */
+    [[nodiscard]] bool needs_hull_fallback() const { return self_intersecting || inverted; }
 };
 
 // ============================================================================
@@ -248,17 +323,34 @@ struct JunctionPolygon {
  *
  * A corner that turns LEFT instead is the wrap-around pair at a node whose arms
  * all leave within a half plane -- an acute fork, a slip road peeling away -- so
- * the gap the corner spans exceeds 180 degrees. Its two offset lines meet far
- * BEHIND the node, and any arc drawn through that intersection extrudes a spike
- * out of the back of the junction and folds the ring through itself. There is no
- * outward fillet for such a corner, so it is closed with the CHORD: no interior
- * vertices at all, exactly as for a chamfer.
+ * the gap the corner spans exceeds 180 degrees, and the ground it spans is the
+ * BACK of the node. It is closed through its corner point C, unrounded, which
+ * wraps the boundary around the back of the node; see
+ * FilletConfig::reflex_reach_factor, which bounds how far behind the node C may
+ * lie before the chord is taken instead. No arc is ever drawn there: an arc
+ * through a reflex corner bulges INTO the junction rather than out of it.
  *
- * The chord is also what a corner gets when the two offset lines are parallel
+ * The chord is what a corner gets when the two offset lines are parallel
  * (an arm's through-continuation on the far side of a T), when the intersection
  * lands past either cut face because a trim was clamped short, when the turn is
- * shallower than min_arc_angle, or when the radius that actually fits has fallen
- * below min_radius.
+ * shallower than min_arc_angle, when the radius that actually fits has fallen
+ * below min_radius, or when a reflex corner's C is out of reach.
+ *
+ * ### When two arms overlap: the cut faces are clipped
+ *
+ * A trim reduced by TrimConfig::max_trim_fraction, or bounded by
+ * TrimConfig::min_pair_angle, leaves the two arms of that corner still
+ * overlapping, and their cut faces then CROSS. Chaining them as they are gives a
+ * bowtie -- the commonest self-intersecting junction in a real extract. Where two
+ * adjacent cut faces cross, both are cut back to the crossing point, so the two
+ * arms share one ring vertex there and the corner between them is a point rather
+ * than a chord or an arc. The ring stays simple and still bounds exactly the
+ * ground the two mouths cover; the ribbons still overlap it, which is what
+ * over-trimmed means and no polygon can undo.
+ *
+ * Each arm keeps its two ring vertices, so arm_ring_start is unaffected. An arm
+ * clipped at both ends far enough to invert collapses to a single point repeated
+ * twice.
  *
  * ### Welding
  *

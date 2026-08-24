@@ -31,12 +31,14 @@
 #include "framework.hpp"
 
 #include "osm/road/road_graph.hpp"
+#include "osm/road/road_style.hpp"
 #include "osm/road/road_profile.hpp"
 #include "osm/types.hpp"
 #include "renderer/mesh.hpp"
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -817,4 +819,163 @@ TEST(RoadProfile, the_both_ways_lane_sits_in_the_middle_of_the_carriageway) {
     const double carriageway_centre =
         carriageway_left - 0.5 * static_cast<double>(p.carriageway_width());
     CHECK_NEAR(middle_centre, carriageway_centre, 1e-4);
+}
+
+// ============================================================================
+// One surface table decides the slot AND the variant
+// ============================================================================
+
+namespace {
+
+/// The MaterialKey of every strip of one kind, in strip order
+std::vector<stratum::MaterialKey> keys_of_kind(const RoadProfile& p, StripKind kind) {
+    std::vector<stratum::MaterialKey> out;
+    for (const Strip& s : p.strips) {
+        if (s.kind == kind) out.push_back(stratum::MaterialKey{s.material, s.variant});
+    }
+    return out;
+}
+
+} // namespace
+
+/**
+ * A cobbled carriageway is cobbled ASPHALT, and is not the pavement beside it.
+ *
+ * ### What was wrong
+ *
+ * This file kept its own surface=* table, and it disagreed with road_style.cpp's
+ * on every modular running surface: road_style puts cobblestone, sett,
+ * paving_stones and bricks in MaterialId::Asphalt with their own variants,
+ * because they are driveable, while this file put them in MaterialId::Sidewalk.
+ *
+ * strip_material() is contractually forbidden from changing the slot it is
+ * handed, so it resolved a cobbled LANE to the FOOTWAY's brick variant. The lane
+ * key came out byte-identical to the sidewalk key beside it, corridor.cpp's
+ * sort_submeshes_by_material() merged the carriageway and the pavement into ONE
+ * draw range with one material and one UV tiling, and variants::kCobblestone,
+ * kSett and kPavingStones could not be emitted by any way in any extract.
+ *
+ * ### How this test fails without the fix
+ *
+ * The lane keys come back {Sidewalk, kSidewalkBrick}, equal to the sidewalk keys.
+ */
+TEST(RoadProfile, a_cobbled_carriageway_is_not_the_pavement_beside_it) {
+    GraphEdge edge = make_edge(RoadType::Residential, 2);
+    edge.surface = "cobblestone";
+
+    stratum::osm::TagMap tags;
+    tags["sidewalk"] = "both";
+
+    const RoadProfile p = build_profile(edge, ProfileConfig{}, &tags);
+    check_profile_invariants(p, "residential surface=cobblestone");
+
+    const auto lanes = keys_of_kind(p, StripKind::Lane);
+    const auto walks = keys_of_kind(p, StripKind::Sidewalk);
+    CHECK_TRUE(lanes.size() >= size_t{2});
+    CHECK_TRUE(walks.size() >= size_t{2});
+    if (lanes.empty() || walks.empty()) return;
+
+    for (const stratum::MaterialKey& key : lanes) {
+        CHECK_EQ(key.material, MaterialId::Asphalt);
+        CHECK_EQ(key.variant, stratum::osm::road::variants::kCobblestone);
+    }
+    for (const stratum::MaterialKey& key : walks) {
+        CHECK_EQ(key.material, MaterialId::Sidewalk);
+    }
+
+    // The point of the whole thing: the carriageway and the pavement are two
+    // materials, so the extruder opens two ranges instead of one.
+    CHECK_TRUE(lanes.front() != walks.front());
+}
+
+/**
+ * `sett` and `paving_stones` reach their own variants too, and they differ.
+ *
+ * Three modular values that used to collapse onto one footway variant.
+ */
+TEST(RoadProfile, each_modular_surface_reaches_its_own_carriageway_variant) {
+    const struct { const char* surface; uint16_t variant; } cases[] = {
+        { "cobblestone",   stratum::osm::road::variants::kCobblestone  },
+        { "sett",          stratum::osm::road::variants::kSett         },
+        { "paving_stones", stratum::osm::road::variants::kPavingStones },
+    };
+
+    std::vector<uint16_t> seen;
+    for (const auto& c : cases) {
+        GraphEdge edge = make_edge(RoadType::Residential, 2);
+        edge.surface = c.surface;
+
+        const RoadProfile p = build_profile(edge, ProfileConfig{});
+        const auto lanes = keys_of_kind(p, StripKind::Lane);
+        CHECK_TRUE(!lanes.empty());
+        if (lanes.empty()) continue;
+
+        CHECK_EQ(lanes.front().material, MaterialId::Asphalt);
+        CHECK_EQ(lanes.front().variant, c.variant);
+        seen.push_back(lanes.front().variant);
+    }
+
+    // Distinct, or the branch's whole variant axis is decorative.
+    CHECK_EQ(seen.size(), size_t{3});
+    if (seen.size() == 3) {
+        CHECK_TRUE(seen[0] != seen[1]);
+        CHECK_TRUE(seen[1] != seen[2]);
+        CHECK_TRUE(seen[0] != seen[2]);
+    }
+}
+
+/**
+ * The smoothness grade survives, because both halves come from the same table.
+ *
+ * assign_strip_variants() only refines a strip whose slot IS the carriageway's,
+ * so any slot disagreement suppressed the grade silently. `surface=cement` was
+ * Concrete here and Asphalt over there, so `smoothness=very_bad` produced
+ * `{Concrete, 0}` instead of `{Concrete, kConcreteWorn}`.
+ */
+TEST(RoadProfile, a_worn_grade_survives_on_every_slot_the_table_names) {
+    const struct { const char* surface; MaterialId slot; uint16_t worn; } cases[] = {
+        { "asphalt",  MaterialId::Asphalt,  stratum::osm::road::variants::kAsphaltWorn  },
+        { "concrete", MaterialId::Concrete, stratum::osm::road::variants::kConcreteWorn },
+        { "cement",   MaterialId::Concrete, stratum::osm::road::variants::kConcreteWorn },
+    };
+
+    for (const auto& c : cases) {
+        GraphEdge edge = make_edge(RoadType::Residential, 2);
+        edge.surface = c.surface;
+
+        stratum::osm::TagMap tags;
+        tags["smoothness"] = "very_bad";
+
+        const RoadProfile p = build_profile(edge, ProfileConfig{}, &tags);
+        const auto lanes = keys_of_kind(p, StripKind::Lane);
+        CHECK_TRUE(!lanes.empty());
+        if (lanes.empty()) continue;
+
+        CHECK_EQ(lanes.front().material, c.slot);
+        CHECK_EQ(lanes.front().variant, c.worn);
+    }
+}
+
+/**
+ * A surveyed footway keeps the Sidewalk SLOT whatever it is paved with.
+ *
+ * The carve-out that makes the shared table safe to use here. road_style.cpp's
+ * table answers for a RUNNING SURFACE and its slot policy is a carriageway's:
+ * paving_stones is driveable, so Asphalt. A footway is not a carriageway, and
+ * moving it into the Asphalt slot would take its collision classification
+ * (CollisionConfig::include_sidewalk), its 2 m UV tiling and every kSidewalk*
+ * variant with it -- strip_material() cannot put it back.
+ */
+TEST(RoadProfile, a_paved_footway_stays_in_the_sidewalk_slot) {
+    for (const char* surface : {"paving_stones", "asphalt", "concrete", ""}) {
+        GraphEdge edge = make_edge(RoadType::Footway, 0);
+        edge.surface = surface;
+
+        const RoadProfile p = build_profile(edge, ProfileConfig{});
+        const auto walks = keys_of_kind(p, StripKind::Sidewalk);
+        CHECK_TRUE(!walks.empty());
+        if (walks.empty()) continue;
+
+        CHECK_EQ(walks.front().material, MaterialId::Sidewalk);
+    }
 }

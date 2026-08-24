@@ -102,6 +102,31 @@ struct Strip {
     float height_right = 0.0f;  ///< metres above the carriageway surface at this strip's right edge
     MaterialId material = MaterialId::Asphalt;
     StripKind kind = StripKind::Lane;
+
+    /**
+     * @brief Which variant of @ref material this strip wants
+     *
+     * The second axis of the material key. @ref material says "this is a running
+     * surface"; the variant says WHICH running surface, so a cobbled street and
+     * an asphalt one occupy the same SubMesh slot and still render differently.
+     *
+     * Zero is the slot's default and is what a profile built by hand carries, so
+     * every producer written before the variant axis existed keeps exactly the
+     * appearance it had. build_profile() fills it from the way's tags through
+     * road_style.hpp, which is the only place in the build allowed to decide a
+     * variant.
+     *
+     * Declared LAST on purpose. Strip is an aggregate and is brace-initialised
+     * positionally all over the tests and the fixtures, so a new field anywhere
+     * but the end would silently rebind `kind` to a number.
+     *
+     * @note The PAIR is the lookup key. Variant 3 of MaterialId::Asphalt and
+     *       variant 3 of MaterialId::Sidewalk are unrelated; see @ref key().
+     */
+    uint16_t variant = 0;
+
+    /// The (slot, variant) pair the corridor extruder tags this strip's SubMesh with
+    [[nodiscard]] MaterialKey key() const { return MaterialKey{ material, variant }; }
 };
 
 // ============================================================================
@@ -282,6 +307,12 @@ struct ProfileConfig {
  *   or alley_width, none of which carry a kerb, a gutter, or a sidewalk.
  * - An unpaved road with no kerb and no shoulder on a side grows a Verge there,
  *   unless a verge=* tag says otherwise. See ProfileConfig::rural_verges.
+ * - Every strip carries a Strip::variant resolved through road_style.hpp, so a
+ *   cobbled street and an asphalt one differ in appearance without differing in
+ *   MaterialId. The slot is decided here and the variant there; nothing else in
+ *   the pipeline invents a variant. @p tags is what carries `smoothness=*`,
+ *   `kerb:material=*` and `footway:surface=*` into that decision, so a null
+ *   @p tags degrades to slot defaults rather than to a wrong appearance.
  *
  * @param edge Graph edge to build the cross-section for
  * @param cfg  Widths and heights for values no tag resolves

@@ -509,12 +509,16 @@ void append_keeping_materials(Mesh& dst, const Mesh& src) {
             continue;
         }
 
+        // Keyed on the PAIR. Two ranges that share a slot and differ in variant
+        // are two materials, and folding them together here would silently
+        // repaint whichever of them lost.
         const uint32_t count = static_cast<uint32_t>(end - begin);
-        if (!dst.submeshes.empty() && dst.submeshes.back().material == range.material) {
+        if (!dst.submeshes.empty() && dst.submeshes.back().material == range.material &&
+            dst.submeshes.back().variant == range.variant) {
             dst.submeshes.back().index_count += count;
         } else {
-            dst.submeshes.push_back(
-                SubMesh{static_cast<uint32_t>(dst.indices.size()), count, range.material});
+            dst.submeshes.push_back(SubMesh{static_cast<uint32_t>(dst.indices.size()), count,
+                                            range.material, range.variant});
         }
         for (size_t k = begin; k < end; ++k) {
             dst.indices.push_back(src.indices[k] + base);
@@ -547,6 +551,196 @@ void append_keeping_materials(Mesh& dst, const Mesh& src) {
 }
 
 /**
+ * @brief Arclength either side of which two stations are the same station
+ *
+ * Matches the tolerance slice() cuts at, so a station this pass inserts and a
+ * station slice() would have synthesised at the same arclength are never both
+ * present.
+ */
+constexpr double kStationEpsilon = 1.0e-6;
+
+/**
+ * @brief Insert real stations at a list of arclengths
+ *
+ * A dropped kerb ramps over a metre or so, and a centerline resampled at
+ * ResampleConfig::max_spacing puts its columns eight metres apart. Laid out
+ * against those columns the ramp is drawn as a vertical step, and a whole drop
+ * that fits inside one band is not drawn at all. The stations have to exist
+ * before the sweep, and nothing upstream knows where the drops are: the runs come
+ * from the crossings, and the crossings are located after the trims.
+ *
+ * The inserted station is taken from slice(), not interpolated here, so it is the
+ * SAME station the trim path would have produced at that arclength -- position,
+ * tangent, mitre vector, curvature and fold bounds all resolved by the one
+ * routine that owns that algebra.
+ *
+ * Arclength is never rebased, so an inserted station carries its coordinate in
+ * whatever parameterisation @p cl already used. Everything expressed in that
+ * frame -- the trims, the markings, the crossings, the carve requests -- stays
+ * valid.
+ *
+ * @param cl          Centerline to densify
+ * @param arclengths  Where stations are wanted, in any order. A value outside the
+ *                    centerline's own range, or within kStationEpsilon of a
+ *                    station it already carries, is ignored.
+ * @return The densified centerline, or a copy of @p cl when nothing was inserted
+ */
+[[nodiscard]] Centerline densify_at(const Centerline& cl, const std::vector<double>& arclengths) {
+    if (!cl.is_valid() || arclengths.empty()) {
+        return cl;
+    }
+
+    const double lo = cl.stations.front().arclength;
+    const double hi = cl.stations.back().arclength;
+
+    std::vector<double> wanted;
+    wanted.reserve(arclengths.size());
+    for (const double at : arclengths) {
+        if (!std::isfinite(at)) continue;
+        if (!(at > lo + kStationEpsilon) || !(at < hi - kStationEpsilon)) continue;
+        wanted.push_back(at);
+    }
+    if (wanted.empty()) {
+        return cl;
+    }
+
+    std::sort(wanted.begin(), wanted.end());
+    wanted.erase(std::unique(wanted.begin(), wanted.end(),
+                             [](double a, double b) {
+                                 return std::fabs(a - b) <= kStationEpsilon;
+                             }),
+                 wanted.end());
+
+    // Drop the ones the centerline already carries. Both lists are sorted, so
+    // this is a merge walk rather than a scan per candidate.
+    std::vector<double> missing;
+    missing.reserve(wanted.size());
+    {
+        size_t k = 0;
+        for (const double at : wanted) {
+            while (k + 1 < cl.stations.size() &&
+                   cl.stations[k].arclength < at - kStationEpsilon) {
+                ++k;
+            }
+            bool have = false;
+            for (size_t probe = (k > 0 ? k - 1 : 0);
+                 probe < cl.stations.size() &&
+                 cl.stations[probe].arclength <= at + kStationEpsilon;
+                 ++probe) {
+                if (std::fabs(cl.stations[probe].arclength - at) <= kStationEpsilon) {
+                    have = true;
+                    break;
+                }
+            }
+            if (!have) missing.push_back(at);
+        }
+    }
+    if (missing.empty()) {
+        return cl;
+    }
+
+    std::vector<Station> inserted;
+    inserted.reserve(missing.size());
+    for (const double at : missing) {
+        const Centerline tail = slice(cl, at, hi);
+        if (!tail.is_valid()) continue;
+        const Station& synthesised = tail.stations.front();
+        if (std::fabs(synthesised.arclength - at) > kStationEpsilon) {
+            continue;   // slice() snapped elsewhere; leave the band alone
+        }
+        inserted.push_back(synthesised);
+    }
+    if (inserted.empty()) {
+        return cl;
+    }
+
+    Centerline out;
+    out.stations.reserve(cl.stations.size() + inserted.size());
+
+    // Merge by arclength, source first on a tie so a bevel pair keeps both of its
+    // halves adjacent and in order.
+    size_t a = 0;
+    size_t b = 0;
+    while (a < cl.stations.size() || b < inserted.size()) {
+        const bool take_source =
+            b >= inserted.size() ||
+            (a < cl.stations.size() && cl.stations[a].arclength <= inserted[b].arclength);
+        out.stations.push_back(take_source ? cl.stations[a++] : inserted[b++]);
+    }
+
+    return out.is_valid() ? out : cl;
+}
+
+/**
+ * @brief Stations the longitudinal decimation may not drop
+ *
+ * A station is a vertex column, and anything anchored to an arclength breaks when
+ * the column at that arclength is gone. The set is everything in this build that
+ * is placed against a station rather than against a position:
+ *
+ * - **Junction trim cut points and taper ends.** Not listed here, because they
+ *   are already the FIRST and LAST stations of the slice being decimated, and
+ *   select_stations() keeps both unconditionally. Naming them again would be
+ *   describing the same guarantee twice.
+ * - **Crossing positions.** A zebra is laid across the carriageway at its own
+ *   arclength, and its kerb drop is laid against the same one.
+ * - **Kerb drop breakpoints.** Both ends of every flat lip and the samples down
+ *   each ramp -- the stations densify_at() has just inserted for exactly this,
+ *   which the decimation would otherwise take straight back out, since a ramp
+ *   over a 20 mm lip departs from its own chord by far less than
+ *   TessellationConfig::max_chord_deviation.
+ * - **Bridge and tunnel portal stations.** These are not known here: the
+ *   structure builders find them themselves, against whatever centerline they are
+ *   handed, by looking for where the road crosses the terrain. There is no
+ *   arclength to protect, so a structural edge protects EVERY station instead and
+ *   is not decimated at all. It is a small share of any extract, and the
+ *   alternative is a portal placed against a column that no longer exists.
+ *
+ * @param cl              Centerline about to be decimated
+ * @param crossings       Crossings on this edge; null entries are skipped
+ * @param kerb_stations   Arclengths from CorridorKerbProfile::required_stations()
+ * @param protect_all     Protect every station; set for a bridge or tunnel edge
+ * @return Mask parallel to `cl.stations`
+ */
+[[nodiscard]] std::vector<bool> feature_station_mask(
+    const Centerline& cl,
+    const std::vector<const Crossing*>& crossings,
+    const std::vector<double>& kerb_stations,
+    bool protect_all) {
+    std::vector<bool> mask(cl.stations.size(), protect_all);
+    if (protect_all || cl.stations.empty()) {
+        return mask;
+    }
+
+    /// The station nearest an arclength, which is the column a feature attaches to
+    const auto protect = [&](double at) {
+        if (!std::isfinite(at)) return;
+        size_t best = 0;
+        double best_gap = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < cl.stations.size(); ++i) {
+            const double gap = std::fabs(cl.stations[i].arclength - at);
+            if (gap < best_gap) {
+                best_gap = gap;
+                best = i;
+            }
+            if (cl.stations[i].arclength > at && gap > best_gap) {
+                break;      // arclengths ascend, so nothing closer remains
+            }
+        }
+        mask[best] = true;
+    };
+
+    for (const Crossing* crossing : crossings) {
+        if (crossing != nullptr) protect(crossing->arclength);
+    }
+    for (const double at : kerb_stations) {
+        protect(at);
+    }
+
+    return mask;
+}
+
+/**
  * @brief What the P7 stage did to one piece
  *
  * Accumulated per piece by the worker that built it, then summed on the calling
@@ -559,14 +753,31 @@ struct PieceFinishStats {
     size_t triangles_before_lod = 0; ///< Triangles of LodChain::levels front
     size_t triangles_after_lod = 0;  ///< Triangles of LodChain::levels back
     size_t collision_triangles = 0;  ///< Triangles of RoadPiece::collision
+
+    /**
+     * @brief Triangles the piece held on entry, before the lateral merge
+     *
+     * Counted whether or not the merge runs, because a mesh that was not merged
+     * still has triangles -- see RoadNetwork::Stats::triangles_before_tess, which
+     * this feeds and which is documented to equal Stats::triangles in the
+     * switched-off state rather than to be zero.
+     */
+    size_t triangles_before_tess = 0;
+
+    /// Quad MERGES the lateral pass made; each removed two triangles
+    size_t quads_merged = 0;
 };
 
 /**
  * @brief Run the P7 passes over one finished piece, in place
  *
  * The order is load-bearing and is the reason this lives in one function rather
- * than four call sites:
+ * than five call sites:
  *
+ * 0. **Lateral merge.** First of all, because it needs the extruder's own
+ *    shared-edge structure to find which quads are adjacent, and both passes
+ *    below renumber the index buffer out from under it. Merging first also means
+ *    fewer vertices to weld and fewer triangles to reorder.
  * 1. **Weld.** First, because everything after it is cheaper on fewer vertices and
  *    because meshopt_simplify() collapses edges, and an edge only exists between
  *    triangles that already share indices. Reordering or simplifying an unwelded
@@ -581,7 +792,7 @@ struct PieceFinishStats {
  *    which only holds because the weld and the reorder already ran.
  *
  * Every step is skipped when its RoadNetworkConfig switch is off, and a piece with
- * all four off comes out byte for byte as the corridor and the detail passes left
+ * all five off comes out byte for byte as the corridor and the detail passes left
  * it.
  *
  * @param piece Piece to finish, modified in place
@@ -593,6 +804,25 @@ void finish_piece(RoadPiece& piece, const RoadNetworkConfig& cfg, PieceFinishSta
 
     if (piece.mesh.vertices.empty() || piece.mesh.indices.empty()) {
         return;
+    }
+
+    out.triangles_before_tess = piece.mesh.indices.size() / 3;
+
+    // ── 0. Lateral merge ─────────────────────────────────────────────────────
+    // Before the weld and before the reorder, per tessellation.hpp: the merge
+    // finds its adjacency through the extruder's shared-edge structure, which the
+    // reorder destroys, and merging first leaves the weld fewer vertices to hash
+    // and the simplifier a better-conditioned mesh to collapse.
+    if (cfg.reduce_tessellation) {
+        const size_t merges = merge_coplanar_quads(piece.mesh, cfg.tessellation);
+        if (merges > 0) {
+            out.quads_merged = merges;
+
+            // Positions did not move, so Mesh::bounds is still correct. UVs did,
+            // so the tangents no longer match the parameterisation they were
+            // derived from.
+            piece.mesh.compute_tangents();
+        }
     }
 
     if (cfg.weld_meshes) {
@@ -659,6 +889,17 @@ struct EdgeSlot {
      */
     std::vector<TunnelPortalFootprint> portals;
     size_t crossings = 0;           ///< Crossings whose zebra was appended
+
+    // ── Tessellation reduction, measured on the ribbon actually extruded ──
+
+    /// Stations of the trimmed, densified centerline, before the decimation
+    size_t stations_before = 0;
+
+    /// Stations of the centerline the extruder was handed; equal when it did not run
+    size_t stations_after = 0;
+
+    /// A crossing demanded this edge's own kerb drop, and the sweep honoured it
+    bool kerb_dropped = false;
 
     /// P7 counters for this piece; every field stays zero when its switch is off
     PieceFinishStats finish;
@@ -818,6 +1059,20 @@ RoadNetwork RoadNetworkBuilder::build(const ParsedOSMData& data, const RoadNetwo
     /// The trim solve ran, so the crossings were located at its seam
     bool trims_solved = false;
 
+    /**
+     * Nodes each solved junction ABSORBED, indexed by the primary's GraphNodeId.
+     *
+     * collect_arms() merges near-coincident junction nodes into one: the primary
+     * takes every arm and the other members solve to nothing. Everything that
+     * keys off a node id rather than off a junction -- the approach markings'
+     * `node_has_junction` gate, and dropped_kerb_spans()' Crossing::node filter --
+     * would otherwise drop its feature at every absorbed member, silently, even
+     * though the primary trimmed that member's approaches back by metres.
+     *
+     * Empty for the overwhelmingly common junction, which absorbs nothing.
+     */
+    std::vector<std::vector<GraphNodeId>> absorbed_members(m_graph.nodes().size());
+
     if (cfg.solve_junctions) {
         const auto junction_started = std::chrono::steady_clock::now();
 
@@ -834,6 +1089,16 @@ RoadNetwork RoadNetworkBuilder::build(const ParsedOSMData& data, const RoadNetwo
         trims_solved = junction_builder.solve_trims(m_graph, m_centerlines, profiles, m_elevation,
                                                     junction_cfg);
         if (trims_solved) {
+            // Invert the owner map once, in ascending node order, so the lists
+            // are the same run to run.
+            const std::vector<GraphNodeId>& owner = junction_builder.junction_owner();
+            for (size_t n = 0; n < owner.size() && n < absorbed_members.size(); ++n) {
+                const GraphNodeId primary = owner[n];
+                if (primary == kInvalidId || primary == static_cast<GraphNodeId>(n)) continue;
+                if (primary >= absorbed_members.size()) continue;
+                absorbed_members[primary].push_back(static_cast<GraphNodeId>(n));
+            }
+
             // ── Stage 3b: crossings, against the FINAL trims ─────────────
             // Located here and nowhere else. Earlier and every trim is still
             // zero, so a junction crossing is neither recognised as one nor set
@@ -861,7 +1126,12 @@ RoadNetwork RoadNetworkBuilder::build(const ParsedOSMData& data, const RoadNetwo
                     KerbDrops drops;
                     drops.center = center;
                     drops.ramp_length = static_cast<double>(cfg.crossings.dropped_kerb_ramp);
-                    drops.spans = dropped_kerb_spans(crossings, node, center, cfg.crossings);
+                    const std::vector<GraphNodeId>* absorbed =
+                        (node != kInvalidId && node < absorbed_members.size())
+                            ? &absorbed_members[node]
+                            : nullptr;
+                    drops.spans =
+                        dropped_kerb_spans(crossings, node, center, cfg.crossings, absorbed);
 
                     // A driveway mouth needs the same flare and the two sources
                     // are documented to concatenate without merging: where they
@@ -908,6 +1178,23 @@ RoadNetwork RoadNetworkBuilder::build(const ParsedOSMData& data, const RoadNetwo
         }
     }
 
+    // ── Corridor kerb drops, the other half of a dropped kerb ────────────────
+    // dropped_kerb_spans() breaks a junction's curb RING and was consumed at
+    // stage 3c. This breaks the kerb of an edge's own CORRIDOR, which no stage
+    // consumed: a mid-block crossing has no ring, so its zebra was painted into a
+    // 150 mm wall, and a junction crossing's ring drop stepped the full curb
+    // height where the arm mouth handed over to the arm's own kerb.
+    //
+    // Built once, globally, because the runs of two crossings a few metres apart
+    // are merged across the whole edge rather than per crossing. Read-only from
+    // stage 4a onwards, so the parallel stage shares it without synchronisation.
+    std::vector<CorridorKerbDrop> corridor_drops;
+    if (cfg.emit_crossings && cfg.crossings.emit_dropped_kerbs && cfg.drop_corridor_kerbs &&
+        !crossings.empty()) {
+        corridor_drops = corridor_kerb_drops(crossings, m_graph, m_centerlines, profiles,
+                                             cfg.crossings);
+    }
+
     // ── Junction height and signalling, indexed by node ──────────────────────
     // Read by the approach markings. Taken from the SOLVED junctions rather than
     // recomputed from the elevation solver: a junction that came back degenerate
@@ -924,6 +1211,18 @@ RoadNetwork RoadNetworkBuilder::build(const ParsedOSMData& data, const RoadNetwo
         }
         junction_height[junction.node] = junction.height;
         node_has_junction[junction.node] = true;
+
+        // A node this junction absorbed has no junction of its own and never
+        // will -- collect_arms() gave its arms away. Its approaches were still
+        // cut back by this solve, so they are approaches to THIS junction and are
+        // painted against THIS plane. Without this the stop line and the give-way
+        // bar are dropped at every merged node, which on a Dublin-sized extract
+        // is around 45 junctions' worth of paint, silently.
+        for (const GraphNodeId member : absorbed_members[junction.node]) {
+            if (member >= junction_height.size()) continue;
+            junction_height[member] = junction.height;
+            node_has_junction[member] = true;
+        }
     }
 
     /// A valid roundabout annulus replaced this edge's ribbon wholesale
@@ -1025,32 +1324,147 @@ RoadNetwork RoadNetworkBuilder::build(const ParsedOSMData& data, const RoadNetwo
                     continue;
                 }
             }
-            const Centerline& centerline = trimmed ? cut : untrimmed;
+            const Centerline& trimmed_cl = trimmed ? cut : untrimmed;
+
+            // ── Kerb drops: the stations the ramps need to exist ─────────────
+            // Bound before anything else that touches the station list, because
+            // inserting a station changes what every pass below indexes against.
+            CorridorKerbProfile kerb;
+            std::vector<double> kerb_stations;
+            if (!corridor_drops.empty()) {
+                kerb = CorridorKerbProfile(corridor_drops, static_cast<EdgeId>(i),
+                                           static_cast<double>(cfg.profile.curb_height));
+                if (kerb.active()) {
+                    kerb_stations = kerb.required_stations(trimmed_cl.stations.front().arclength,
+                                                           trimmed_cl.stations.back().arclength);
+                }
+            }
+
+            // Held by value only when a station is actually inserted, so an edge
+            // with no drop copies nothing.
+            Centerline dense;
+            bool densified = false;
+            if (!kerb_stations.empty()) {
+                dense = densify_at(trimmed_cl, kerb_stations);
+                densified = dense.is_valid() &&
+                            dense.stations.size() > trimmed_cl.stations.size();
+            }
+            const Centerline& swept = densified ? dense : trimmed_cl;
 
             // Copied per edge rather than shared, because station_heights is the
             // one field that differs between them.
             CorridorConfig corridor_cfg = cfg.corridor;
             bool elevated = false;
+
+            // Parallel to `swept`. Held separately from corridor_cfg because the
+            // decimation below has to gather it by the SAME index list it gathers
+            // the stations by, and a vector already moved into the config cannot
+            // be gathered from.
+            std::vector<float> swept_heights;
             if (has_solved_heights(i)) {
                 const std::vector<float>& solved =
                     !plateau_heights[i].empty()
                         ? plateau_heights[i]
                         : m_elevation.edge(static_cast<EdgeId>(i)).station_heights;
-                if (!trimmed) {
-                    corridor_cfg.station_heights = solved;
+                if (!trimmed && !densified) {
+                    swept_heights = solved;
                     elevated = true;
                 } else {
                     // The solved heights are indexed against the UNTRIMMED
-                    // stations. Handing them to a trimmed ribbon would be accepted
-                    // on size alone and would slide the vertical profile along the
-                    // road by the trim distance.
-                    corridor_cfg.station_heights =
-                        reslice_station_heights(untrimmed, solved, centerline);
-                    elevated = corridor_cfg.station_heights.size() == centerline.stations.size();
+                    // stations. Handing them to a trimmed or densified ribbon
+                    // would be accepted on size alone and would slide the whole
+                    // vertical profile along the road. Resampling by arclength is
+                    // exact because neither slice() nor densify_at() rebases it.
+                    swept_heights = reslice_station_heights(untrimmed, solved, swept);
+                    elevated = swept_heights.size() == swept.stations.size();
                     if (!elevated) {
-                        corridor_cfg.station_heights.clear();
+                        swept_heights.clear();
                     }
                 }
+            }
+
+            // ── Longitudinal decimation ──────────────────────────────────────
+            // Between the elevation solve and the extrusion, which is the only
+            // place it can run: it needs the solved heights, because a road that
+            // is straight in plan can still crest a hill and a plan-view chord
+            // test would flatten the crest back out; and it must come before the
+            // sweep, or the triangles it removes have already been built.
+            //
+            // Everything indexed by station is reduced by the SAME index list --
+            // the stations themselves through apply_station_selection(), the
+            // solved heights by a plain gather here. Reducing one and not the
+            // other is the defect the trim path already had to solve: the sizes
+            // still agree, build_corridor() accepts them, and the road silently
+            // takes somebody else's vertical profile.
+            Centerline reduced;
+            std::vector<float> reduced_heights;
+            bool decimated = false;
+
+            slot.stations_before = swept.stations.size();
+            slot.stations_after = swept.stations.size();
+
+            if (cfg.reduce_tessellation && swept.stations.size() > 2) {
+                // A structural edge is not decimated. Its portal and its span ends
+                // are found by the structure builder against the centerline it is
+                // handed, so there is no arclength to protect and the only safe
+                // answer is to protect them all; see feature_station_mask().
+                const bool structural =
+                    cfg.emit_structures && cfg.height_sampler && on_terrain &&
+                    (m_elevation.edge(static_cast<EdgeId>(i)).is_bridge ||
+                     m_elevation.edge(static_cast<EdgeId>(i)).is_tunnel);
+
+                // A crossing is protected only where it has a kerb drop to
+                // anchor. Its zebra is separate geometry placed against the
+                // UNTRIMMED centerline and its own sampled height, so it does not
+                // need a column in the ribbon -- and protecting one anyway would
+                // make the extruded SURFACE depend on whether the crossings pass
+                // ran, which is exactly what P5's switch-off contract forbids.
+                // Where a drop IS active the ramp needs the columns, and
+                // kerb_stations already brackets the crossing's own arclength.
+                static const std::vector<const Crossing*> kNoCrossings;
+                const std::vector<bool> features = feature_station_mask(
+                    swept, kerb.active() ? crossings_on_edge[i] : kNoCrossings, kerb_stations,
+                    structural);
+
+                const std::vector<size_t> keep =
+                    select_stations(swept, cfg.tessellation, &features,
+                                    elevated ? &swept_heights : nullptr);
+
+                if (keep.size() >= 2 && keep.size() < swept.stations.size()) {
+                    Centerline candidate =
+                        apply_station_selection(swept, keep, cfg.resample.miter_limit);
+
+                    // A selection that did not come back one station per kept
+                    // index cannot be gathered against, so it is refused whole
+                    // rather than applied to the stations and not to the heights.
+                    if (candidate.is_valid() && candidate.stations.size() == keep.size()) {
+                        if (elevated) {
+                            reduced_heights.reserve(keep.size());
+                            for (const size_t k : keep) {
+                                reduced_heights.push_back(swept_heights[k]);
+                            }
+                        }
+                        reduced = std::move(candidate);
+                        decimated = true;
+                        slot.stations_after = keep.size();
+                    }
+                }
+            }
+
+            const Centerline& centerline = decimated ? reduced : swept;
+            if (elevated) {
+                corridor_cfg.station_heights =
+                    decimated ? std::move(reduced_heights) : std::move(swept_heights);
+            }
+
+            // Bound last, so nothing above sees a modulated profile. The lambda
+            // outlives nothing: `kerb`, `corridor_cfg` and the sweep below all
+            // live in this same iteration.
+            if (kerb.active()) {
+                slot.kerb_dropped = true;
+                corridor_cfg.kerb_top_height = [&kerb](double at, bool left, double full) {
+                    return kerb.top_height(at, left, full);
+                };
             }
 
             Corridor corridor = build_corridor(centerline, profile, corridor_cfg);
@@ -1340,6 +1754,13 @@ RoadNetwork RoadNetworkBuilder::build(const ParsedOSMData& data, const RoadNetwo
         network.stats.triangles_before_lod += slot.finish.triangles_before_lod;
         network.stats.triangles_after_lod += slot.finish.triangles_after_lod;
         network.stats.collision_triangles += slot.finish.collision_triangles;
+        network.stats.triangles_before_tess += slot.finish.triangles_before_tess;
+        network.stats.quads_merged += slot.finish.quads_merged;
+        network.stats.stations_before += slot.stations_before;
+        network.stats.stations_after += slot.stations_after;
+        if (slot.kerb_dropped) {
+            ++network.stats.corridor_kerb_edges;
+        }
         if (slot.trimmed) {
             ++network.stats.trimmed_edges;
         }
@@ -1391,6 +1812,8 @@ RoadNetwork RoadNetworkBuilder::build(const ParsedOSMData& data, const RoadNetwo
         network.stats.triangles_before_lod += slot.finish.triangles_before_lod;
         network.stats.triangles_after_lod += slot.finish.triangles_after_lod;
         network.stats.collision_triangles += slot.finish.collision_triangles;
+        network.stats.triangles_before_tess += slot.finish.triangles_before_tess;
+        network.stats.quads_merged += slot.finish.quads_merged;
         ++network.stats.junction_pieces;
 
         network.pieces.push_back(std::move(slot.piece));
@@ -1460,7 +1883,7 @@ RoadNetwork RoadNetworkBuilder::build(const ParsedOSMData& data, const RoadNetwo
             const Junction* solved = junction_at_node[n];
             if (solved != nullptr && !solved->footprint.empty()) {
                 disc.outline = solved->footprint;
-                disc.outline_is_simple = !solved->polygon.self_intersecting;
+                disc.outline_is_simple = !solved->polygon.needs_hull_fallback();
 
                 // The radius contract is that it always BOUNDS the outline, so a
                 // consumer ignoring the polygon still carves a superset.
@@ -1634,6 +2057,43 @@ RoadNetwork RoadNetworkBuilder::build(const ParsedOSMData& data, const RoadNetwo
                      lod_ratio, network.stats.collision_triangles,
                      cfg.weld_meshes ? "on" : "off", cfg.optimize_meshes ? "on" : "off",
                      cfg.build_collision ? "on" : "off", cfg.build_lods ? "on" : "off");
+    }
+
+    // ── Tessellation summary ─────────────────────────────────────────────────
+    // The line that says whether this phase did anything. Stations before and
+    // after are the longitudinal pass on its own; quads merged are the lateral
+    // pass on its own; the triangle pair is the two together, and it is the only
+    // one of the three that a consumer feels directly.
+    //
+    // With RoadNetworkConfig::reduce_tessellation off the station counts are
+    // equal rather than zero and the triangle counts are equal too, which is the
+    // documented no-op state and not a pass that failed to fire.
+    {
+        const double station_ratio =
+            network.stats.stations_before > 0
+                ? 100.0 * static_cast<double>(network.stats.stations_after) /
+                      static_cast<double>(network.stats.stations_before)
+                : 0.0;
+        const double triangle_ratio =
+            network.stats.triangles_before_tess > 0
+                ? 100.0 * static_cast<double>(network.stats.triangles) /
+                      static_cast<double>(network.stats.triangles_before_tess)
+                : 0.0;
+
+        spdlog::info("RoadNetworkBuilder: Tessellation — stations {} -> {} ({:.1f}%), "
+                     "{} quads merged, triangles {} -> {} ({:.1f}%), {} edges with a dropped "
+                     "corridor kerb (reduce {}, merge {}, kerb drops {})",
+                     network.stats.stations_before, network.stats.stations_after, station_ratio,
+                     network.stats.quads_merged, network.stats.triangles_before_tess,
+                     network.stats.triangles, triangle_ratio,
+                     network.stats.corridor_kerb_edges,
+                     cfg.reduce_tessellation ? "on" : "off",
+                     (cfg.reduce_tessellation && cfg.tessellation.merge_coplanar_strips) ? "on"
+                                                                                         : "off",
+                     (cfg.drop_corridor_kerbs && cfg.emit_crossings &&
+                      cfg.crossings.emit_dropped_kerbs)
+                         ? "on"
+                         : "off");
     }
 
     if (cfg.emit_structures && !cfg.height_sampler) {

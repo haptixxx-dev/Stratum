@@ -58,6 +58,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 namespace stratum::osm::road {
 
@@ -255,6 +256,12 @@ UVTiling uv_tiling(MaterialId material) {
         case MaterialId::Grass:      return UVTiling{ 4.0f, 4.0f };
         case MaterialId::Parapet:    return UVTiling{ 2.0f, 2.0f };
 
+        // Building slots. A road strip never carries one -- surface_material() and
+        // strip_material() cannot return them -- so they take the neutral 1x1 m
+        // entry alongside Default, and the switch stays exhaustive.
+        case MaterialId::Wall:
+        case MaterialId::Roof:
+
         // Markings is an atlas; P5 writes explicit sub-rects and must not scale
         // by this neutral entry.
         case MaterialId::Default:
@@ -341,12 +348,72 @@ Corridor build_corridor(const Centerline& cl,
     };
 
     // ------------------------------------------------------------------------
+    // Kerb drop roles.
+    //
+    // Which strip boundaries a dropped kerb owns, found once from the profile's
+    // own structure rather than from a strip index the caller had to supply. See
+    // CorridorConfig::kerb_top_height for the rule and for why the sidewalk's
+    // inboard edge is included and its outboard edge is not.
+    // ------------------------------------------------------------------------
+    const size_t strip_count = profile.strips.size();
+    const bool modulating = static_cast<bool>(cfg.kerb_top_height);
+
+    std::vector<uint8_t> drop_left(modulating ? strip_count : 0u, 0u);
+    std::vector<uint8_t> drop_right(modulating ? strip_count : 0u, 0u);
+    std::vector<uint8_t> drop_side_left(modulating ? strip_count : 0u, 1u);
+
+    if (modulating) {
+        for (size_t i = 0; i < strip_count; ++i) {
+            const Strip& face = profile.strips[i];
+            if (face.kind != StripKind::CurbFace) {
+                continue;
+            }
+            if (std::fabs(face.height_left - face.height_right) <= kZeroHeight) {
+                continue;   // a face with no rise is not a kerb
+            }
+
+            // The raised edge names the side: a kerb whose top is on its LEFT is
+            // the kerb of the left-of-travel footway, and outboard from it runs
+            // towards the front of the strip list.
+            const bool side_left = face.height_left > face.height_right;
+            const int step = side_left ? -1 : 1;
+
+            (side_left ? drop_left : drop_right)[i] = 1u;
+            drop_side_left[i] = side_left ? 1u : 0u;
+
+            // Every CurbTop outboard of the face moves as a whole: it is the top
+            // of the same kerb.
+            auto next = [&](size_t from) -> size_t {
+                return static_cast<size_t>(static_cast<long long>(from) + step);
+            };
+
+            size_t j = next(i);
+            while (j < strip_count && profile.strips[j].kind == StripKind::CurbTop) {
+                drop_left[j] = 1u;
+                drop_right[j] = 1u;
+                drop_side_left[j] = side_left ? 1u : 0u;
+                j = next(j);
+            }
+
+            // The first strip beyond the kerb takes the drop on its INBOARD edge
+            // only, and becomes the crossfall ramp. For a left kerb the inboard
+            // edge is the strip's RIGHT edge, because the lateral walk runs from
+            // the outboard left towards the carriageway.
+            if (j < strip_count) {
+                (side_left ? drop_right : drop_left)[j] = 1u;
+                drop_side_left[j] = side_left ? 1u : 0u;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
     // Lateral walk: left to right is DECREASING lateral, because positive
     // lateral is to the LEFT of travel.
     // ------------------------------------------------------------------------
     double lateral = static_cast<double>(profile.left_edge_offset());
 
-    for (const Strip& strip : profile.strips) {
+    for (size_t strip_index = 0; strip_index < strip_count; ++strip_index) {
+        const Strip& strip = profile.strips[strip_index];
         const double lat_left = lateral;
         const double lat_right = lat_left - static_cast<double>(strip.width);
         lateral = lat_right;
@@ -390,23 +457,49 @@ Corridor build_corridor(const Centerline& cl,
         column_left.clear();
         column_right.clear();
 
+        // Nothing on this strip moves with a drop, so the whole modulation is one
+        // branch outside the station loop for the overwhelming majority of strips.
+        const bool modulate_left = modulating && drop_left[strip_index] != 0u;
+        const bool modulate_right = modulating && drop_right[strip_index] != 0u;
+        const bool side_left_of_travel = !modulating || drop_side_left[strip_index] != 0u;
+
         for (size_t i = 0; i < station_count; ++i) {
             const Station& s = cl.stations[i];
             const double base = surface_height(i);
             const float v = static_cast<float>(s.arclength / static_cast<double>(v_scale));
 
+            // ONE evaluation per station and side, per the contract on
+            // CorridorConfig::kerb_top_height: two boundaries that have to agree
+            // must not be handed two answers.
+            double height_left = static_cast<double>(strip.height_left);
+            double height_right = static_cast<double>(strip.height_right);
+            if (modulate_left) {
+                height_left = cfg.kerb_top_height(s.arclength, side_left_of_travel, height_left);
+            }
+            if (modulate_right) {
+                height_right = cfg.kerb_top_height(s.arclength, side_left_of_travel, height_right);
+            }
+
+            // A dropped face is shorter, so its texture must cover less of the
+            // face rather than being stretched over what is left.
+            float u_l = u_left;
+            float u_r = u_right;
+            if (is_vertical_riser && (modulate_left || modulate_right)) {
+                const double lower = std::min(height_left, height_right);
+                u_l = static_cast<float>((height_left - lower) / static_cast<double>(u_scale));
+                u_r = static_cast<float>((height_right - lower) / static_cast<double>(u_scale));
+            }
+
             Vertex vl{};
-            vl.position = to_world(offset_point(s, lat_left),
-                                   base + static_cast<double>(strip.height_left));
+            vl.position = to_world(offset_point(s, lat_left), base + height_left);
             vl.normal = glm::vec3(0.0f, 1.0f, 0.0f);
-            vl.uv = glm::vec2(u_left, v);
+            vl.uv = glm::vec2(u_l, v);
             vl.color = glm::vec4(1.0f);
 
             Vertex vr{};
-            vr.position = to_world(offset_point(s, lat_right),
-                                   base + static_cast<double>(strip.height_right));
+            vr.position = to_world(offset_point(s, lat_right), base + height_right);
             vr.normal = glm::vec3(0.0f, 1.0f, 0.0f);
-            vr.uv = glm::vec2(u_right, v);
+            vr.uv = glm::vec2(u_r, v);
             vr.color = glm::vec4(1.0f);
 
             column_left.push_back(static_cast<uint32_t>(mesh.vertices.size()));
@@ -439,10 +532,16 @@ Corridor build_corridor(const Centerline& cl,
             continue;
         }
 
-        if (!mesh.submeshes.empty() && mesh.submeshes.back().material == strip.material) {
+        // Keyed on the PAIR, not the slot. Two Asphalt strips with different
+        // variants are two materials, and folding them into one range would put
+        // one texture under both.
+        const MaterialKey key = strip.key();
+        if (!mesh.submeshes.empty() && mesh.submeshes.back().material == key.material &&
+            mesh.submeshes.back().variant == key.variant) {
             mesh.submeshes.back().index_count += added;
         } else {
-            mesh.submeshes.push_back(SubMesh{ strip_index_start, added, strip.material });
+            mesh.submeshes.push_back(SubMesh{ strip_index_start, added, key.material,
+                                              key.variant });
         }
     }
 

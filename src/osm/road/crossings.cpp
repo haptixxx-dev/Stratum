@@ -18,10 +18,15 @@
  *   2. **Painting it.** Stripes are fitted INSIDE the carriageway rather than
  *      laid out and clipped afterwards. See fit_stripes().
  *
- *   3. **Dropping the kerb.** No geometry is produced here. Both span functions
- *      return angular runs of the junction's kerb ring measured from the
- *      junction centre, which junction_curb.cpp turns into a height modulation
- *      of the ring's existing cross-section.
+ *   3. **Dropping the kerb.** No geometry is produced here, and there are two
+ *      kerbs to cut, not one. dropped_kerb_spans() and driveway_kerb_spans()
+ *      return angular runs of a JUNCTION's kerb ring measured from the junction
+ *      centre, which junction_curb.cpp turns into a height modulation of the
+ *      ring's cross-section. corridor_kerb_drops() returns arclength runs of an
+ *      EDGE's own kerb, which the corridor extruder turns into the same
+ *      modulation of the ribbon's cross-section. A mid-block crossing has only
+ *      the second; a junction crossing has both, and needs both, because the
+ *      ring's drop stops dead at the arm's mouth.
  *
  * Everything here lives in stratum_core: no SDL, no ImGui, no rendering API.
  */
@@ -310,9 +315,30 @@ struct CenterlineSample {
     glm::dvec2 position{0.0};
     glm::dvec2 tangent{1.0, 0.0};   ///< unit, direction of travel
     glm::dvec2 normal{0.0, 1.0};    ///< unit, LEFT of travel
+
+    /// Station::miter_scale at the sample; multiply every lateral by it
+    double miter_scale = 1.0;
+
+    /// Station::lateral_max at the sample; the fold guard offset_point() clamps to
+    double lateral_max = 0.0;
+    double lateral_min = 0.0;       ///< Station::lateral_min at the sample
+
     size_t band = 0;                ///< index of the station the band starts at
     double t = 0.0;                 ///< fraction along the band, [0, 1]
     bool valid = false;
+
+    /**
+     * @brief The ground distance a profile lateral stands at, along `normal`
+     *
+     * The single definition of "where is the carriageway edge", and it is
+     * deliberately offset_point()'s arithmetic and nothing else: clamp the
+     * lateral into the station's fold bounds, then multiply by the miter scale.
+     * Any other conversion puts the paint somewhere the corridor's kerb is not.
+     */
+    [[nodiscard]] double ground_offset(double lateral) const {
+        const double bounded = std::min(std::max(lateral, lateral_min), lateral_max);
+        return bounded * miter_scale;
+    }
 };
 
 /**
@@ -373,6 +399,14 @@ struct CenterlineSample {
  * tangent and at a joint it leans with the joint. Where the two bracketing
  * bisectors cancel -- a hairpin -- the tangent's own left perpendicular takes
  * over rather than leaving a zero-length axis.
+ *
+ * The MITER VECTOR `normal * miter_scale` is what is interpolated, not the
+ * normal and the scale separately. That is exactly what interpolate_station()
+ * does behind slice(), and it is not a stylistic match: lerping a unit normal
+ * and a scale apart gives a different direction AND a different reach from the
+ * ribbon the corridor extruder actually swept, so the zebra would be laid on a
+ * carriageway a few centimetres wider or narrower than the one under it, and
+ * dropped_kerb_spans() would put its corners off the junction ring's own.
  */
 [[nodiscard]] CenterlineSample sample_centerline(const Centerline& cl, double arclength) {
     CenterlineSample out;
@@ -416,8 +450,30 @@ struct CenterlineSample {
     out.t = t;
     out.position = a.position + (b.position - a.position) * t;
     out.tangent = safe_normalise(b.position - a.position, a.tangent);
-    out.normal = safe_normalise(a.normal + (b.normal - a.normal) * t,
-                                glm::dvec2(-out.tangent.y, out.tangent.x));
+
+    const glm::dvec2 mv_a = a.normal * a.miter_scale;
+    const glm::dvec2 mv_b = b.normal * b.miter_scale;
+    const glm::dvec2 mv = mv_a + (mv_b - mv_a) * t;
+    const double mv_len = glm::length(mv);
+    if (mv_len > kZeroLength && std::isfinite(mv_len)) {
+        out.normal = mv / mv_len;
+        out.miter_scale = mv_len;
+    } else {
+        out.normal = safe_normalise(a.normal, glm::dvec2(-out.tangent.y, out.tangent.x));
+        out.miter_scale = a.miter_scale;
+    }
+
+    out.lateral_max = a.lateral_max + (b.lateral_max - a.lateral_max) * t;
+    out.lateral_min = a.lateral_min + (b.lateral_min - a.lateral_min) * t;
+    if (!(out.lateral_max > out.lateral_min)) {
+        // An inverted or collapsed pair would clamp every lateral to one point.
+        out.lateral_max = kUnboundedLateral;
+        out.lateral_min = -kUnboundedLateral;
+    }
+    if (!(out.miter_scale > kZeroLength) || !std::isfinite(out.miter_scale)) {
+        out.miter_scale = 1.0;
+    }
+
     out.valid = true;
     return out;
 }
@@ -459,12 +515,17 @@ struct Arc {
 /**
  * @brief The arc subtended at @p center by the segment from @p a to @p b
  *
- * Always the SHORT way round. A kerb drop is a couple of metres on a ring tens
- * of metres in circumference, so a sweep past pi means the two endpoints were
- * taken in the wrong order, never that the drop really wraps most of the
- * junction.
+ * Always the SHORT way round, which for a straight segment is exactly the arc
+ * the segment sweeps: the angle a segment subtends at a point off it is less
+ * than pi by construction, so a sweep past pi says the two endpoints were taken
+ * in clockwise order and nothing else.
  *
- * @return false when either endpoint sits on the centre, or the two collapse
+ * The one case that is not covered by that is the centre lying ON the segment,
+ * where the two endpoints are diametrically opposed, the angle is exactly pi and
+ * which half is "the drop" is undecidable. It is refused rather than guessed at.
+ *
+ * @return false when either endpoint sits on the centre, when the two collapse,
+ *         or when the centre lies on the segment between them
  */
 [[nodiscard]] bool arc_between(const glm::dvec2& center,
                                const glm::dvec2& a,
@@ -474,6 +535,9 @@ struct Arc {
     const glm::dvec2 db = b - center;
     if (glm::length(da) <= kZeroLength || glm::length(db) <= kZeroLength) {
         return false;
+    }
+    if (glm::length(da + db) <= kZeroLength) {
+        return false;   // the centre is the midpoint: no arc corresponds to the run
     }
 
     const double theta_a = std::atan2(da.y, da.x);
@@ -841,11 +905,32 @@ std::vector<Crossing> find_crossings(const RoadGraph& graph,
 
         // Push a junction crossing back off the trim station, so it and the
         // stop line on the same arm stack rather than overlap.
+        //
+        // The setback is bounded by the OTHER end's trim, not by the end of the
+        // edge. The corridor only exists over [lo + trim_from, length - trim_to];
+        // outside it the ribbon was cut away and the junction fill took over. A
+        // setback clamped to the whole edge walks a crossing straight into the
+        // far junction's polygon whenever the block is short -- two 7 m roads
+        // meeting 8 m apart trim 3.75 m a side, so 1.5 m of setback lands the
+        // crossing a metre INSIDE the opposite junction, where it paints over the
+        // fill, gets a kerb drop demanded of kerb that is not there, and stacks
+        // on top of the far arm's stop line.
         if (at_junction) {
             const double setback = std::max(0.0, static_cast<double>(cfg.setback));
             const double want = at_from_end ? (lo + trim_from + setback)
                                             : (length - trim_to - setback);
-            arclength = std::clamp(want, lo, length);
+
+            const double corridor_lo = std::min(lo + trim_from, length);
+            const double corridor_hi = std::max(length - trim_to, lo);
+            if (corridor_hi > corridor_lo) {
+                arclength = std::clamp(want, corridor_lo, corridor_hi);
+            } else {
+                // The two trims met or crossed: the whole edge is junction and
+                // there is no ribbon left to stand the crossing on. Splitting the
+                // difference keeps it at the seam between the two fills rather
+                // than arbitrarily inside one of them.
+                arclength = std::clamp(0.5 * (corridor_lo + corridor_hi), lo, length);
+            }
         }
 
         const CenterlineSample sample = sample_centerline(cl, arclength);
@@ -883,7 +968,51 @@ std::vector<Crossing> find_crossings(const RoadGraph& graph,
         if (!extent.valid) {
             continue;
         }
-        const double usable = 2.0 * extent.half;
+
+        // --------------------------------------------------------------------
+        // Profile laterals are NOT ground distances.
+        //
+        // build_corridor() puts every strip edge through offset_point(), which
+        // clamps the lateral into the station's fold bounds and then multiplies
+        // by Station::miter_scale. So the kerb the paint has to stop at is at
+        // `half * miter_scale`, not at `half`, and inside a fold it is at the
+        // clamp instead. Laying the run out against the raw profile span leaves
+        // the zebra short of both kerbs at every joint the centerline mitres --
+        // 3.5% of the width at a 30 degree turn, 45% at a right angle -- and,
+        // where the fold guard binds, runs it over the kerb and onto the
+        // footway, which is precisely the failure this file's clipping rule
+        // exists to prevent.
+        //
+        // The two sides are measured independently because the fold clamp is not
+        // symmetric: on the inside of a tight bend lateral_min or lateral_max
+        // binds on one side only. Crossing::width is a single span centred on the
+        // centreline, so the SHORTER side is what it can carry. Under-reaching
+        // one kerb by the difference is the safe error; over-reaching the other
+        // is the unsafe one.
+        // --------------------------------------------------------------------
+        const double left_reach = sample.ground_offset(extent.half);
+        const double right_reach = -sample.ground_offset(-extent.half);
+        const double half_ground = std::min(left_reach, right_reach);
+        if (!(half_ground > kZeroLength) || !std::isfinite(half_ground)) {
+            continue;
+        }
+        const double usable = 2.0 * half_ground;
+
+        // The island rides the same transform, then is held inside the extent so
+        // an asymmetric clamp can never leave build_crossing() a run that starts
+        // outside the carriageway it is supposed to be fitted into.
+        double island_left = 0.0;
+        double island_right = 0.0;
+        if (extent.island_left - extent.island_right > kZeroLength) {
+            island_left = std::clamp(sample.ground_offset(extent.island_left),
+                                     -half_ground, half_ground);
+            island_right = std::clamp(sample.ground_offset(extent.island_right),
+                                      -half_ground, half_ground);
+            if (!(island_left - island_right > kZeroLength)) {
+                island_left = 0.0;
+                island_right = 0.0;
+            }
+        }
 
         Crossing c;
         c.node = at_junction ? node : ((cand.vertex == 0 || cand.vertex + 1 == edge.node_ids.size())
@@ -894,8 +1023,8 @@ std::vector<Crossing> find_crossings(const RoadGraph& graph,
         c.position = sample.position;
         c.axis = axis;
         c.width = static_cast<float>(usable);
-        c.island_left = static_cast<float>(extent.island_left);
-        c.island_right = static_cast<float>(extent.island_right);
+        c.island_left = static_cast<float>(island_left);
+        c.island_right = static_cast<float>(island_right);
         c.height = height_at(elevation, cand.edge, sample);
         c.at_junction = at_junction;
 
@@ -1081,12 +1210,22 @@ Mesh build_crossing(const Crossing& c, const CrossingConfig& cfg) {
 std::vector<DroppedKerbSpan> dropped_kerb_spans(const std::vector<Crossing>& crossings,
                                                 GraphNodeId node,
                                                 glm::dvec2 junction_center,
-                                                const CrossingConfig& cfg) {
+                                                const CrossingConfig& cfg,
+                                                const std::vector<GraphNodeId>* absorbed_nodes) {
     std::vector<DroppedKerbSpan> out;
 
     if (!cfg.emit_dropped_kerbs || node == kInvalidId || !is_finite(junction_center)) {
         return out;
     }
+
+    // A crossing on an approach to a node this junction ABSORBED stands on this
+    // junction's ring, because the absorbed node has none. See the header.
+    const auto covers_node = [&](GraphNodeId id) {
+        if (id == node) return true;
+        if (absorbed_nodes == nullptr) return false;
+        return std::find(absorbed_nodes->begin(), absorbed_nodes->end(), id) !=
+               absorbed_nodes->end();
+    };
 
     const double half_drop = std::max(0.0, static_cast<double>(cfg.dropped_kerb_width)) * 0.5;
     if (half_drop <= kZeroLength) {
@@ -1097,7 +1236,7 @@ std::vector<DroppedKerbSpan> dropped_kerb_spans(const std::vector<Crossing>& cro
     arcs.reserve(crossings.size() * 2);
 
     for (const Crossing& c : crossings) {
-        if (!c.at_junction || c.node != node) {
+        if (!c.at_junction || !covers_node(c.node)) {
             continue;
         }
         if (!(c.width > 0.0f) || !is_finite(c.position) || !is_finite(c.axis)) {
@@ -1240,7 +1379,14 @@ std::vector<DroppedKerbSpan> driveway_kerb_spans(const RoadGraph& graph,
             continue;
         }
 
-        double half_width = 0.5 * static_cast<double>(profiles[arm.edge].carriageway_width());
+        // The Lane-to-Median ENVELOPE, not RoadProfile::carriageway_width().
+        // carriageway_width() sums Lane strips alone, so it misses a median and
+        // the gutters and curbs inside one, and the flare would then be cut for a
+        // mouth narrower than the one junction_polygon.cpp actually opened.
+        // carriageway_half_extent() in junction_trim.cpp measures the same span
+        // this does, which is what keeps the flare and the mouth on one lateral.
+        const CrossExtent arm_extent = measure_extent(profiles[arm.edge]);
+        double half_width = arm_extent.valid ? arm_extent.half : 0.0;
         if (!(half_width > 0.0)) {
             half_width = 0.5 * static_cast<double>(edge.width);
         }
@@ -1271,6 +1417,396 @@ std::vector<DroppedKerbSpan> driveway_kerb_spans(const RoadGraph& graph,
     }
 
     return to_spans(merge_arcs(std::move(arcs)), cfg.dropped_kerb_height);
+}
+
+
+// ============================================================================
+// corridor_kerb_drops
+// ============================================================================
+
+namespace {
+
+/// Spacing the ramp breakpoints are handed out at, metres
+constexpr double kCorridorRampStep = 0.2;
+
+/// Spacing the flat lip's breakpoints are handed out at, metres
+constexpr double kCorridorFlatStep = 1.0;
+
+/// Ceiling on the stations one run may demand, so a huge drop cannot explode a mesh
+constexpr size_t kMaxRequiredStations = 256;
+
+/**
+ * @brief The profile carries a kerb that a drop could act on
+ *
+ * A CurbFace whose two edges differ in height, or a CurbTop standing above the
+ * carriageway. A rural profile with a verge and no kerb has neither, and asking
+ * the corridor to resample it across a drop would cost vertices and change
+ * nothing.
+ */
+[[nodiscard]] bool profile_has_kerb(const RoadProfile& profile) {
+    constexpr double kFlushHeight = 0.01;
+    for (const Strip& s : profile.strips) {
+        if (s.kind == StripKind::CurbFace &&
+            std::fabs(static_cast<double>(s.height_left) -
+                      static_cast<double>(s.height_right)) > kFlushHeight) {
+            return true;
+        }
+        if (s.kind == StripKind::CurbTop &&
+            std::max(std::fabs(static_cast<double>(s.height_left)),
+                     std::fabs(static_cast<double>(s.height_right))) > kFlushHeight) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Merge the runs of one edge and side that overlap or touch
+ *
+ * Two crossings a few metres apart would otherwise ramp back up to full height
+ * between them and straight down again, which is a ripple in the kerb line that
+ * exists in no real street. Merging takes the union of the flats, the DEEPER
+ * lip, and the ramps belonging to the two surviving outer ends -- so a merged
+ * run that reaches a trim station still carries that end's zero ramp and still
+ * butts the junction ring at the lip.
+ *
+ * @param runs Runs of ONE edge and ONE side, sorted ascending by `from`
+ */
+void merge_runs(std::vector<CorridorKerbDrop>& runs) {
+    if (runs.size() < 2) {
+        return;
+    }
+
+    std::vector<CorridorKerbDrop> merged;
+    merged.reserve(runs.size());
+
+    for (const CorridorKerbDrop& r : runs) {
+        if (merged.empty()) {
+            merged.push_back(r);
+            continue;
+        }
+        CorridorKerbDrop& last = merged.back();
+
+        // The two ramps between the runs are what would be drawn, so touching
+        // ramps -- not only overlapping flats -- are cause to merge.
+        if (r.from - r.ramp_from > last.to + last.ramp_to + kArclengthEpsilon) {
+            merged.push_back(r);
+            continue;
+        }
+
+        if (r.to > last.to) {
+            last.to = r.to;
+            last.ramp_to = r.ramp_to;
+        }
+        last.ramp_from = std::min(last.ramp_from, r.ramp_from);
+        last.height = std::min(last.height, r.height);
+    }
+
+    runs.swap(merged);
+}
+
+} // namespace
+
+std::vector<CorridorKerbDrop> corridor_kerb_drops(const std::vector<Crossing>& crossings,
+                                                  const RoadGraph& graph,
+                                                  const std::vector<Centerline>& centerlines,
+                                                  const std::vector<RoadProfile>& profiles,
+                                                  const CrossingConfig& cfg) {
+    std::vector<CorridorKerbDrop> out;
+
+    if (!cfg.emit_dropped_kerbs || crossings.empty()) {
+        return out;
+    }
+
+    const std::vector<GraphEdge>& edges = graph.edges();
+    if (centerlines.size() != edges.size() || profiles.size() != edges.size()) {
+        spdlog::warn("corridor_kerb_drops: {} edges but {} centerlines and {} profiles; "
+                     "refusing to cut the corridor kerb",
+                     edges.size(), centerlines.size(), profiles.size());
+        return out;
+    }
+
+    // The drop is at least as wide as the painted corridor it serves. A 2 m
+    // dropped_kerb_width against a 3 m crossing_depth would leave the outer half
+    // metre of the zebra at each end running into a full-height kerb, which is
+    // the same defect at a smaller scale.
+    const double flat = std::max({ static_cast<double>(cfg.dropped_kerb_width),
+                                   static_cast<double>(cfg.crossing_depth),
+                                   0.0 });
+    const double ramp = std::max(0.0, static_cast<double>(cfg.dropped_kerb_ramp));
+    if (!(flat > kZeroLength)) {
+        return out;
+    }
+    const double half_flat = 0.5 * flat;
+
+    out.reserve(crossings.size());
+
+    for (const Crossing& c : crossings) {
+        if (c.edge == kInvalidId || static_cast<size_t>(c.edge) >= edges.size()) {
+            continue;
+        }
+        const GraphEdge& edge = edges[c.edge];
+        const Centerline& cl = centerlines[c.edge];
+        if (!cl.is_valid() || !profile_has_kerb(profiles[c.edge])) {
+            continue;
+        }
+        if (!std::isfinite(c.arclength)) {
+            continue;
+        }
+
+        const double lo = cl.stations.front().arclength;
+        const double length = cl.length();
+        const double trim_from = std::clamp(edge.trim_from, 0.0, std::max(0.0, length - lo));
+        const double trim_to = std::clamp(edge.trim_to, 0.0, std::max(0.0, length - lo));
+
+        // The span the ribbon actually occupies. Outside it there is no kerb to
+        // cut -- the corridor was sliced away and the junction fill took over.
+        const double corridor_lo = lo + trim_from;
+        const double corridor_hi = length - trim_to;
+        if (!(corridor_hi - corridor_lo > kZeroLength)) {
+            continue;
+        }
+
+        const double s = std::clamp(c.arclength, corridor_lo, corridor_hi);
+
+        CorridorKerbDrop drop;
+        drop.edge = c.edge;
+        drop.height = cfg.dropped_kerb_height;
+        drop.side = KerbSide::Both;
+
+        if (c.at_junction) {
+            // Which end of the edge the arm belongs to. Crossing::node is the
+            // junction the arm approaches, so it names the end directly; a loop
+            // edge whose two ends are the same node falls back to whichever trim
+            // station the crossing is nearer, which is the same test
+            // find_crossings() used to classify it.
+            bool at_from_end = false;
+            if (c.node != kInvalidId && edge.from == edge.to) {
+                at_from_end = (s - corridor_lo) <= (corridor_hi - s);
+            } else if (c.node != kInvalidId && c.node == edge.from) {
+                at_from_end = true;
+            } else if (c.node != kInvalidId && c.node == edge.to) {
+                at_from_end = false;
+            } else {
+                at_from_end = (s - corridor_lo) <= (corridor_hi - s);
+            }
+
+            // Run right up to the arm's trim station, with NO ramp at that end.
+            // That is where the corridor stops and the junction ring's own
+            // dropped span begins, and both are at the lip there, so the two
+            // kerbs meet at one height instead of stepping the full curb.
+            if (at_from_end) {
+                drop.from = corridor_lo;
+                drop.to = std::min(s + half_flat, corridor_hi);
+                drop.ramp_from = 0.0;
+                drop.ramp_to = ramp;
+            } else {
+                drop.from = std::max(s - half_flat, corridor_lo);
+                drop.to = corridor_hi;
+                drop.ramp_from = ramp;
+                drop.ramp_to = 0.0;
+            }
+        } else {
+            drop.from = std::max(s - half_flat, corridor_lo);
+            drop.to = std::min(s + half_flat, corridor_hi);
+            drop.ramp_from = ramp;
+            drop.ramp_to = ramp;
+        }
+
+        // A ramp needs kerb to climb. On a short block the flat is pressed right
+        // against a trim station and there is none left on that side, so the ramp
+        // is cut back to what there is -- and cut to nothing where the flat
+        // reaches the trim station itself, which is the correct answer rather
+        // than a fallback: past that station the junction ring's own dropped span
+        // continues at the lip, and a ramp climbing back to full height in the
+        // last metre before it would build the step it was meant to avoid.
+        if (drop.ramp_from > 0.0) {
+            drop.ramp_from = std::min(drop.ramp_from, std::max(0.0, drop.from - corridor_lo));
+        }
+        if (drop.ramp_to > 0.0) {
+            drop.ramp_to = std::min(drop.ramp_to, std::max(0.0, corridor_hi - drop.to));
+        }
+
+        if (!(drop.to - drop.from >= 0.0)) {
+            continue;
+        }
+        out.push_back(drop);
+    }
+
+    if (out.empty()) {
+        return out;
+    }
+
+    std::sort(out.begin(), out.end(),
+              [](const CorridorKerbDrop& a, const CorridorKerbDrop& b) {
+                  if (a.edge != b.edge) {
+                      return a.edge < b.edge;
+                  }
+                  if (a.from != b.from) {
+                      return a.from < b.from;
+                  }
+                  return a.to < b.to;
+              });
+
+    // Merge per (edge, side). Every run this function produces is KerbSide::Both,
+    // so the grouping is by edge alone today; the side is carried in the key so a
+    // one-sided source -- a driveway on a corridor, say -- needs no new pass.
+    std::vector<CorridorKerbDrop> merged;
+    merged.reserve(out.size());
+    size_t i = 0;
+    while (i < out.size()) {
+        size_t j = i + 1;
+        while (j < out.size() && out[j].edge == out[i].edge && out[j].side == out[i].side) {
+            ++j;
+        }
+        std::vector<CorridorKerbDrop> group(out.begin() + static_cast<std::ptrdiff_t>(i),
+                                            out.begin() + static_cast<std::ptrdiff_t>(j));
+        merge_runs(group);
+        merged.insert(merged.end(), group.begin(), group.end());
+        i = j;
+    }
+
+    return merged;
+}
+
+// ============================================================================
+// CorridorKerbProfile
+// ============================================================================
+
+CorridorKerbProfile::CorridorKerbProfile(const std::vector<CorridorKerbDrop>& drops,
+                                         EdgeId edge,
+                                         double curb_height,
+                                         double ramp_floor) {
+    if (edge == kInvalidId || !(curb_height > 0.0)) {
+        return;
+    }
+    const double floor_len = std::max(kZeroLength, ramp_floor);
+
+    for (const CorridorKerbDrop& d : drops) {
+        if (d.edge != edge) {
+            continue;
+        }
+        if (!std::isfinite(d.from) || !std::isfinite(d.to) || d.to < d.from) {
+            continue;
+        }
+
+        Run r;
+        r.from = d.from;
+        r.to = d.to;
+        // A ramp of ZERO is meaningful: the drop continues past that end into a
+        // junction ring already at the lip. Any other value below the floor is a
+        // misconfiguration, and honouring it would draw the instant step this
+        // whole mechanism exists to avoid.
+        r.ramp_from = (d.ramp_from <= kZeroLength) ? 0.0 : std::max(floor_len, d.ramp_from);
+        r.ramp_to = (d.ramp_to <= kZeroLength) ? 0.0 : std::max(floor_len, d.ramp_to);
+        r.lip = std::clamp(static_cast<double>(d.height), 0.0, curb_height);
+        r.left = (d.side != KerbSide::Right);
+        r.right = (d.side != KerbSide::Left);
+        if (!r.left && !r.right) {
+            continue;
+        }
+        m_runs.push_back(r);
+    }
+}
+
+double CorridorKerbProfile::run_factor(const Run& r, double s) const {
+    if (s >= r.from && s <= r.to) {
+        return 1.0;
+    }
+    if (s < r.from) {
+        // Zero ramp: the drop runs off this end at the lip rather than climbing
+        // back, so anything before it is simply outside this run.
+        if (r.ramp_from <= kZeroLength) {
+            return 0.0;
+        }
+        return std::clamp(1.0 - (r.from - s) / r.ramp_from, 0.0, 1.0);
+    }
+    if (r.ramp_to <= kZeroLength) {
+        return 0.0;
+    }
+    return std::clamp(1.0 - (s - r.to) / r.ramp_to, 0.0, 1.0);
+}
+
+double CorridorKerbProfile::factor(double arclength, bool left_of_travel) const {
+    if (m_runs.empty() || !std::isfinite(arclength)) {
+        return 0.0;
+    }
+    double deepest = 0.0;
+    for (const Run& r : m_runs) {
+        if (left_of_travel ? !r.left : !r.right) {
+            continue;
+        }
+        deepest = std::max(deepest, run_factor(r, arclength));
+    }
+    return deepest;
+}
+
+double CorridorKerbProfile::top_height(double arclength, bool left_of_travel, double full) const {
+    if (m_runs.empty() || !std::isfinite(arclength) || !std::isfinite(full)) {
+        return full;
+    }
+    double lowest = full;
+    for (const Run& r : m_runs) {
+        if (left_of_travel ? !r.left : !r.right) {
+            continue;
+        }
+        const double f = run_factor(r, arclength);
+        if (f <= 0.0) {
+            continue;
+        }
+        lowest = std::min(lowest, full + (r.lip - full) * f);
+    }
+    return lowest;
+}
+
+std::vector<double> CorridorKerbProfile::required_stations(double lo, double hi) const {
+    std::vector<double> out;
+    if (m_runs.empty() || !(hi > lo)) {
+        return out;
+    }
+
+    const auto add = [&](double s) {
+        if (s >= lo - kArclengthEpsilon && s <= hi + kArclengthEpsilon &&
+            out.size() < kMaxRequiredStations) {
+            out.push_back(std::clamp(s, lo, hi));
+        }
+    };
+
+    // Both ends of a ramp AND samples down it, because the slope has to be
+    // carried by real columns; both ends of the flat, because a lip that falls
+    // between two stations is drawn as a V rather than as a lip.
+    const auto walk = [&](double a, double b, double step) {
+        if (!(b > a) || !(step > kZeroLength)) {
+            return;
+        }
+        const auto n = static_cast<size_t>(std::ceil((b - a) / step));
+        const size_t count = std::min<size_t>(std::max<size_t>(n, 1), kMaxRequiredStations);
+        for (size_t k = 0; k <= count; ++k) {
+            add(a + (b - a) * (static_cast<double>(k) / static_cast<double>(count)));
+        }
+    };
+
+    for (const Run& r : m_runs) {
+        if (r.ramp_from > kZeroLength) {
+            walk(r.from - r.ramp_from, r.from, kCorridorRampStep);
+        } else {
+            add(r.from);
+        }
+        walk(r.from, r.to, kCorridorFlatStep);
+        if (r.ramp_to > kZeroLength) {
+            walk(r.to, r.to + r.ramp_to, kCorridorRampStep);
+        } else {
+            add(r.to);
+        }
+    }
+
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end(),
+                          [](double a, double b) {
+                              return std::fabs(a - b) <= kArclengthEpsilon;
+                          }),
+              out.end());
+    return out;
 }
 
 } // namespace stratum::osm::road

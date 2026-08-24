@@ -184,9 +184,10 @@ struct CarveDisc {
     /**
      * @brief The outline is a simple polygon and may be point-in-polygon tested
      *
-     * Mirrors the negation of JunctionPolygon::self_intersecting. A ring that
-     * crosses itself has no meaningful winding number, and a winding test against
-     * one punches holes in the terrain -- the same failure CarveRibbon documents.
+     * Mirrors the negation of JunctionPolygon::needs_hull_fallback(). A ring that
+     * crosses itself has no meaningful winding number, and one wound clockwise
+     * bounds the complement of what it looks like; a winding test against either
+     * punches holes in the terrain -- the same failure CarveRibbon documents.
      * When this is false, or `outline` is empty, the carve must use `radius`.
      * Always false when `outline` is empty.
      */

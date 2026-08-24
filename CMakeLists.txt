@@ -76,6 +76,7 @@ add_library(stratum_core STATIC
 
     # OSM road network
     src/osm/road/road_graph.cpp
+    src/osm/road/road_style.cpp
     src/osm/road/road_profile.cpp
     src/osm/road/centerline.cpp
     src/osm/road/corridor.cpp
@@ -96,12 +97,21 @@ add_library(stratum_core STATIC
     src/osm/road/bridge_builder.cpp
     src/osm/road/tunnel_builder.cpp
 
+    # Geometry reduction. Ordered before the builder because the builder calls
+    # both: select_stations() between the elevation solve and the extrusion, and
+    # merge_coplanar_quads() inside the per-piece finish.
+    src/osm/road/tessellation.cpp
+
     src/osm/road/road_network_builder.cpp
 
     # P7 game-ready output
     src/osm/road/mesh_optimize.cpp
     src/osm/road/collision_mesh.cpp
     src/osm/road/road_export.cpp
+
+    # Chunk-level LOD. Built by the SPATIAL INDEX once it knows which pieces
+    # landed in which leaf, not by RoadNetworkBuilder; see lod_chunk.hpp.
+    src/osm/road/lod_chunk.cpp
 
     # Procedural Generation
     src/procgen/noise.cpp

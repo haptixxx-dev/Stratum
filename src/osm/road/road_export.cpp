@@ -51,6 +51,8 @@
 
 #include "osm/road/road_export.hpp"
 
+#include "osm/road/road_style.hpp"
+
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -121,14 +123,33 @@ constexpr int kGltfTriangles = 4;
         case MaterialId::Grass:      return { 0.30f, 0.45f, 0.20f };
         case MaterialId::BridgeDeck: return { 0.55f, 0.55f, 0.56f };
         case MaterialId::Parapet:    return { 0.70f, 0.70f, 0.68f };
+        // Building slots. No road piece carries either; the arms exist so the
+        // switch stays exhaustive and a new slot is a warning, not a grey mass.
+        case MaterialId::Wall:       return { 0.72f, 0.62f, 0.52f };
+        case MaterialId::Roof:       return { 0.48f, 0.28f, 0.26f };
         case MaterialId::Count:      break;
     }
     return { 0.60f, 0.60f, 0.60f };
 }
 
-/// Name an emitted material slot, prefix included
-[[nodiscard]] std::string material_name(MaterialId material, const ExportConfig& cfg) {
-    return cfg.material_prefix + material_id_name(material);
+/// Unpack a MaterialKey::packed() value back into its two halves
+[[nodiscard]] MaterialKey unpack_material_key(uint32_t packed) {
+    return MaterialKey{ static_cast<MaterialId>(packed >> 16), static_cast<uint16_t>(packed) };
+}
+
+/**
+ * @brief Name an emitted material, prefix included
+ *
+ * material_key_name(), NOT material_id_name(): the pipeline distinguishes an
+ * ordinary asphalt carriageway from a worn or a cobbled one by the VARIANT half
+ * of its MaterialKey, and naming an export by the slot alone collapses every such
+ * pair into one `usemtl` line, one glTF material and one `newmtl` block. The
+ * distinction then cannot be re-made in the target engine at all, because the
+ * ranges were merged before any file was written. road_style.hpp documents these
+ * names as frozen precisely because they travel in exported files.
+ */
+[[nodiscard]] std::string material_name(MaterialKey key, const ExportConfig& cfg) {
+    return cfg.material_prefix + material_key_name(key);
 }
 
 // ============================================================================
@@ -165,13 +186,20 @@ struct ChunkKey {
  * @brief One chunk under construction
  *
  * Indices are kept in per-material lists and concatenated only at the end, so a
- * chunk's SubMesh ranges come out contiguous and in ascending MaterialId order
+ * chunk's SubMesh ranges come out contiguous and in ascending MaterialKey order
  * without any post-hoc sorting pass.
+ *
+ * Keyed on MaterialKey::packed(), not on the slot: two ranges sharing a slot and
+ * differing in variant are two materials, and a fixed slot-indexed bucket array
+ * merged them before any writer saw them. std::map keeps the ascending packed
+ * order -- slot first, then variant -- that the ranges are documented to come out
+ * in, and the variant axis is sparse enough that a bucket per possible key is not
+ * an option.
  */
 struct ChunkAccum {
     std::vector<Vertex> vertices;
     std::unordered_map<uint64_t, uint32_t> vertex_map;   ///< (source id, vertex) -> local index
-    std::vector<std::vector<uint32_t>> by_material{ kMaterialCount };
+    std::map<uint32_t, std::vector<uint32_t>> by_material;  ///< packed MaterialKey -> indices
     size_t triangles = 0;
 };
 
@@ -195,25 +223,31 @@ using ChunkMap = std::map<ChunkKey, ChunkAccum>;
 }
 
 /**
- * @brief Per-triangle material slot, resolving the implicit whole-mesh range
+ * @brief Per-triangle packed MaterialKey, resolving the implicit whole-mesh range
  *
- * Triangles covered by no range keep MaterialId::Default rather than being
- * dropped, which matches Mesh::sort_submeshes_by_material().
+ * Triangles covered by no range keep `MaterialKey{}` -- MaterialId::Default,
+ * variant 0 -- rather than being dropped, which matches
+ * Mesh::sort_submeshes_by_material().
+ *
+ * The key is the (slot, variant) PAIR, exactly as sort_submeshes_by_material()
+ * keys it. Keying on the slot alone silently merged a worn asphalt range with an
+ * ordinary one before the writers ran, so the two could not be given different
+ * textures in the target engine.
  */
-[[nodiscard]] std::vector<uint8_t> triangle_materials(const Mesh& mesh) {
+[[nodiscard]] std::vector<uint32_t> triangle_materials(const Mesh& mesh) {
     const size_t tri_count = mesh.indices.size() / 3u;
-    std::vector<uint8_t> out(tri_count, static_cast<uint8_t>(MaterialId::Default));
+    std::vector<uint32_t> out(tri_count, MaterialKey{}.packed());
 
     for (const SubMesh& sub : mesh.effective_submeshes()) {
-        const uint8_t slot = static_cast<uint8_t>(sub.material);
-        if (static_cast<size_t>(slot) >= kMaterialCount) {
+        if (static_cast<size_t>(sub.material) >= kMaterialCount) {
             continue;
         }
+        const uint32_t key = MaterialKey{ sub.material, sub.variant }.packed();
         const size_t first = sub.index_offset / 3u;
         const size_t last = (static_cast<size_t>(sub.index_offset)
                              + static_cast<size_t>(sub.index_count)) / 3u;
         for (size_t t = first; t < last && t < tri_count; ++t) {
-            out[t] = slot;
+            out[t] = key;
         }
     }
     return out;
@@ -227,16 +261,16 @@ using ChunkMap = std::map<ChunkKey, ChunkAccum>;
  * @param source_id  Identity of the mesh, so its vertices are deduplicated
  *                   within a chunk without colliding with another mesh's
  * @param chunk_size Grid cell size; 0 or less puts everything in one chunk
- * @param used       Set of materials seen anywhere in the export
+ * @param used       Packed MaterialKeys seen anywhere in the export
  * @return Triangles routed
  */
 size_t accumulate_mesh(ChunkMap& chunks, const Mesh& mesh, uint32_t source_id,
-                       float chunk_size, std::set<MaterialId>& used) {
+                       float chunk_size, std::set<uint32_t>& used) {
     if (mesh.vertices.empty() || mesh.indices.size() < 3u) {
         return 0;
     }
 
-    const std::vector<uint8_t> tri_material = triangle_materials(mesh);
+    const std::vector<uint32_t> tri_material = triangle_materials(mesh);
     const size_t tri_count = mesh.indices.size() / 3u;
     const size_t vertex_count = mesh.vertices.size();
     size_t routed = 0;
@@ -259,8 +293,8 @@ size_t accumulate_mesh(ChunkMap& chunks, const Mesh& mesh, uint32_t source_id,
         }
 
         ChunkAccum& chunk = chunks[cell_of(centroid, chunk_size)];
-        const uint8_t slot = tri_material[t];
-        std::vector<uint32_t>& target = chunk.by_material[slot];
+        const uint32_t key = tri_material[t];
+        std::vector<uint32_t>& target = chunk.by_material[key];
 
         for (uint32_t vi : index) {
             const uint64_t key = source_vertex_key(source_id, vi);
@@ -274,7 +308,7 @@ size_t accumulate_mesh(ChunkMap& chunks, const Mesh& mesh, uint32_t source_id,
 
         ++chunk.triangles;
         ++routed;
-        used.insert(static_cast<MaterialId>(slot));
+        used.insert(key);
     }
 
     return routed;
@@ -286,19 +320,22 @@ size_t accumulate_mesh(ChunkMap& chunks, const Mesh& mesh, uint32_t source_id,
     mesh.vertices = chunk.vertices;
 
     size_t total = 0;
-    for (const auto& list : chunk.by_material) {
+    for (const auto& [key, list] : chunk.by_material) {
+        (void)key;
         total += list.size();
     }
     mesh.indices.reserve(total);
 
-    for (size_t m = 0; m < chunk.by_material.size(); ++m) {
-        const std::vector<uint32_t>& list = chunk.by_material[m];
+    for (const auto& [key, list] : chunk.by_material) {
         if (list.empty()) continue;
+
+        const MaterialKey material = unpack_material_key(key);
 
         SubMesh range;
         range.index_offset = static_cast<uint32_t>(mesh.indices.size());
         range.index_count = static_cast<uint32_t>(list.size());
-        range.material = static_cast<MaterialId>(m);
+        range.material = material.material;
+        range.variant = material.variant;
         mesh.submeshes.push_back(range);
         mesh.indices.insert(mesh.indices.end(), list.begin(), list.end());
     }
@@ -432,8 +469,9 @@ private:
         // ExportConfig::material_prefix, whose documented purpose is to namespace
         // the materials into another project, so its length is not bounded by
         // anything this file controls.
-        const std::string name = material_name(range.material, cfg);
-        out.put("g " + object_name + "_" + material_id_name(range.material)
+        const MaterialKey key{ range.material, range.variant };
+        const std::string name = material_name(key, cfg);
+        out.put("g " + object_name + "_" + material_key_name(key)
                 + "\nusemtl " + name + "\n");
 
         const size_t first = range.index_offset;
@@ -456,7 +494,7 @@ private:
 }
 
 /// Write the material library shared by every OBJ of one export
-[[nodiscard]] bool write_mtl_file(const std::set<MaterialId>& materials, const fs::path& mtl_path,
+[[nodiscard]] bool write_mtl_file(const std::set<uint32_t>& materials, const fs::path& mtl_path,
                                   const ExportConfig& cfg) {
     TextWriter out(mtl_path);
     if (!out.ok()) {
@@ -466,11 +504,12 @@ private:
 
     out.put("# Stratum road export material library\n");
     char line[256];
-    for (MaterialId material : materials) {
-        const glm::vec3 base = material_base_color(material);
+    for (const uint32_t packed : materials) {
+        const MaterialKey key = unpack_material_key(packed);
+        const glm::vec3 base = material_base_color(key.material);
         // The name carries ExportConfig::material_prefix and is unbounded, so it
         // goes out as a string; only the fixed numeric block is formatted.
-        out.put("\nnewmtl " + material_name(material, cfg) + "\n");
+        out.put("\nnewmtl " + material_name(key, cfg) + "\n");
         const int n = std::snprintf(line, sizeof(line),
                                     "Ka 0.000 0.000 0.000\n"
                                     "Kd %.3f %.3f %.3f\nKs 0.000 0.000 0.000\n"
@@ -612,7 +651,7 @@ private:
     const int acc_tangent = add_accessor(view_tangent, kGltfFloat, "VEC4", vertex_count, 0);
 
     // One primitive and one material per SubMesh range, in the order the ranges
-    // appear, which finish_chunk() leaves in ascending MaterialId order.
+    // appear, which finish_chunk() leaves in ascending MaterialKey order.
     nlohmann::json primitives = nlohmann::json::array();
     nlohmann::json materials = nlohmann::json::array();
 
@@ -629,7 +668,7 @@ private:
 
         const glm::vec3 base = material_base_color(range.material);
         nlohmann::json material;
-        material["name"] = material_name(range.material, cfg);
+        material["name"] = material_name(MaterialKey{ range.material, range.variant }, cfg);
         material["doubleSided"] = false;
         material["pbrMetallicRoughness"] = {
             { "baseColorFactor", { base.r, base.g, base.b, 1.0f } },
@@ -793,7 +832,7 @@ ExportStats export_road_network(const std::vector<RoadPiece>& pieces,
         // the same lattice, so a consumer streaming one cell gets the render
         // mesh, its collision surface and its LODs together.
         // --------------------------------------------------------------------
-        std::set<MaterialId> used_materials;
+        std::set<uint32_t> used_materials;   ///< Packed MaterialKeys, ascending
         ChunkMap render_chunks;
 
         for (size_t p = 0; p < pieces.size(); ++p) {
@@ -966,10 +1005,10 @@ bool export_mesh(const Mesh& mesh, const fs::path& out_path, const ExportConfig&
         fs::path mtl_path = out_path;
         mtl_path.replace_extension(".mtl");
 
-        std::set<MaterialId> used;
+        std::set<uint32_t> used;
         for (const SubMesh& range : mesh.effective_submeshes()) {
             if (static_cast<size_t>(range.material) < kMaterialCount) {
-                used.insert(range.material);
+                used.insert(MaterialKey{ range.material, range.variant }.packed());
             }
         }
         const bool mtl_ok = write_mtl_file(used, mtl_path, effective);

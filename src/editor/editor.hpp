@@ -432,6 +432,120 @@ private:
     bool m_emit_structures = true;
 
     /**
+     * @brief Run the tessellation reduction passes
+     *
+     * RoadNetworkConfig::reduce_tessellation. Off restores the pre-reduction
+     * geometry exactly, which is what the golden tests diff against, so a
+     * geometry defect can be attributed to the decimator by flipping this and
+     * re-solving.
+     */
+    bool m_reduce_tessellation = true;
+
+    /**
+     * @brief Build a chunk-level LOD chain per quadtree leaf
+     *
+     * QuadTree::set_chunk_lod(). Read at ASSIGNMENT, not at draw time, because it
+     * also decides how road geometry is routed into the tree -- triangle by
+     * triangle when on, whole pieces when off -- so flipping it re-solves the
+     * network rather than only changing what is drawn.
+     */
+    bool m_chunk_lod = true;
+
+    /**
+     * @brief Multiplier on every ChunkLod::switch_distances entry
+     *
+     * 1 is the chain's own suggestion. Larger holds full detail further out and
+     * costs memory; smaller drops to a coarse level sooner.
+     */
+    float m_road_lod_distance_scale = 1.0f;
+
+    /**
+     * @brief Force every chunk to one LOD level, or -1 to select by distance
+     *
+     * An inspection control. A level forced beyond a chunk's chain is clamped to
+     * that chunk's coarsest, so a leaf with a short chain still draws.
+     */
+    int m_road_lod_override = -1;
+
+    /**
+     * @brief What one completed traversal actually had resident, per LOD level
+     *
+     * Separate from QuadTree::RoadLodStats, which describes the chain that was
+     * BUILT and does not change until the next import. This describes what the
+     * camera is looking at right now, and it is the only number that says whether
+     * selection is working at all: a build stat of four levels means nothing if
+     * every visible leaf sits at level 0.
+     *
+     * Counted over VISIBLE leaves only, because the traversal is where it is
+     * gathered and the traversal visits nothing else.
+     */
+    struct RoadLodFrameStats {
+        /// Visible leaves whose resident level is this index
+        std::vector<size_t> leaves_per_level;
+        /// Visible leaves carrying a chain
+        size_t leaves_with_chain = 0;
+        /// Visible leaves carrying road geometry but no chain (chunk LOD off)
+        size_t leaves_no_chain = 0;
+        /// Triangles of the resident levels, summed over visible leaves
+        size_t resident_triangles = 0;
+        /// Vertices of the resident levels, summed over visible leaves
+        size_t resident_vertices = 0;
+        /// Level changes this traversal performed: one release plus one upload each
+        size_t swaps = 0;
+
+        void reset() {
+            leaves_per_level.clear();
+            leaves_with_chain = 0;
+            leaves_no_chain = 0;
+            resident_triangles = 0;
+            resident_vertices = 0;
+            swaps = 0;
+        }
+    };
+
+    /**
+     * @brief Accumulator for the traversal in flight
+     *
+     * Reset immediately before QuadTree::traverse_visible() and moved into
+     * m_road_lod_frame when it returns. The panel reads the published copy, so it
+     * never shows a half-gathered frame -- the OSM panel and render_3d() run in
+     * an order ImGui decides, not one this class controls.
+     */
+    RoadLodFrameStats m_road_lod_frame_build;
+
+    /// Residency of the last COMPLETED traversal; what draw_chunk_lod_stats() reads
+    RoadLodFrameStats m_road_lod_frame;
+
+    /**
+     * @brief Add one visible leaf's residency to m_road_lod_frame_build
+     *
+     * Called after sync_node_road_lod() rather than inside it, so a leaf whose
+     * upload was refused this frame is still counted at whatever it really has.
+     */
+    void record_road_lod_residency(const osm::QuadTreeNode& node);
+
+    /**
+     * @brief Choose, upload and release the one LOD level a leaf keeps resident
+     *
+     * Only the selected level is ever on the device. Uploading the whole chain
+     * and picking per draw would cost more memory than no LOD at all.
+     *
+     * @param node     Leaf to update; does nothing when it carries no chain
+     * @param renderer Upload target
+     * @param distance Camera distance to the leaf, metres
+     */
+    void sync_node_road_lod(osm::QuadTreeNode& node, GPURenderer& renderer, float distance);
+
+    /**
+     * @brief Draw the chunk-LOD section of the OSM panel
+     *
+     * Reports the chain the last assignment built and, separately, what is
+     * resident RIGHT NOW -- which is the number that says whether selection is
+     * working, because the chain is fixed and the residency is not.
+     */
+    void draw_chunk_lod_stats();
+
+    /**
      * @brief Height query handed to the road elevation solver, or null
      *
      * Null when terrain-aware roads are off, when the legacy single-terrain mode

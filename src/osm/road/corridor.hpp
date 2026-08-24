@@ -28,6 +28,7 @@
 #include <glm/glm.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <vector>
 
 namespace stratum::osm::road {
@@ -64,6 +65,63 @@ struct CorridorConfig {
      * degrades to a flat road rather than to mangled geometry.
      */
     std::vector<float> station_heights;
+
+    /**
+     * @brief Height the top of a kerb stands at, as a function of where it is
+     *
+     * The hook a dropped kerb is applied through. A drop is a MODULATION of the
+     * profile the edge already has, never a second profile: the strip list, the
+     * lateral layout and the outline are all unchanged, and only the heights of
+     * the boundaries that a kerb owns move.
+     *
+     * Left null -- the default -- nothing is modulated and the sweep is
+     * bit-identical to one with no drops anywhere, which is what makes the
+     * feature bisectable.
+     *
+     * ### What is modulated
+     *
+     * Found structurally from the profile, in the order the kerb is built, and
+     * mirrored on each side:
+     *
+     * - The RAISED edge of a CurbFace whose two heights differ. The lower edge
+     *   sits at the carriageway surface and does not move.
+     * - Both edges of every CurbTop outboard of that face.
+     * - The INBOARD edge of the first strip beyond those -- the sidewalk. Its
+     *   outboard edge keeps its full height, so the footway becomes the crossfall
+     *   ramp and the ribbon can never tear away from the verge, the terrain or
+     *   the junction ring beside it.
+     * - Everything further outboard is untouched.
+     *
+     * A raised median has a kerb on each of its own sides and is modulated by the
+     * same rule, which is what turns it into a pedestrian refuge at a crossing.
+     *
+     * Every boundary that moves takes exactly ONE call per station and side, so
+     * two boundaries that must agree cannot be handed two different answers.
+     *
+     * @param arclength      Station::arclength, in the parameterisation the
+     *                       centerline being swept carries. A trimmed slice does
+     *                       not rebase arclength, so this is the same frame the
+     *                       trims, the markings and the crossings are expressed
+     *                       in.
+     * @param left_of_travel Which of the edge's two kerb lines is being asked
+     *                       about; true for the kerb at positive lateral.
+     * @param full           The undropped height of that boundary, metres above
+     *                       the carriageway surface.
+     * @return The height that boundary stands at. Returning @p full is a no-op.
+     *
+     * @note The face's LATERAL width is not modulated with its height, so a
+     *       dropped face keeps the full batter over a fraction of the rise and
+     *       leans further than it should over the 20 mm it has left. Correcting
+     *       it means recomputing the lateral layout per station, which moves
+     *       every strip outboard of the kerb and the outline with them; at the
+     *       shipping batter of 20 mm the error is smaller than the lip.
+     * @note The centerline must carry stations across the ramp. A ramp laid out
+     *       against columns metres apart is drawn as a step, and a drop that
+     *       fits between two columns is not drawn at all. The caller is
+     *       responsible for resampling first; see CorridorKerbProfile in
+     *       crossings.hpp.
+     */
+    std::function<double(double arclength, bool left_of_travel, double full)> kerb_top_height;
 };
 
 // ============================================================================

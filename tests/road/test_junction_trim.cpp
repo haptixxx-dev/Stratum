@@ -347,15 +347,23 @@ TEST(JunctionTrim, acute_fork_trim_is_large_finite_and_bounded) {
 
 /**
  * Two arms 0.01 degrees apart. The angle is far above TrimConfig::parallel_epsilon,
- * so the exact formula still applies and demands about 11,000 half widths. The
- * contract is that the clamp catches it: a real number inside the edge's own
- * bound, never an infinity and never a NaN.
+ * so the exact formula would still apply and would demand about 11,000 half
+ * widths. TrimConfig::min_pair_angle is what catches it: the pair is solved as
+ * though its arms were 15 degrees apart, which bounds the demand at
+ * `(wa + wb) / sin(min_pair_angle)` plus the fillet reserve.
  *
- * The finiteness assertion is the point. An infinity here reaches the corridor
- * extruder as a slice range and comes out of the GPU as a corrupt bounding box
- * that breaks culling for a whole chunk, with nothing in the log to trace.
+ * The bound is asserted rather than the clamp. Before the angle floor existed the
+ * only thing standing between this fixture and a kilometre-long junction was
+ * TrimConfig::max_trim_fraction, which on a 400 m arm still let 160 m of trunk
+ * road be cut away for a fork; the floor now stops it at 38 m and nothing is
+ * clamped at all.
+ *
+ * The finiteness assertion is still the point underneath. An infinity here
+ * reaches the corridor extruder as a slice range and comes out of the GPU as a
+ * corrupt bounding box that breaks culling for a whole chunk, with nothing in the
+ * log to trace.
  */
-TEST(JunctionTrim, near_parallel_arms_stay_finite_and_clamped) {
+TEST(JunctionTrim, near_parallel_arms_stay_finite_and_bounded) {
     const double arm_length = 400.0;
     const jt::Fixture fixture = jt::fork(0.01, arm_length);
     const GraphNodeId node = jt::sole_node_of_degree(fixture.graph, 3);
@@ -385,12 +393,20 @@ TEST(JunctionTrim, near_parallel_arms_stay_finite_and_clamped) {
         CHECK_TRUE(std::isfinite(ends[i].carriage_right.y));
     }
 
-    // Two of the three arms are the near-parallel pair and are cut to the clamp.
+    // The two near-parallel arms are bounded by the angle floor, not by the
+    // max_trim_fraction clamp: on a 400 m arm the floor's bound is an order of
+    // magnitude inside it, so nothing is clamped and no ribbon is over-trimmed.
+    const double h = jt::carriageway_half_of(fixture.profiles[arms[0].edge]);
+    const double bound = (h + h) / std::sin(cfg.min_pair_angle) +
+                         jt::fillet_reserve(cfg, h, h, 3.14159265358979323846) + cfg.clearance;
+    CHECK_TRUE(bound < arm_length * cfg.max_trim_fraction);
+
     size_t clamped = 0;
     for (const ArmRef& arm : arms) {
         if (arm.clamped) ++clamped;
+        CHECK_TRUE(arm.trim <= bound + jt::kExactEps);
     }
-    CHECK_EQ(clamped, size_t{2});
+    CHECK_EQ(clamped, size_t{0});
 }
 
 /**

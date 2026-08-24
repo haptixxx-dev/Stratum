@@ -41,6 +41,7 @@
 
 #include <glm/glm.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -58,6 +59,7 @@ using stratum::osm::QuadTreeNode;
 using stratum::osm::Road;
 using stratum::osm::RoadType;
 using stratum::osm::road::RoadPiece;
+using stratum::osm::road::ChunkLodConfig;
 
 /// Half the side of the synthetic network, metres
 constexpr double kExtent = 1000.0;
@@ -325,4 +327,134 @@ TEST(QuadTreeRoads, a_leaf_holding_only_paint_still_reports_it_as_paint) {
     CHECK_EQ(ranges.size(), size_t{1});
     CHECK_TRUE(ranges[0].material == MaterialId::Markings);
     CHECK_EQ(static_cast<size_t>(ranges[0].index_count), leaf_mesh->indices.size());
+}
+
+// ============================================================================
+// Chunk LOD and the visibility gate
+// ============================================================================
+
+namespace {
+
+/**
+ * @brief A network whose features all sit in ONE quadrant of the tree
+ *
+ * assign_data() routes a feature to a leaf by its centroid and subdivide()
+ * distributes by centroid too, so a root split over a lopsided network leaves
+ * whole quadrants with no feature in them at all. That is not exotic: a park, a
+ * river or an industrial estate does it on every real extract, and the leaf is
+ * still crossed by the middle of a long way whose own centroid is elsewhere.
+ *
+ * The single far road exists only to make the root's extent symmetric, so the
+ * empty quadrants are real leaves rather than off the edge of the tree.
+ */
+ParsedOSMData lopsided_network() {
+    ParsedOSMData data;
+    stratum::osm::WayId id = 1;
+
+    // 200 short roads in a blob around (+400, +400): well past
+    // MAX_FEATURES_PER_LEAF, so the root and its north-east child both split.
+    for (int i = 0; i < 200; ++i) {
+        const double x = 380.0 + 0.2 * static_cast<double>(i % 20);
+        const double y = 380.0 + 0.2 * static_cast<double>(i / 20);
+        Road road;
+        road.osm_id = id++;
+        road.type = RoadType::Residential;
+        road.width = 6.0f;
+        road.lanes = 2;
+        road.polyline = {{x, y}, {x + 1.0, y}};
+        data.roads.push_back(std::move(road));
+    }
+
+    Road far_road;
+    far_road.osm_id = id++;
+    far_road.type = RoadType::Residential;
+    far_road.width = 6.0f;
+    far_road.lanes = 2;
+    far_road.polyline = {{-400.0, -400.0}, {-399.0, -400.0}};
+    data.roads.push_back(std::move(far_road));
+
+    return data;
+}
+
+/// A long ribbon of quads, enough geometry for build_chunk_lod() to build a chain
+RoadPiece ribbon_piece(glm::dvec2 start, size_t quads) {
+    RoadPiece piece;
+    piece.anchor = start;
+    piece.edge = 0;
+    for (size_t i = 0; i < quads; ++i) {
+        append_quad(piece.mesh, {start.x + 0.05 * static_cast<double>(i), start.y}, kAsphaltY,
+                    MaterialId::Asphalt);
+    }
+    return piece;
+}
+
+} // namespace
+
+/**
+ * A leaf whose ONLY content is road geometry is still traversed once chunk LOD
+ * moved that geometry out of road_meshes and into the LOD chain.
+ *
+ * ### What was wrong
+ *
+ * `build_chunk_lods()` moves a leaf's merged mesh into `QuadTreeNode::road_lod`
+ * and then CLEARS `road_meshes`, because holding both keeps the whole road
+ * network on the host twice. The visible-leaf gate in `traverse_recursive()`
+ * still asked `feature_count() > 0 || !road_meshes.empty()`, and a leaf holding
+ * no feature centroid of its own answers no to both the moment the chain exists.
+ * It was then never pushed into `visible`, so the editor's visitor never ran for
+ * it, its level was never uploaded and its roads were simply absent from the
+ * viewport -- present with chunk LOD off, gone with it on, with nothing logged.
+ *
+ * Triangle-centroid routing is what makes this ordinary rather than rare: with
+ * chunk LOD on, every road TRIANGLE goes to the leaf holding its own centroid,
+ * while features go to the leaf holding theirs. On the Lucan extract 12 leaves
+ * carrying 3,975 triangles between them were reachable only through this gate.
+ *
+ * ### How this test fails without the fix
+ *
+ * Every culling mode is turned OFF, so the gate is the only thing left that can
+ * reject a leaf. The orphan leaf is never visited and the visited triangle count
+ * comes back short by the whole ribbon.
+ */
+TEST(QuadTreeRoads, a_leaf_that_owns_only_a_lod_chain_is_still_visible) {
+    ParsedOSMData data = lopsided_network();
+
+    QuadTree tree;
+    tree.init(data);
+    tree.assign_data(data);
+
+    tree.set_chunk_lod(true, stratum::osm::road::ChunkLodConfig{});
+
+    // Into the north-west quadrant, which holds no feature centroid at all.
+    constexpr size_t kQuads = 1200;
+    std::vector<RoadPiece> pieces;
+    pieces.push_back(ribbon_piece({-300.0, 300.0}, kQuads));
+    tree.assign_road_pieces(std::move(pieces));
+
+    const QuadTreeNode* orphan = nullptr;
+    for (const QuadTreeNode* leaf : tree.get_all_leaves()) {
+        if (leaf->feature_count() == 0 && leaf->has_road_lod()) {
+            orphan = leaf;
+        }
+        // The eager per-chunk release must not take a leaf's geometry away
+        // without leaving a chain behind: road_meshes is emptied exactly when
+        // road_lod holds something.
+        if (leaf->has_road_lod()) {
+            CHECK_TRUE(leaf->road_meshes.empty());
+        }
+    }
+    CHECK_TRUE(orphan != nullptr);
+    if (orphan == nullptr) return;
+
+    size_t visited_orphans = 0;
+    std::array<glm::vec4, 6> planes{};
+    tree.traverse_visible(planes, glm::vec3(0.0f, 100.0f, 0.0f), 1.0e6f, 1080.0f, 60.0f, 0.0f,
+                          /*use_frustum_culling=*/false,
+                          /*use_distance_culling=*/false,
+                          /*use_contribution_culling=*/false,
+                          [&](QuadTreeNode* node, float /*dist_sq*/) {
+                              if (node == orphan) ++visited_orphans;
+                          });
+
+    CHECK_EQ(visited_orphans, size_t{1});
 }

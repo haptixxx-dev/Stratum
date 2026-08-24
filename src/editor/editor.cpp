@@ -626,6 +626,107 @@ void Editor::draw_console() {
     ImGui::End();
 }
 
+void Editor::draw_chunk_lod_stats() {
+    ImGui::Spacing();
+    ImGui::Text("Chunk LOD:");
+
+    if (!m_chunk_lod) {
+        // Not "no levels were built": the chain is not built at all, and the
+        // leaves hold whole pieces routed by anchor. Say which of the two it is.
+        ImGui::BulletText("Off: every leaf keeps one full-detail mesh");
+        if (m_road_lod_frame.leaves_no_chain > 0) {
+            ImGui::BulletText("Visible leaves with roads: %zu",
+                              m_road_lod_frame.leaves_no_chain);
+        }
+        return;
+    }
+
+    const osm::QuadTree::RoadLodStats& built = m_quadtree.road_lod_stats();
+
+    if (built.chunks == 0) {
+        ImGui::BulletText("On: no road geometry has been assigned yet");
+        return;
+    }
+
+    ImGui::BulletText("Chunks: %zu built from %zu (%.1f ms)", built.chunks_with_lod,
+                      built.chunks, built.build_ms);
+
+    // The merge is the half of the win that costs nothing: level 0 is the same
+    // triangles with the per-piece seams welded shut, so it is already smaller
+    // than what was handed in before a single level is simplified.
+    const size_t level0_tris =
+        built.triangles_per_level.empty() ? 0 : built.triangles_per_level.front();
+    ImGui::BulletText("Merged: %zu -> %zu triangles, %zu -> %zu vertices",
+                      built.triangles_in, level0_tris, built.vertices_in,
+                      built.vertices_per_level.empty() ? 0 : built.vertices_per_level.front());
+
+    for (size_t l = 0; l < built.triangles_per_level.size(); ++l) {
+        const size_t tris = built.triangles_per_level[l];
+        const double pct = level0_tris ? 100.0 * static_cast<double>(tris)
+                                             / static_cast<double>(level0_tris)
+                                       : 100.0;
+        ImGui::BulletText("  L%zu: %zu tri (%.1f%% of L0) in %zu chunks", l, tris, pct,
+                          l < built.chunks_per_level.size() ? built.chunks_per_level[l] : 0);
+    }
+
+    // The seam band is the reduction the crack-free guarantee is paid for with.
+    // A large one means a triangle reached a long way outside the leaf that owns
+    // it, and the coarsest level is what absorbs the cost.
+    ImGui::BulletText("Seam band: %.2f m widest, %zu straddling triangles",
+                      built.max_seam_band, built.straddling_triangles);
+
+    // Residency. This is the number that says selection is working: the chain
+    // above is fixed at import, what follows changes as the camera moves.
+    ImGui::Spacing();
+    ImGui::Text("Resident (last frame, visible leaves):");
+
+    if (m_road_lod_frame.leaves_with_chain == 0) {
+        ImGui::BulletText("No visible leaf carries a chain");
+    } else {
+        size_t resident_leaves = 0;
+        for (size_t l = 0; l < m_road_lod_frame.leaves_per_level.size(); ++l) {
+            resident_leaves += m_road_lod_frame.leaves_per_level[l];
+            if (m_road_lod_frame.leaves_per_level[l] == 0) continue;
+            ImGui::BulletText("  L%zu: %zu leaves", l, m_road_lod_frame.leaves_per_level[l]);
+        }
+        // The two counts differ while a leaf waits for an upload the budget
+        // refused, which is a streaming state and not an error.
+        ImGui::BulletText("%zu of %zu visible leaves resident, %zu tri, %zu vtx",
+                          resident_leaves, m_road_lod_frame.leaves_with_chain,
+                          m_road_lod_frame.resident_triangles,
+                          m_road_lod_frame.resident_vertices);
+        // A swap is a release plus an upload. A steady non-zero number with the
+        // camera still means the hysteresis band is being crossed every frame.
+        ImGui::BulletText("Level swaps last frame: %zu", m_road_lod_frame.swaps);
+    }
+
+    // Inspection controls. Neither re-solves: the chain is already built and both
+    // only change which level of it is asked for on the next frame.
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::SliderFloat("LOD Distance", &m_road_lod_distance_scale, 0.25f, 4.0f, "%.2fx");
+    ImGui::SetItemTooltip(
+        "Multiplier on every switch distance the chain suggests.\n"
+        "Larger holds full detail further out and costs resident memory.");
+
+    bool forced = (m_road_lod_override >= 0);
+    if (ImGui::Checkbox("Force Level", &forced)) {
+        m_road_lod_override = forced ? 0 : -1;
+    }
+    ImGui::SetItemTooltip(
+        "Pin every chunk to one level regardless of distance, for inspection.\n"
+        "A chunk with a shorter chain is clamped to its own coarsest level.");
+
+    if (forced) {
+        ImGui::SameLine();
+        const int max_level =
+            built.triangles_per_level.empty()
+                ? 0
+                : static_cast<int>(built.triangles_per_level.size()) - 1;
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SliderInt("##road_lod_level", &m_road_lod_override, 0, max_level, "Level %d");
+    }
+}
+
 void Editor::draw_osm_panel() {
     ImGui::Begin("OSM");
 
@@ -737,6 +838,28 @@ void Editor::draw_osm_panel() {
     if (m_emit_structures && !m_terrain_aware_roads) {
         ImGui::TextDisabled("Structures need terrain-aware roads: none will be emitted.");
     }
+
+    // Geometry reduction. Both change what is built rather than what is drawn, so
+    // both re-solve, and both are bisectable the same way the detail passes are.
+    if (ImGui::Checkbox("Reduce Tessellation", &m_reduce_tessellation)) {
+        begin_road_network_rebuild();
+    }
+    ImGui::SetItemTooltip(
+        "Drop stations a straight road does not need, and merge coplanar strip quads.\n"
+        "Bounded by a chord deviation and a span cap, so the centerline never moves far.\n"
+        "Off: the pre-reduction geometry, which the golden tests diff against.");
+
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Chunk LOD", &m_chunk_lod)) {
+        // Not a draw-time switch. It decides how pieces are routed into the
+        // leaves -- triangle by triangle when on -- so the tree has to be
+        // rebuilt, not merely redrawn.
+        begin_road_network_rebuild();
+    }
+    ImGui::SetItemTooltip(
+        "Merge each leaf's road pieces and simplify the merged mesh into a level chain.\n"
+        "Only the level the camera distance selects is ever uploaded.\n"
+        "Off: every leaf keeps one full-detail mesh, routed whole by piece anchor.");
 
     ImGui::Separator();
 
@@ -952,6 +1075,34 @@ void Editor::draw_osm_panel() {
             // Counted per SIDE, not per edge: an edge whose sidewalk is separately
             // mapped on both sides adds two.
             ImGui::BulletText("Sidewalk sides deduped: %zu", m_road_stats.deduped_sidewalks);
+
+            ImGui::Spacing();
+            ImGui::Text("Tessellation:");
+            if (m_reduce_tessellation) {
+                const size_t before = m_road_stats.stations_before;
+                const size_t after = m_road_stats.stations_after;
+                ImGui::BulletText("Stations: %zu -> %zu (%.1f%%)", before, after,
+                                  before ? 100.0 * static_cast<double>(after)
+                                                 / static_cast<double>(before)
+                                         : 100.0);
+                // A merge removes two triangles, so the pair is what the lateral
+                // pass actually contributed and the count alone is half the story.
+                ImGui::BulletText("Quads merged: %zu (%zu triangles)",
+                                  m_road_stats.quads_merged, m_road_stats.quads_merged * 2);
+                const size_t tri_before = m_road_stats.triangles_before_tess;
+                ImGui::BulletText("Triangles: %zu -> %zu (%.1f%%)", tri_before,
+                                  m_road_stats.triangles,
+                                  tri_before ? 100.0 * static_cast<double>(m_road_stats.triangles)
+                                                     / static_cast<double>(tri_before)
+                                             : 100.0);
+                ImGui::BulletText("Corridor kerbs dropped on %zu edges",
+                                  m_road_stats.corridor_kerb_edges);
+            } else {
+                ImGui::BulletText("Reduction: off (%zu stations, %zu triangles)",
+                                  m_road_stats.stations_before, m_road_stats.triangles);
+            }
+
+            draw_chunk_lod_stats();
 
             // A portal mouth is the only carve primitive the road geometry cannot
             // stand without: the headwall frames an opening the hillside would
@@ -1950,6 +2101,7 @@ osm::road::RoadNetworkConfig Editor::make_road_network_config() const {
     cfg.emit_markings = m_emit_markings;
     cfg.emit_crossings = m_emit_crossings;
     cfg.emit_structures = m_emit_structures;
+    cfg.reduce_tessellation = m_reduce_tessellation;
     return cfg;
 }
 
@@ -2439,6 +2591,11 @@ void Editor::begin_mesh_rebuild(std::vector<osm::road::RoadPiece>&& road_pieces,
     // Roads are not rebuilt per leaf any more. Hand the already-solved geometry
     // over now, while the leaves exist and before any node build is queued, so
     // the first upload of a leaf already carries its roads.
+    //
+    // Set BEFORE the hand-off: the flag decides how pieces are routed into the
+    // leaves as well as whether a chain is built afterwards, and both happen
+    // inside assign_road_pieces().
+    m_quadtree.set_chunk_lod(m_chunk_lod, osm::road::ChunkLodConfig{});
     m_quadtree.assign_road_pieces(std::move(road_pieces));
 
     spdlog::info("QuadTree: {} leaves, {} roads, {} buildings, {} areas, max depth {}",
@@ -2605,7 +2762,12 @@ void Editor::on_mesh_evicted(uint32_t mesh_id) {
         case MeshOwner::Kind::QuadTreeLeaf: {
             if (!owner.node) break;
             std::erase(owner.node->area_gpu_ids, mesh_id);
-            std::erase(owner.node->road_gpu_ids, mesh_id);
+            if (std::erase(owner.node->road_gpu_ids, mesh_id) > 0) {
+                // The resident LOD level went with it. Saying so is what makes
+                // sync_node_road_lod() upload again instead of trusting a level
+                // that is no longer on the device.
+                owner.node->road_lod_resident = -1;
+            }
             std::erase(owner.node->building_gpu_ids, mesh_id);
             // The leaf is no longer whole, so it is no longer uploaded. It streams
             // back in the next time it is visible, and upload_node_to_gpu()
@@ -2665,6 +2827,10 @@ void Editor::upload_node_to_gpu(osm::QuadTreeNode& node, GPURenderer& renderer) 
     };
 
     upload_all(node.area_meshes, node.area_gpu_ids);
+    // Empty when the leaf carries a chunk LOD chain: the chain replaced this mesh
+    // and sync_node_road_lod() uploads exactly one level of it, per frame, by
+    // distance. Roads are therefore NOT part of the completeness test below --
+    // they are not uploaded here and their absence is not a failure.
     upload_all(node.road_meshes, node.road_gpu_ids);
     upload_all(node.building_meshes, node.building_gpu_ids);
 
@@ -2717,7 +2883,100 @@ void Editor::release_node_from_gpu(osm::QuadTreeNode& node, GPURenderer& rendere
     release_all(node.road_gpu_ids);
     release_all(node.building_gpu_ids);
 
+    // The chain is still on the CPU, but nothing of it is on the device any
+    // more. Leaving the level set would make sync_node_road_lod() believe the
+    // right geometry was already resident and skip the re-upload.
+    node.road_lod_resident = -1;
     node.gpu_uploaded = false;
+}
+
+void Editor::sync_node_road_lod(osm::QuadTreeNode& node, GPURenderer& renderer,
+                                float distance) {
+    if (!node.has_road_lod()) return;
+
+    const int levels = static_cast<int>(node.road_lod.levels.size());
+
+    // A forced level is clamped per chunk. Chains are not all the same length --
+    // a chunk of seven pieces gives up after one level where a dense one gets
+    // four -- so an override of 3 has to mean "the coarsest you have" rather than
+    // "draw nothing".
+    const int desired = (m_road_lod_override >= 0)
+                      ? std::min(m_road_lod_override, levels - 1)
+                      : osm::select_road_lod_level(node.road_lod, distance,
+                                                   node.road_lod_resident,
+                                                   m_road_lod_distance_scale);
+
+    if (desired == node.road_lod_resident && !node.road_gpu_ids.empty()) {
+        return;
+    }
+
+    ++m_road_lod_frame_build.swaps;
+
+    // Release first, upload second. The other order would hold two levels of the
+    // same chunk resident at once, and under a tight budget that is what makes an
+    // upload evict some other leaf to make room for geometry about to be freed.
+    for (uint32_t& id : node.road_gpu_ids) {
+        release_tracked_mesh(renderer, id);
+    }
+    node.road_gpu_ids.clear();
+    node.road_lod_resident = -1;
+
+    const Mesh& mesh = node.road_lod.levels[static_cast<size_t>(desired)];
+    if (!mesh.is_valid()) {
+        // A level that simplified down to nothing is not a failure and must not
+        // latch: leaving the level unset means the next frame tries again, which
+        // is wrong. Record it as resident with no handle instead.
+        node.road_lod_resident = desired;
+        return;
+    }
+
+    MeshOwner owner;
+    owner.kind = MeshOwner::Kind::QuadTreeLeaf;
+    owner.node = &node;
+    owner.anchor = node_anchor(node);
+
+    const uint32_t id = upload_tracked_mesh(renderer, mesh, owner);
+    if (id == 0) {
+        return;  // retried on the next frame the leaf stays visible
+    }
+
+    // The upload may have evicted to make room, and the victim it picked can be
+    // the mesh it just uploaded. m_mesh_owners is the record of what survived, so
+    // pushing a handle that is no longer in it would leave the leaf drawing a
+    // freed buffer.
+    if (m_mesh_owners.find(id) == m_mesh_owners.end()) {
+        return;
+    }
+
+    node.road_gpu_ids.push_back(id);
+    node.road_lod_resident = desired;
+}
+
+void Editor::record_road_lod_residency(const osm::QuadTreeNode& node) {
+    if (!node.has_road_lod()) {
+        // A leaf with no chain but with road geometry is the chunk-LOD-off path,
+        // not an empty leaf, and the panel has to be able to tell the two apart.
+        if (!node.road_meshes.empty()) {
+            ++m_road_lod_frame_build.leaves_no_chain;
+        }
+        return;
+    }
+
+    ++m_road_lod_frame_build.leaves_with_chain;
+
+    const int level = node.road_lod_resident;
+    if (level < 0 || level >= static_cast<int>(node.road_lod.levels.size())) {
+        return;  // nothing resident: the upload was refused or the leaf was evicted
+    }
+
+    auto& per_level = m_road_lod_frame_build.leaves_per_level;
+    const size_t idx = static_cast<size_t>(level);
+    if (per_level.size() <= idx) per_level.resize(idx + 1, 0);
+    ++per_level[idx];
+
+    const Mesh& mesh = node.road_lod.levels[idx];
+    m_road_lod_frame_build.resident_triangles += mesh.indices.size() / 3;
+    m_road_lod_frame_build.resident_vertices += mesh.vertices.size();
 }
 
 void Editor::render_3d(GPURenderer& renderer) {
@@ -2760,6 +3019,10 @@ void Editor::render_3d(GPURenderer& renderer) {
     Frustum frustum = m_camera.get_frustum();
     glm::mat4 model(1.0f);
 
+    // Gathered by the visitor below and published when the traversal returns, so
+    // the panel never reads a partially counted frame.
+    m_road_lod_frame_build.reset();
+
     // Use quadtree traversal for GPU rendering (front-to-back sorted)
     m_quadtree.traverse_visible(
         frustum.planes,
@@ -2771,7 +3034,7 @@ void Editor::render_3d(GPURenderer& renderer) {
         m_use_tile_culling,
         m_use_distance_culling,
         m_use_contribution_culling,
-        [&](osm::QuadTreeNode* node, float /*dist_sq*/) {
+        [&](osm::QuadTreeNode* node, float dist_sq) {
             // Stream: a node that just became visible gets its mesh build queued
             // here. This traversal is the only one per frame, so it has to do the
             // queueing that rebuild_visible_batches() used to.
@@ -2787,6 +3050,15 @@ void Editor::render_3d(GPURenderer& renderer) {
                 upload_node_to_gpu(*node, renderer);
             }
 
+            // Roads go through their own path when the leaf carries a chunk LOD
+            // chain, because which level belongs on the device depends on where
+            // the camera is and the rest of the leaf does not. dist_sq is the
+            // squared XZ distance the traversal already computed for its
+            // front-to-back sort, which is the same measure ChunkLod's switch
+            // distances are expressed in.
+            sync_node_road_lod(*node, renderer, std::sqrt(dist_sq));
+            record_road_lod_residency(*node);
+
             if (m_render_areas) {
                 for (uint32_t id : node->area_gpu_ids) renderer.draw_mesh(id, model, glm::vec4(1.0f));
             }
@@ -2798,6 +3070,8 @@ void Editor::render_3d(GPURenderer& renderer) {
             }
         }
     );
+
+    m_road_lod_frame = m_road_lod_frame_build;
 
     // Render procedural terrain
     float radius_sq = m_view_radius * m_view_radius;

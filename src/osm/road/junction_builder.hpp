@@ -431,7 +431,7 @@ public:
         size_t degenerate = 0;
 
         /// Junction polygons whose ring crossed itself and were filled as a convex hull
-        size_t self_intersecting = 0;
+        size_t self_intersecting = 0;  ///< Rings that needed the hull fallback: crossing OR clockwise
 
         /**
          * @brief Edges where TrimConfig::max_trim_fraction bound the demanded trim
@@ -467,6 +467,27 @@ public:
     [[nodiscard]] const std::vector<bool>& consumed_edges() const { return m_consumed_edges; }
 
     /**
+     * @brief Which junction owns each node, after coincident-cluster merging
+     *
+     * Parallel to `graph.nodes()`, filled by solve_trims(). Entry `n` is the
+     * GraphNodeId of the junction that SOLVED node `n`: `n` itself for the
+     * overwhelmingly common node that merges with nothing, the cluster's primary
+     * for a node absorbed into a near-coincident neighbour, and kInvalidId for a
+     * node of degree below 3, which never participates in a merge.
+     *
+     * Without this a consumer that keys off a node id -- approach markings ask
+     * `node_has_junction[edge.from]`, dropped_kerb_spans() filters crossings on
+     * `Crossing::node` -- silently drops its feature at every absorbed member,
+     * because that member reports no junction of its own even though the primary
+     * trimmed its approaches back. Resolve through this map first.
+     *
+     * Empty until solve_trims() has run.
+     */
+    [[nodiscard]] const std::vector<GraphNodeId>& junction_owner() const {
+        return m_junction_owner;
+    }
+
+    /**
      * @brief Junctions whose curb ring was actually broken by a dropped kerb
      *
      * Zero after a build() or a build_geometry() with no provider. Reported so an
@@ -486,6 +507,7 @@ private:
 
     Stats m_stats;
     std::vector<bool> m_consumed_edges;
+    std::vector<GraphNodeId> m_junction_owner;
     std::unique_ptr<SolveState> m_solve;
     size_t m_dropped_kerb_junctions = 0;
 };

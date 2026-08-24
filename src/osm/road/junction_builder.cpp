@@ -385,6 +385,10 @@ bool JunctionBuilder::solve_trims(RoadGraph& graph,
     m_solve->solves.assign(node_count, JunctionNodeSolve{});
     std::vector<JunctionNodeSolve>& solves = m_solve->solves;
 
+    // One slot per node, written by the same worker that owns the node, so it
+    // needs no more synchronisation than `solves` does. See junction_owner().
+    m_junction_owner.assign(node_count, kInvalidId);
+
     run_node_ranges(node_count, [&](size_t begin, size_t end) {
         for (size_t n = begin; n < end; ++n) {
             const GraphNode& node = graph.nodes()[n];
@@ -396,7 +400,18 @@ bool JunctionBuilder::solve_trims(RoadGraph& graph,
             if (degree >= 3) {
                 slot.participates = true;
                 slot.emit = true;
-                slot.arms = collect_arms(graph, profiles, static_cast<GraphNodeId>(n));
+
+                // The cluster is taken out with the arms, not recomputed later:
+                // a node absorbed into a near-coincident neighbour comes back
+                // with NO arms, and without the cluster nothing downstream can
+                // tell that from a node that simply failed to solve. Approach
+                // markings and dropped kerbs both key off the node id.
+                std::vector<GraphNodeId> cluster;
+                slot.arms = collect_arms(graph, profiles, static_cast<GraphNodeId>(n),
+                                         kCoincidentRadius, &cluster);
+                m_junction_owner[n] =
+                    cluster.empty() ? static_cast<GraphNodeId>(n) : cluster.front();
+
                 const bool solved = solve_arm_trims(graph, centerlines,
                                                     static_cast<GraphNodeId>(n), slot.arms,
                                                     trim_cfg);
@@ -824,7 +839,7 @@ std::vector<Junction> JunctionBuilder::build_geometry(
         switch (junction.kind) {
             case JunctionKind::Intersection:
                 ++m_stats.junctions;
-                if (junction.polygon.self_intersecting) {
+                if (junction.polygon.needs_hull_fallback()) {
                     ++m_stats.self_intersecting;
                 }
                 break;

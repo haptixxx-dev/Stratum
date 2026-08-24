@@ -43,12 +43,27 @@
  * A corner that turns LEFT is the exception. It appears on the WRAP-AROUND pair
  * at a node whose arms all leave within a half plane -- two ways forking at a
  * very acute angle, a slip road peeling off a main road -- where the angular gap
- * the corner has to span exceeds 180 degrees. There the two offset lines meet far
- * BEHIND the node, and drawing any arc through that intersection extrudes a long
- * spike out of the back of the junction and folds the ring through itself. Such a
- * corner is closed with the chord instead. Same for a corner whose intersection
- * lands past either cut face, which is the clamped-trim version of the same
- * failure.
+ * the corner has to span exceeds 180 degrees, and the ground it spans is the BACK
+ * of the node. The ring is taken THROUGH its corner point, unrounded, so the fill
+ * wraps around the back of the node the way the cut faces wrap around its front;
+ * an arc there would bulge into the junction rather than out of it. The chord is
+ * the fallback, and it is a poor one -- it passes on the wrong side of the node,
+ * so the polygon stops containing the node it was built for.
+ *
+ * Every corner point, reflex or not, has to lie near the junction to be used at
+ * all. Two nearly parallel arms meet at a vanishing angle, kilometres away, and
+ * the arc built around that meeting point is tangent over a distance that
+ * diverges with the turn. See FilletConfig::max_corner_reach_factor. The chord is
+ * also what a corner gets when its intersection lands past either cut face, which
+ * is the clamped-trim version of the same failure.
+ *
+ * ### Cut faces that cross
+ *
+ * Two arms whose trims were both cut short of what their pair demanded still
+ * overlap, and their cut faces then cross -- a bowtie, and the commonest
+ * self-intersecting junction in a real extract. Where two adjacent faces cross,
+ * both are cut back to the crossing point, so the ring stays simple and bounds
+ * exactly the ground the two mouths cover between them.
  *
  * ### Winding
  *
@@ -355,6 +370,57 @@ constexpr double kMinCentroidArea = 1e-12;
     return hull;
 }
 
+/// Append a point unless it repeats the one already at the back of the ring
+void push_ring_welded(std::vector<glm::dvec2>& ring, const glm::dvec2& p) {
+    if (!ring.empty() && dist_sq(p, ring.back()) <= kWeldEpsilon * kWeldEpsilon) {
+        return;
+    }
+    ring.push_back(p);
+}
+
+/**
+ * @brief Proper intersection point of two 2D segments
+ *
+ * Proper only, on both segments: the parameters must land strictly inside (0, 1)
+ * on each. Two cut faces that merely touch at a corner are not overlapping and
+ * must not be clipped, and a shared endpoint is the normal state of a ring.
+ *
+ * @param a0     First segment start
+ * @param a1     First segment end
+ * @param b0     Second segment start
+ * @param b1     Second segment end
+ * @param out_at Receives the crossing point when true is returned
+ * @return True when the two segments cross at an interior point of both
+ */
+[[nodiscard]] bool segment_crossing(const glm::dvec2& a0, const glm::dvec2& a1,
+                                    const glm::dvec2& b0, const glm::dvec2& b1,
+                                    glm::dvec2& out_at) {
+    const glm::dvec2 da = a1 - a0;
+    const glm::dvec2 db = b1 - b0;
+
+    const double denom = cross2(da, db);
+    if (!std::isfinite(denom)) {
+        return false;
+    }
+
+    // Relative, because these are areas: a scale-free epsilon would call two
+    // hundred-metre motorway faces parallel and two-metre footway faces not.
+    const double scale = std::sqrt(glm::dot(da, da) * glm::dot(db, db));
+    if (!(std::abs(denom) > kParallelEpsilon * std::max(scale, 1.0))) {
+        return false;   // parallel or degenerate: no single crossing point
+    }
+
+    const glm::dvec2 delta = b0 - a0;
+    const double t = cross2(delta, db) / denom;
+    const double u = cross2(delta, da) / denom;
+    if (!(t > 0.0 && t < 1.0 && u > 0.0 && u < 1.0)) {
+        return false;
+    }
+
+    out_at = a0 + da * t;
+    return true;
+}
+
 // ============================================================================
 // Corner construction
 // ============================================================================
@@ -408,11 +474,8 @@ void append_corner(const ArmEnd& a_end, const ArmEnd& b_end,
     const glm::dvec2 u_out = db;
 
     const double turn = cross2(u_in, u_out);
-    if (turn >= 0.0) {
-        // Left turn, or dead straight. See the file header: this is the
-        // wrap-around corner at a node whose arms all leave within a half plane.
-        // Its "corner" is behind the node and rounding it inverts the ring.
-        return;     // chord
+    if (turn == 0.0) {
+        return;     // dead straight: the chord IS the corner
     }
 
     // Intersect A's outgoing left offset line with B's incoming right offset
@@ -442,6 +505,60 @@ void append_corner(const ArmEnd& a_end, const ArmEnd& b_end,
     const glm::dvec2 corner = pa + da * alpha_a;
     const double run_a = -alpha_a;      // straight run available on A's left edge
     const double run_b = -alpha_b;      // and on B's right edge
+
+    // ------------------------------------------------------------------------
+    // The corner point has to BE a corner of this junction. Two nearly parallel
+    // arms meet at a vanishing angle, so C runs off towards infinity and the arc
+    // built around it -- tangent over `radius * tan(theta / 2)`, which diverges
+    // with the turn -- leaves the map. A real extract produced a 38,000 m^2
+    // junction whose ring reached 2.5 km from its node that way. The trim solve
+    // bounds its own mirror of that reserve at kMaxReserveTanHalf; this is the
+    // matching bound here, expressed as a distance rather than as a tangent, so
+    // it also catches the reflex corner behind the node. See
+    // FilletConfig::max_corner_reach_factor.
+    // ------------------------------------------------------------------------
+    const double reach_slack = std::max(0.0, cfg.max_corner_reach_factor) *
+                               (std::max(0.0, a_arm.carriageway_half) +
+                                std::max(0.0, b_arm.carriageway_half));
+    if (run_a > std::max(0.0, a_arm.trim) + reach_slack ||
+        run_b > std::max(0.0, b_arm.trim) + reach_slack) {
+        return;     // the "corner" is not near this junction; chord
+    }
+
+    if (turn > 0.0) {
+        // ------------------------------------------------------------------
+        // REFLEX corner: the ring turns LEFT here, so the angular gap this
+        // corner spans is more than half a turn. It is the wrap-around pair at
+        // a node whose arms all leave within one half plane -- an acute fork, a
+        // slip road peeling off a trunk -- and the ground it spans is the BACK
+        // of the node, where no arm arrives.
+        //
+        // Closing it with the chord, which is what this function used to do,
+        // draws a straight line from one arm's far cut face to the other's and
+        // that line cuts diagonally across the junction. It passes on the wrong
+        // side of the node -- so the junction polygon does not contain its own
+        // node, and the terrain carve leaves the ground under it unflattened --
+        // and on a three-arm fork it crosses the fillet of the OTHER corner,
+        // which is the self-intersection an acute fork reports.
+        //
+        // The honest closure is the corner point itself: the two carriageway
+        // edges really do meet at C, behind the node, and taking the boundary
+        // round through it wraps the fill around the back of the node the way
+        // the cut faces wrap around its front. C is NOT rounded -- there is no
+        // outward side to round towards, and an arc through a reflex corner
+        // bulges into the junction rather than out of it.
+        //
+        // What has to be bounded is how far back C sits. Two arms a hair either
+        // side of anti-parallel put it hundreds of metres away and a spike out
+        // of the back of the junction is worse than the chord ever was, so C is
+        // bounded by the reach test above, which rejects a C further behind a
+        // cut face than that arm's trim plus FilletConfig::max_corner_reach_factor
+        // combined widths -- that is, further than about one carriageway beyond
+        // the node.
+        // ------------------------------------------------------------------
+        push_ring_welded(ring, corner);
+        return;
+    }
 
     // Turn magnitude, in [0, pi]: the angle the ring's heading swings through.
     const double theta = std::atan2(std::abs(turn), glm::dot(u_in, u_out));
@@ -499,12 +616,7 @@ void append_corner(const ArmEnd& a_end, const ArmEnd& b_end,
                   kSegmentBias));
     segments = std::clamp(segments, 1, kMaxArcSegments);
 
-    const auto push_welded = [&ring](const glm::dvec2& p) {
-        if (!ring.empty() && dist_sq(p, ring.back()) <= kWeldEpsilon * kWeldEpsilon) {
-            return;
-        }
-        ring.push_back(p);
-    };
+    const auto push_welded = [&ring](const glm::dvec2& p) { push_ring_welded(ring, p); };
 
     // Endpoints are placed from the tangent construction rather than from the
     // arc parameterisation, so they land EXACTLY on their offset lines and the
@@ -558,6 +670,75 @@ JunctionPolygon build_junction_polygon(const std::vector<ArmRef>& arms,
         }
     }
 
+    // ------------------------------------------------------------------------
+    // Clip adjacent cut faces against each other.
+    //
+    // Two arms whose trims were BOTH cut short of what their pair demanded still
+    // overlap, and their cut faces then cross: the ring walks out along arm k's
+    // face, past arm k+1's, and back, which is a bowtie. It is the single
+    // commonest way a real extract produces a self-intersecting junction -- every
+    // over-trimmed corner is a candidate, and TrimConfig::max_trim_fraction
+    // over-trims whenever two junctions sit closer together than one junction is
+    // wide.
+    //
+    // The repair is local and exact: where two adjacent faces cross, both give up
+    // their shared corner and meet AT the crossing point instead. The ring is then
+    // simple, and it bounds precisely the region the two arm mouths cover between
+    // them. The ribbon still overlaps it -- that is what over-trimmed means, and
+    // no polygon can undo it -- but the fill underneath is a proper polygon rather
+    // than a hull thrown over a bowtie, so the curb ring and the terrain carve can
+    // both use it.
+    //
+    // Every crossing is computed from the UNCLIPPED faces, so the result does not
+    // depend on which arm the walk happens to start at.
+    // ------------------------------------------------------------------------
+    std::vector<glm::dvec2> face_right(arm_count);
+    std::vector<glm::dvec2> face_left(arm_count);
+    std::vector<bool> corner_clipped(arm_count, false);
+    for (size_t k = 0; k < arm_count; ++k) {
+        face_right[k] = ends[k].carriage_right;
+        face_left[k] = ends[k].carriage_left;
+    }
+
+    if (arm_count > 2) {
+        std::vector<glm::dvec2> clip_left = face_left;
+        std::vector<glm::dvec2> clip_right = face_right;
+
+        for (size_t k = 0; k < arm_count; ++k) {
+            const size_t next = (k + 1u) % arm_count;
+            glm::dvec2 at(0.0);
+            if (!segment_crossing(ends[k].carriage_right, ends[k].carriage_left,
+                                  ends[next].carriage_right, ends[next].carriage_left, at)) {
+                continue;
+            }
+            clip_left[k] = at;
+            clip_right[next] = at;
+            corner_clipped[k] = true;
+        }
+
+        // An arm clipped at BOTH ends can come out inverted: its right corner
+        // pulled past its left one, which would put a backwards sliver of face
+        // into the ring. The two clip points are then collapsed onto their own
+        // midpoint, which leaves the arm one point wide -- degenerate, but
+        // forwards, and still exactly two ring vertices as arm_ring_start
+        // promises.
+        for (size_t k = 0; k < arm_count; ++k) {
+            const glm::dvec2 face = face_left[k] - face_right[k];
+            const double len_sq = glm::dot(face, face);
+            if (len_sq > 0.0) {
+                const double t_right = glm::dot(clip_right[k] - face_right[k], face) / len_sq;
+                const double t_left = glm::dot(clip_left[k] - face_right[k], face) / len_sq;
+                if (t_right > t_left) {
+                    const glm::dvec2 mid = (clip_right[k] + clip_left[k]) * 0.5;
+                    clip_right[k] = mid;
+                    clip_left[k] = mid;
+                }
+            }
+            face_right[k] = clip_right[k];
+            face_left[k] = clip_left[k];
+        }
+    }
+
     out.ring.reserve(arm_count * (2u + static_cast<size_t>(kMaxArcSegments)));
     out.arm_ring_start.reserve(arm_count);
 
@@ -567,11 +748,18 @@ JunctionPolygon build_junction_polygon(const std::vector<ArmRef>& arms,
         // Right before left. For an arm leaving along +x that runs -y to +y, so
         // the interior stays on the left of the walk and the ring is CCW.
         out.arm_ring_start.push_back(out.ring.size());
-        out.ring.push_back(ends[k].carriage_right);
-        out.ring.push_back(ends[k].carriage_left);
+        out.ring.push_back(face_right[k]);
+        out.ring.push_back(face_left[k]);
 
-        append_corner(ends[k], ends[next], arms[k], arms[next], cfg,
-                      ends[next].carriage_right, out.ring);
+        // A clipped corner IS a point -- the two faces meet there -- so there is
+        // no straight run left for a fillet to be tangent over, and the arc's
+        // construction would be solved from offset lines the ring no longer
+        // reaches. It is left as the zero-length chord between the two coincident
+        // ring vertices.
+        if (!corner_clipped[k]) {
+            append_corner(ends[k], ends[next], arms[k], arms[next], cfg,
+                          face_right[next], out.ring);
+        }
     }
 
     // The last corner runs up to arm 0's carriage_right, which is ring.front().
@@ -591,21 +779,28 @@ JunctionPolygon build_junction_polygon(const std::vector<ArmRef>& arms,
     out.valid = true;
     out.self_intersecting = ring_self_intersects(out.ring);
 
+    // A clockwise ring is NOT a cosmetic complaint, and treating it as one is how
+    // an inverted sliver used to reach the fill and the carve. The corner clipping
+    // above collapses an over-clipped arm onto its own midpoint while its two
+    // neighbours keep the crossing points they were handed, so on a trident node
+    // the walk reverses between those neighbours and the ring comes back simple
+    // with negative area -- which ring_self_intersects() correctly does not flag.
+    // Flagging it here restores the convex-hull fill and the disc carve for
+    // exactly the inputs no polygon rule has produced a usable ring for. Tested
+    // strictly negative: a zero-area ring is a junction whose arms all collapsed
+    // onto the node, which is degenerate but not mis-wound.
+    out.inverted = !out.self_intersecting && ring_double_area(out.ring) < 0.0;
+
     if (out.self_intersecting) {
         spdlog::warn("build_junction_polygon: junction ring with {} arms and {} vertices "
                      "crosses itself; the fill falls back to its convex hull and the terrain "
                      "carve must not use it as a winding test",
                      arm_count, out.ring.size());
-    } else if (ring_double_area(out.ring) < 0.0) {
-        // Simple but wound the wrong way, which means the arms were not handed
-        // over in ascending bearing order. The fill survives it -- every triangle
-        // is oriented from its own 2D signed area -- but the curb ring's outward
-        // offset would run inward, so it is worth saying out loud. Tested
-        // strictly negative: a ring of exactly zero area is a junction whose arms
-        // all collapsed onto the node, which is degenerate but not mis-wound.
-        spdlog::warn("build_junction_polygon: junction ring with {} arms is clockwise; "
-                     "arms were not in ascending bearing order",
-                     arm_count);
+    } else if (out.inverted) {
+        spdlog::warn("build_junction_polygon: junction ring with {} arms and {} vertices is "
+                     "clockwise; the fill falls back to its convex hull and the terrain carve "
+                     "must not use it as a winding test",
+                     arm_count, out.ring.size());
     }
 
     return out;
@@ -631,10 +826,11 @@ Mesh triangulate_junction(const JunctionPolygon& poly, float height, MaterialId 
         return mesh;
     }
 
-    // A self-crossing ring has no meaningful interior, so earcut's output for it
-    // is arbitrary. The hull is a visible approximation and the caller counts it.
+    // A self-crossing ring has no meaningful interior and a clockwise one bounds
+    // the complement of what it looks like, so earcut's output for either is
+    // arbitrary. The hull is a visible approximation and the caller counts it.
     const std::vector<glm::dvec2> source =
-        poly.self_intersecting ? convex_hull(poly.ring) : poly.ring;
+        poly.needs_hull_fallback() ? convex_hull(poly.ring) : poly.ring;
     if (source.size() < 3) {
         return mesh;
     }

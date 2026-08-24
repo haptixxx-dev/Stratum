@@ -57,6 +57,7 @@ set(STRATUM_TEST_SOURCES
     road/test_junction_dump.cpp
     road/test_markings.cpp
     road/test_crossings.cpp
+    road/test_crossing_kerb_fixes.cpp
     road/test_sidewalk_dedup.cpp
     road/test_structures.cpp
     road/test_p5_p6_integration.cpp
@@ -67,6 +68,11 @@ set(STRATUM_TEST_SOURCES
     road/test_collision_mesh.cpp
     road/test_road_export.cpp
     road/test_p7_integration.cpp
+
+    # Tag-to-appearance mapping. Unconditional: road_style.cpp is a pure table and
+    # has no dependency on the reduction work guarded below.
+    road/test_road_style.cpp
+
     procgen/test_terrain_carve.cpp
     osm/test_quadtree_roads.cpp
 )
@@ -87,6 +93,7 @@ set(STRATUM_TEST_SUITES
     JunctionIntegration
     Markings
     Crossings
+    CrossingKerbFixes
     SidewalkDedup
     Structures
     P5P6Integration
@@ -94,6 +101,7 @@ set(STRATUM_TEST_SUITES
     CollisionMesh
     RoadExport
     P7Integration
+    RoadStyle
     TerrainCarve
     QuadTreeRoads
     RoadDump
@@ -101,6 +109,45 @@ set(STRATUM_TEST_SUITES
     JunctionDump
     P5P6Dump
 )
+
+# ───────────────────────────────────────────────────────────────────
+# Geometry-reduction suites, guarded on their implementation existing
+# ───────────────────────────────────────────────────────────────────
+# tessellation.cpp and lod_chunk.cpp are landed independently of the suites that
+# exercise them, so listing their tests unconditionally would make a tree with
+# only the headers fail to LINK -- taking every unrelated suite down with it.
+# Guarded the same way the GPU block below is guarded, for the same reason.
+#
+# test_opt_integration.cpp is gated on tessellation.cpp rather than on a source of
+# its own: it drives the passes through RoadNetworkBuilder, so without them it
+# would link only if the builder never called them, and then assert against a
+# stage that is not running.
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/osm/road/tessellation.cpp)
+    list(APPEND STRATUM_TEST_SOURCES
+        road/test_tessellation.cpp
+        road/test_opt_integration.cpp
+    )
+    list(APPEND STRATUM_TEST_SUITES Tessellation OptIntegration)
+endif()
+
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/osm/road/lod_chunk.cpp)
+    list(APPEND STRATUM_TEST_SOURCES road/test_lod_chunk.cpp)
+    list(APPEND STRATUM_TEST_SUITES LodChunk)
+endif()
+
+# The junction robustness suite covers what a real extract contains rather than
+# what a clean junction looks like: forks a few degrees wide, junction nodes
+# centimetres apart, edges shorter than the junctions at their ends, ten arms on
+# one node. It needs no guard -- junction_trim.cpp and junction_polygon.cpp are
+# unconditional sources.
+list(APPEND STRATUM_TEST_SOURCES road/test_junction_robustness.cpp)
+list(APPEND STRATUM_TEST_SUITES JunctionRobustness)
+
+# Near-coincident junction merging, and what the merge owes the consumers that
+# key off a node id rather than off a junction. Unconditional for the same
+# reason: junction_trim.cpp and junction_builder.cpp are unconditional sources.
+list(APPEND STRATUM_TEST_SOURCES road/test_junction_merge.cpp)
+list(APPEND STRATUM_TEST_SUITES JunctionMerge)
 
 add_executable(stratum_tests ${STRATUM_TEST_SOURCES})
 

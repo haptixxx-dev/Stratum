@@ -1140,6 +1140,13 @@ struct RingColumn {
  * the inboard boundary of the curb-top band, and p[3] likewise joins the curb
  * top to the sidewalk, so the four bands can only stay welded if they read the
  * same number.
+ *
+ * The one LATERAL a drop moves is p[2]. CurbRingConfig::curb_face_batter is the
+ * face's lean over its full height, so it is scaled by the same fraction the
+ * height was, and the face keeps its slope all the way down the ramp instead of
+ * flattening into a wedge across the gutter. p[1], p[3] and p[4] keep their
+ * laterals: the apron, the curb top and the sidewalk are as wide at a dropped
+ * kerb as anywhere else.
  */
 [[nodiscard]] std::vector<RingColumn> build_columns(const Section& section,
                                                     double height,
@@ -1185,14 +1192,31 @@ struct RingColumn {
             reach = 0.0;
         }
 
+        // One evaluation, shared by every band boundary that moves -- and taken
+        // BEFORE the lateral layout, because the batter depends on it.
+        const double curb_rise = drops.top_height(s.inner, cfg.curb_height);
+
+        // CurbRingConfig::curb_face_batter is the outward lean of the face over
+        // its FULL height, so a face standing 20 mm tall at a dropped kerb leans
+        // 20 mm's worth of it and not 150 mm's worth. Holding the lateral
+        // constant while the height collapses turns a 7.6 degree face into a 45
+        // degree wedge that juts into the gutter exactly where a wheel is meant
+        // to roll over it, and the wedge appears and disappears down the ramp
+        // because the lateral never moves while the height does.
+        const double rise_fraction = (cfg.curb_height > kZeroLength)
+                                         ? std::clamp(curb_rise / cfg.curb_height, 0.0, 1.0)
+                                         : 1.0;
+        const double batter_here = batter * rise_fraction;
+
         // Never let the cross-section overshoot the offset ring on a corner the
         // offset pulled in tighter than the nominal one. The apron is consumed
         // first, because it is the band that keeps the ring's curb face on the
         // same lateral as the arms' curb faces; giving it up would put the hole
         // back in the kerb.
         const double gutter = (reach > 0.0) ? std::min(apron, reach) : apron;
-        const double face =
-            (reach > 0.0) ? std::min(batter, std::max(0.0, reach - gutter)) : batter;
+        const double face = (reach > 0.0)
+                                ? std::min(batter_here, std::max(0.0, reach - gutter))
+                                : batter_here;
         const double flat = (reach > 0.0)
                                 ? std::min(top_width, std::max(0.0, reach - gutter - face))
                                 : top_width;
@@ -1203,8 +1227,6 @@ struct RingColumn {
         c.p[2] = s.inner + outward * (gutter + face);
         c.p[3] = s.inner + outward * (gutter + face + flat);
         c.p[4] = (reach > 0.0) ? s.outer : c.p[3];
-        // One evaluation, shared by every band boundary that moves.
-        const double curb_rise = drops.top_height(s.inner, cfg.curb_height);
 
         c.h[0] = surface;
         c.h[1] = surface;
@@ -1378,7 +1400,7 @@ CurbRing build_curb_ring(const JunctionPolygon& poly,
     if (!cfg.enabled) {
         return out;
     }
-    if (!poly.valid || poly.self_intersecting || poly.ring.size() < 3) {
+    if (!poly.valid || poly.needs_hull_fallback() || poly.ring.size() < 3) {
         return out;
     }
     if (arms.size() != ends.size() || poly.arm_ring_start.size() != arms.size()) {

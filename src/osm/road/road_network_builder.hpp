@@ -28,12 +28,14 @@
 #include "osm/road/corridor.hpp"
 #include "osm/road/crossings.hpp"
 #include "osm/road/junction_builder.hpp"
+#include "osm/road/lod_chunk.hpp"
 #include "osm/road/markings.hpp"
 #include "osm/road/mesh_optimize.hpp"
 #include "osm/road/road_elevation.hpp"
 #include "osm/road/road_graph.hpp"
 #include "osm/road/road_profile.hpp"
 #include "osm/road/sidewalk_dedup.hpp"
+#include "osm/road/tessellation.hpp"
 #include "osm/road/tunnel_builder.hpp"
 #include "osm/types.hpp"
 #include "renderer/mesh.hpp"
@@ -309,8 +311,96 @@ struct RoadNetworkConfig {
      * The most expensive of the four by a wide margin: simplification runs once per
      * material range per level, so a kerbed profile at the default three ratios is
      * a dozen meshopt_simplify() calls per piece. Off by default.
+     *
+     * @note This is the PER-PIECE chain, and on road geometry it barely reduces --
+     *       85.3% of level 0 at its coarsest level, because lock_borders pins
+     *       nearly every vertex of a 3 m ribbon. See lod_chunk.hpp, which explains
+     *       why and builds the chain from merged per-chunk geometry instead.
+     *       RoadNetworkConfig::chunk_lod configures that path. This one is kept
+     *       because a piece is the unit the spatial index evicts, so a consumer
+     *       that streams per piece and never merges still needs it.
      */
     bool build_lods = false;
+
+    // ------------------------------------------------------------------
+    // Tessellation reduction
+    //
+    // The station and strip counts are where the geometry actually is. See
+    // tessellation.hpp: a dead-straight road is resampled every
+    // ResampleConfig::max_spacing metres whatever its shape, and a kerbed
+    // profile is around 16 vertex columns wide however many of those columns
+    // are the same material at the same height.
+    //
+    // This is the only P7-era switch that shrinks LOD level 0, every level
+    // below it, the collision mesh and the export at once, because it removes
+    // triangles instead of producing a cheaper copy of them.
+    // ------------------------------------------------------------------
+
+    /// Deviation budget, span cap and coplanarity threshold for both passes
+    TessellationConfig tessellation;
+
+    /**
+     * @brief Ratios, error bound and border band for the chunk-level LOD chain
+     *
+     * Read by build_chunk_lod(), which the SPATIAL INDEX calls once it knows
+     * which pieces landed in which leaf. RoadNetworkBuilder does not chunk and
+     * therefore never calls it; the config is carried here so that one
+     * RoadNetworkConfig still describes the whole pipeline and a caller does not
+     * have to thread a second struct through the import path.
+     */
+    ChunkLodConfig chunk_lod;
+
+    /**
+     * @brief Run the tessellation reduction passes
+     *
+     * When true, two passes run:
+     *
+     * - select_stations() plus apply_station_selection() on each edge's
+     *   centerline, between step 2 and step 5, AFTER the elevation solve and the
+     *   junction trims. It must be after both: the trims decide which arclengths
+     *   are feature stations, and the elevation solve is expressed per station of
+     *   the untrimmed centerline. Station heights are gathered to match the
+     *   surviving stations exactly as slice() already does for a trim.
+     * - merge_coplanar_quads() on each finished piece, inside step 8 and BEFORE
+     *   the weld, for the reason given on that function.
+     *
+     * When false, neither pass runs and the geometry is byte-identical to the
+     * previous phase's, which is what the golden tests diff against. Same
+     * bisectability contract as solve_junctions, emit_markings and the rest.
+     *
+     * On by default: the passes remove triangles that carry no information, and
+     * every measured downside of removing them is bounded by
+     * TessellationConfig::max_chord_deviation and
+     * TessellationConfig::max_span_length.
+     */
+    bool reduce_tessellation = true;
+
+    /**
+     * @brief Drop an edge's OWN kerb where a crossing needs it
+     *
+     * The other half of a dropped kerb, and the half that was missing. A junction
+     * ring is broken by dropped_kerb_spans(), which junction_curb.hpp has
+     * consumed since P5; the kerb running along an edge's corridor is broken by
+     * corridor_kerb_drops(), which nothing consumed. A mid-block crossing has no
+     * ring at all, so before this its zebra was painted into a 150 mm wall, and a
+     * junction crossing stepped the full curb height at the arm mouth where the
+     * ring's drop stopped and the corridor's kerb carried on.
+     *
+     * When on, and only for edges whose profile actually has a kerb:
+     *
+     * - The edge's centerline is resampled at the arclengths
+     *   CorridorKerbProfile::required_stations() names, so each ramp is drawn as a
+     *   slope rather than as a step between two columns metres apart.
+     * - CorridorConfig::kerb_top_height is bound for that edge, and the extruder
+     *   modulates the kerb face, the kerb top and the sidewalk's inboard edge
+     *   across the run.
+     *
+     * Gated on emit_crossings and on CrossingConfig::emit_dropped_kerbs as well,
+     * since both are what produce the runs in the first place. With any of the
+     * three off no run is demanded, no station is inserted, and the output is
+     * bit-identical to the previous phase's.
+     */
+    bool drop_corridor_kerbs = true;
 };
 
 /**
@@ -606,6 +696,81 @@ struct RoadNetwork {
 
         /// Triangles across every RoadPiece::collision. Zero when build_collision is off.
         size_t collision_triangles = 0;
+
+        // --------------------------------------------------------------------
+        // Tessellation reduction counts
+        //
+        // All zero when RoadNetworkConfig::reduce_tessellation is off, which is
+        // indistinguishable from "ran, and there was nothing to merge" -- check
+        // the flag, not the count. Except stations_before and stations_after,
+        // which are equal in that case rather than zero, because the stations
+        // exist either way.
+        // --------------------------------------------------------------------
+
+        /**
+         * @brief Stations summed over every edge centerline BEFORE decimation
+         *
+         * Counted on the TRIMMED centerline, that is, on the stations that would
+         * have been extruded, so the ratio against stations_after is the
+         * reduction a consumer actually receives. Bevel pairs count as two, since
+         * they are two stations and cost two vertex columns.
+         */
+        size_t stations_before = 0;
+
+        /**
+         * @brief Stations summed over every edge centerline AFTER decimation
+         *
+         * Equal to stations_before when RoadNetworkConfig::reduce_tessellation is
+         * off. `stations_after / stations_before` is the longitudinal pass's
+         * whole effect, and it is normally well above
+         * TessellationConfig::max_chord_deviation would suggest, because
+         * TessellationConfig::max_span_length and the protected feature stations
+         * both refuse merges the deviation budget would allow. That is the cap
+         * doing its job, not a failure.
+         */
+        size_t stations_after = 0;
+
+        /**
+         * @brief Quads merged by the lateral pass, summed over every piece
+         *
+         * A count of MERGES, not of triangles: each one removes two triangles, so
+         * `2 * quads_merged` is the triangle reduction the lateral pass
+         * contributed. Zero when RoadNetworkConfig::reduce_tessellation or
+         * TessellationConfig::merge_coplanar_strips is off.
+         */
+        size_t quads_merged = 0;
+
+        /**
+         * @brief Triangles across every piece BEFORE either tessellation pass
+         *
+         * The denominator the two passes are measured against, so
+         * `triangles / triangles_before_tess` is the combined reduction. Equal to
+         * Stats::triangles when RoadNetworkConfig::reduce_tessellation is off,
+         * and NOT zero in that case -- unlike triangles_before_lod, which is
+         * zero when its pass is off, because a LOD chain that did not run has no
+         * level 0 to count while a mesh that was not decimated still has
+         * triangles.
+         *
+         * Counted after the corridor, markings, crossings and structures of an
+         * edge are all in the piece, and before the weld, so it is comparable
+         * with Stats::triangles on the same footing.
+         */
+        size_t triangles_before_tess = 0;
+
+        /**
+         * @brief Edges whose own corridor kerb a crossing dropped
+         *
+         * Zero when RoadNetworkConfig::drop_corridor_kerbs is off, when the
+         * crossings pass is off, or when no crossing in the extract sits on a
+         * kerbed edge. Counted per EDGE and not per run: two crossings on one
+         * street are merged into one continuous drop, so a run count would say
+         * less about the network than this does.
+         *
+         * Its junction counterpart is Stats::dropped_kerb_spans. A junction
+         * crossing contributes to BOTH, which is the point: the ring's drop and
+         * the arm's drop meet at the trim station and a crossing needs the pair.
+         */
+        size_t corridor_kerb_edges = 0;
 
         double elevation_ms = 0.0;  ///< Share of build_ms spent in the elevation solve
         double junction_ms = 0.0;   ///< Share of build_ms spent in the junction solve

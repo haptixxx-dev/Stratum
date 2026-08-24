@@ -13,9 +13,20 @@
  *
  * The two halves are produced separately because they belong to different
  * meshes. build_crossing() returns paint, entirely MaterialId::Markings, on the
- * same contract as markings.hpp. dropped_kerb_spans() returns no geometry at
- * all: it returns the ANGULAR SPANS of the junction's kerb ring that must drop,
- * which the curb-ring stage consumes. See DroppedKerbSpan.
+ * same contract as markings.hpp. The kerb drop returns no geometry at all: it
+ * returns the RUNS of kerb that must drop, which the two stages that own a kerb
+ * line consume.
+ *
+ * There are two such stages, and a crossing needs BOTH:
+ *
+ * - dropped_kerb_spans() / driveway_kerb_spans() return ANGULAR SPANS of a
+ *   junction's kerb RING, measured from the junction centre. See
+ *   DroppedKerbSpan; junction_curb.hpp consumes them.
+ * - corridor_kerb_drops() returns ARCLENGTH RUNS of an edge's own corridor kerb.
+ *   See CorridorKerbDrop and CorridorKerbProfile; the corridor extruder consumes
+ *   them. A mid-block crossing has no ring at all and is expressed ONLY here,
+ *   and a junction crossing needs both, because the ring's drop stops at the
+ *   arm's mouth and the arm's own kerb runs on from there at full height.
  *
  * Everything in this file lives in stratum_core: no SDL, no ImGui, no rendering
  * API.
@@ -33,6 +44,7 @@
 
 #include <glm/glm.hpp>
 
+#include <cstdint>
 #include <vector>
 
 namespace stratum::osm::road {
@@ -93,13 +105,17 @@ struct CrossingConfig {
      * lip across DroppedKerbSpan's own span, and ramps back up over the same
      * distance on the far side.
      *
-     * Consumed by the curb-ring stage, not by anything in this file: see
-     * KerbDrops in junction_curb.hpp.
+     * Consumed by whichever stage owns the kerb being cut -- KerbDrops in
+     * junction_curb.hpp for a ring, CorridorKerbProfile below for an edge's own
+     * kerb -- and by nothing that emits geometry in this file.
      */
     float dropped_kerb_ramp = 1.0f;
 
     bool emit_zebra = true;         ///< Paint the stripes
-    bool emit_dropped_kerbs = true; ///< Produce spans from dropped_kerb_spans()
+
+    /// Produce runs from dropped_kerb_spans(), driveway_kerb_spans() and
+    /// corridor_kerb_drops()
+    bool emit_dropped_kerbs = true;
 };
 
 // ============================================================================
@@ -166,6 +182,24 @@ struct Crossing {
      *
      * RoadProfile::left_edge_offset() centres that same span on the centreline,
      * so the extent runs from `-width / 2` to `+width / 2` in Crossing::axis.
+     *
+     * ### The miter is already in this number
+     *
+     * A lateral offset in the profile's own frame is NOT a distance on the
+     * ground. The corridor extruder puts every strip edge through
+     * offset_point(), which clamps the lateral to the station's fold bounds and
+     * then multiplies by Station::miter_scale, so at a mitred joint the
+     * carriageway edge stands `half * miter_scale` from the centreline and not
+     * `half`. This field is the extent MEASURED ON THE GROUND along
+     * Crossing::axis: the profile span with that clamp and that scale already
+     * applied. Laying stripes out against the raw profile span instead stops the
+     * paint short of the kerb at every bend -- 1.45 m short a side at a
+     * right-angle joint -- and, inside a fold where the clamp binds, runs it
+     * over the kerb.
+     *
+     * Where the fold clamp binds asymmetrically the SHORTER of the two sides is
+     * taken, so the extent stays centred on the centreline as the field's
+     * contract requires and the paint can never cross a kerb.
      */
     float width = 0.0f;
 
@@ -183,6 +217,9 @@ struct Crossing {
      * island and one contiguous run across the whole extent. A FLUSH median is
      * not an island: it is painted straight across, which is what a flush median
      * is for.
+     *
+     * Measured on the ground along Crossing::axis, on the same terms as
+     * @ref width: the miter scale and the fold clamp are already applied.
      */
     float island_left = 0.0f;
     float island_right = 0.0f;    ///< See @ref island_left
@@ -372,11 +409,26 @@ struct DroppedKerbSpan {
  * fillet is tangent to the arm's kerb line at the corner, so that is the kerb a
  * pedestrian at this crossing steps off, and it is live ring by construction.
  * The corridor kerb running the other way past the corner is not part of any
- * ring and cannot be cut from here at all.
+ * ring and cannot be cut from here at all -- corridor_kerb_drops() cuts it, and
+ * a junction crossing needs BOTH calls or the two kerbs meet at the arm's mouth
+ * with a full curb height between them.
  *
  * Only crossings whose Crossing::at_junction is set and whose arm belongs to
- * @p node contribute. A mid-block crossing needs a drop in the CORRIDOR's kerb
- * strip, not in a junction ring, and is not represented here.
+ * @p node -- or to one of @p absorbed_nodes -- contribute. A mid-block crossing
+ * needs a drop in the CORRIDOR's kerb strip, not in a junction ring, and is not
+ * represented here.
+ *
+ * ### Why @p absorbed_nodes exists
+ *
+ * collect_arms() merges near-coincident junction nodes: one primary takes every
+ * arm and the other members are solved away. Crossing::node still names the arm's
+ * OWN end node, so a crossing on an absorbed member's approach asks for a drop
+ * from a node that has no ring, while the primary's ring -- the one the crossing
+ * actually stands on -- never sees it. The corridor still lays its own drop right
+ * up to the trim station, so the two kerbs then meet at the arm mouth with a full
+ * curb height between them, which is exactly the step this pair of calls exists
+ * to remove. Pass the nodes the primary absorbed and the spans land on the ring
+ * that covers them.
  *
  * Overlapping spans are merged, so two crossings on adjacent arms sharing a
  * corner produce one continuous drop rather than two that fight over the same
@@ -400,13 +452,19 @@ struct DroppedKerbSpan {
  *                        Every returned direction is measured from this point,
  *                        so passing the wrong centre rotates every span.
  * @param cfg             Drop width and lip height
+ * @param absorbed_nodes  Optional. Other graph nodes this junction's ring covers,
+ *                        because collect_arms() merged them into @p node. A
+ *                        crossing naming any of them is treated exactly as one
+ *                        naming @p node. Null or empty is the ordinary case.
  * @return Merged spans in counter-clockwise order; empty when
  *         CrossingConfig::emit_dropped_kerbs is false or no crossing reaches @p node
  */
-[[nodiscard]] std::vector<DroppedKerbSpan> dropped_kerb_spans(const std::vector<Crossing>& crossings,
-                                                              GraphNodeId node,
-                                                              glm::dvec2 junction_center,
-                                                              const CrossingConfig& cfg);
+[[nodiscard]] std::vector<DroppedKerbSpan> dropped_kerb_spans(
+    const std::vector<Crossing>& crossings,
+    GraphNodeId node,
+    glm::dvec2 junction_center,
+    const CrossingConfig& cfg,
+    const std::vector<GraphNodeId>* absorbed_nodes = nullptr);
 
 /**
  * @brief Angular spans of one junction's kerb ring that a DRIVEWAY requires be dropped
@@ -451,5 +509,230 @@ struct DroppedKerbSpan {
                                                                glm::dvec2 junction_center,
                                                                const std::vector<RoadProfile>& profiles,
                                                                const CrossingConfig& cfg);
+
+
+// ============================================================================
+// Corridor kerb drops
+// ============================================================================
+
+/**
+ * @brief Which of an edge's two kerb lines a drop applies to
+ *
+ * Sides are named against the edge's DIRECTION OF TRAVEL, the same convention
+ * Strip laterals and Crossing::axis use: Left is positive lateral.
+ */
+enum class KerbSide : std::uint8_t {
+    Left,   ///< The kerb at positive lateral
+    Right,  ///< The kerb at negative lateral
+    Both    ///< Both kerbs of the edge
+};
+
+/**
+ * @brief A run of ONE edge's own corridor kerb that must drop to a lip
+ *
+ * The corridor counterpart of DroppedKerbSpan, and the half of the kerb drop
+ * that a junction ring cannot express. A ring is a closed curve around a node
+ * and its spans are angles about that node's centre; an edge's kerb is a ribbon
+ * along a centerline and its runs are ARCLENGTHS in that centerline's own
+ * untrimmed parameterisation -- the same frame GraphEdge::trim_from,
+ * Crossing::arclength and the lane markings are already expressed in.
+ *
+ * @ref from and @ref to bound the FLAT part of the drop. The kerb ramps between
+ * full height and the lip over @ref ramp_from before @ref from and over
+ * @ref ramp_to after @ref to, so the whole run the drop touches is
+ * `[from - ramp_from, to + ramp_to]`.
+ *
+ * A ramp of zero is not a step. It means the drop CONTINUES past that end into
+ * something else that is already at the lip, which is exactly what happens at a
+ * junction crossing: the run is laid right up to the arm's trim station, where
+ * the corridor stops and the junction ring's own dropped span takes over. Both
+ * ends of a mid-block drop carry a real ramp.
+ */
+struct CorridorKerbDrop {
+    /// Edge whose kerb drops. Never kInvalidId for a returned drop.
+    EdgeId edge = kInvalidId;
+
+    /// Arclength the flat lip starts at, in the edge's untrimmed parameterisation
+    double from = 0.0;
+
+    /// Arclength the flat lip ends at; always >= @ref from
+    double to = 0.0;
+
+    /// Metres the kerb ramps over BEFORE @ref from; 0 means the drop continues
+    double ramp_from = 0.0;
+
+    /// Metres the kerb ramps over AFTER @ref to; 0 means the drop continues
+    double ramp_to = 0.0;
+
+    /// Height the kerb top drops to, above the carriageway surface
+    float height = 0.0f;
+
+    /// Which kerb line drops
+    KerbSide side = KerbSide::Both;
+};
+
+/**
+ * @brief Runs of corridor kerb that the located crossings require be dropped
+ *
+ * This is the answer to the failure crossings.hpp has always named and never
+ * fixed: a mid-block crossing on a kerbed street painted a zebra into a 150 mm
+ * wall, because the only kerb the pipeline knew how to drop belonged to a
+ * junction ring and a mid-block crossing has no ring.
+ *
+ * Every crossing contributes, not only the mid-block ones:
+ *
+ * - A **mid-block** crossing contributes one run centred on its arclength,
+ *   `max(CrossingConfig::dropped_kerb_width, CrossingConfig::crossing_depth)`
+ *   long -- the drop is at least as wide as the painted corridor it serves --
+ *   with a real ramp at each end.
+ * - A **junction** crossing contributes one run from its own arclength out to
+ *   the arm's TRIM STATION, with a ramp only on the mid-block side. That end is
+ *   where the corridor stops and dropped_kerb_spans() begins, so the two drops
+ *   butt at the same height instead of stepping the full curb height at the arm
+ *   mouth. Emitting the ring span without this run is the tear that made a
+ *   junction crossing look worse than no crossing at all.
+ *
+ * Runs are clamped into `[trim_from, length - trim_to]`, which is the span the
+ * corridor actually occupies, so a drop can never be demanded of kerb that was
+ * trimmed away. Overlapping runs on one edge and side are merged, taking the
+ * deeper lip and the outer ends' ramps, so two crossings a few metres apart
+ * produce one continuous drop rather than a ripple between them.
+ *
+ * Edges whose profile carries no kerb at all -- a rural road with a verge, a
+ * motorway with a shoulder -- contribute nothing, so a build over an extract
+ * with no footways pays nothing for this pass.
+ *
+ * @param crossings   All located crossings, from find_crossings()
+ * @param graph       Built road graph; supplies each edge's solved trims
+ * @param centerlines Parallel to graph.edges(); the untrimmed centerlines the
+ *                    arclengths are measured in
+ * @param profiles    Parallel to graph.edges(); an edge with no kerb is skipped
+ * @param cfg         Drop width, lip height and ramp length
+ * @return Runs sorted by (edge, from), so a build is reproducible run to run;
+ *         empty when CrossingConfig::emit_dropped_kerbs is false
+ */
+[[nodiscard]] std::vector<CorridorKerbDrop> corridor_kerb_drops(
+    const std::vector<Crossing>& crossings,
+    const RoadGraph& graph,
+    const std::vector<Centerline>& centerlines,
+    const std::vector<RoadProfile>& profiles,
+    const CrossingConfig& cfg);
+
+/**
+ * @brief One edge's kerb drops, evaluated as a continuous function of arclength
+ *
+ * The corridor counterpart of the DropProfile that junction_curb.cpp builds from
+ * KerbDrops, and it exists for the same reason: the modulation must be
+ * CONTINUOUS in position, because the extruder samples it at vertex columns and
+ * anything the sampling misses reads as a step or as nothing at all.
+ *
+ * ### What a consumer must do with it
+ *
+ * A drop is a MODULATION of the profile the edge already has, never a second
+ * profile. Exactly as KerbDrops describes for the ring, and in the same order
+ * from the carriageway outward:
+ *
+ * - Strip boundaries at the carriageway surface do not move. The gutter is at
+ *   road level with or without a drop.
+ * - The CurbFace's RAISED edge and both edges of the CurbTop beyond it take
+ *   top_height(). The face keeps its batter in proportion to its remaining
+ *   height, so a 20 mm lip leans 20 mm's worth and not 150 mm's worth.
+ * - The first strip OUTBOARD of that curb -- the sidewalk -- takes top_height()
+ *   at its inboard edge and keeps its outboard edge at full height. It becomes
+ *   the crossfall ramp, which is what a real dropped kerb does to a footway, and
+ *   it is why the drop can never tear the ribbon away from the verge, the
+ *   terrain or the junction ring beside it.
+ * - Everything further outboard is untouched.
+ *
+ * Every boundary that moves must take ONE evaluation of top_height() per
+ * station and side. Two evaluations of the same station cannot be relied on to
+ * agree once the caller has interpolated anything, and boundaries that disagree
+ * are exactly where a ribbon splits.
+ *
+ * ### Resampling
+ *
+ * required_stations() lists the arclengths the centerline MUST carry a station
+ * at for the ramp to be drawn as a slope. A centerline resampled at
+ * ResampleConfig::max_spacing puts its stations metres apart, and a 1 m ramp
+ * laid out against those columns falls between two of them and is drawn as a
+ * vertical step -- or, where a whole drop fits inside one band, is drawn not at
+ * all. A consumer that cannot resample gets a step, which is the tear this class
+ * exists to avoid.
+ */
+class CorridorKerbProfile {
+public:
+    /// An inactive profile: top_height() returns the full height everywhere
+    CorridorKerbProfile() = default;
+
+    /**
+     * @brief Select one edge's runs out of the network-wide list
+     *
+     * @param drops       Runs from corridor_kerb_drops(); other edges are ignored
+     * @param edge        Edge to build the profile for
+     * @param curb_height Full height of the kerb above the carriageway, metres.
+     *                    Every lip is clamped into [0, curb_height], so a
+     *                    misconfigured lip can never raise the kerb.
+     * @param ramp_floor  Shortest ramp that will be honoured, metres. A ramp
+     *                    below this is raised to it, because a ramp of zero
+     *                    LENGTH is an instant step; it is not the same thing as
+     *                    CorridorKerbDrop's zero ramp, which means the drop
+     *                    continues rather than ramping.
+     */
+    CorridorKerbProfile(const std::vector<CorridorKerbDrop>& drops,
+                        EdgeId edge,
+                        double curb_height,
+                        double ramp_floor = 0.05);
+
+    /// There is at least one usable run on this edge
+    [[nodiscard]] bool active() const { return !m_runs.empty(); }
+
+    /**
+     * @brief Height the kerb top stands at, above the carriageway surface
+     *
+     * @param arclength     Station arclength, in the edge's untrimmed frame
+     * @param left_of_travel Which kerb line is being asked about
+     * @param full          The undropped curb height, metres
+     * @return @p full away from every run, the run's lip inside one, and a linear
+     *         ramp between the two. Where two runs overlap the deeper wins.
+     */
+    [[nodiscard]] double top_height(double arclength, bool left_of_travel, double full) const;
+
+    /**
+     * @brief Fraction of the way from the full kerb down to the lip, in [0, 1]
+     *
+     * 1 inside a run, 0 clear of every run and its ramps. Published alongside
+     * top_height() because a consumer scaling a batter, a UV or a material blend
+     * needs the shape of the ramp rather than its height.
+     */
+    [[nodiscard]] double factor(double arclength, bool left_of_travel) const;
+
+    /**
+     * @brief Arclengths the centerline must carry a station at
+     *
+     * Every run's four breakpoints, plus intermediate samples down each ramp, so
+     * the slope is carried by real vertex columns. Ascending, deduplicated, and
+     * clipped to `[lo, hi]`.
+     *
+     * @param lo Lowest arclength the centerline covers
+     * @param hi Highest arclength the centerline covers
+     * @return Arclengths in ascending order; empty when the profile is inactive
+     */
+    [[nodiscard]] std::vector<double> required_stations(double lo, double hi) const;
+
+private:
+    struct Run {
+        double from = 0.0;
+        double to = 0.0;
+        double ramp_from = 0.0;
+        double ramp_to = 0.0;
+        double lip = 0.0;
+        bool left = true;
+        bool right = true;
+    };
+
+    [[nodiscard]] double run_factor(const Run& r, double s) const;
+
+    std::vector<Run> m_runs;
+};
 
 } // namespace stratum::osm::road

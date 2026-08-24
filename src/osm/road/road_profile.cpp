@@ -21,7 +21,10 @@
 
 #include "osm/road/road_profile.hpp"
 
+#include "osm/road/road_style.hpp"
+
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <string>
 
@@ -447,43 +450,32 @@ enum class MedianTag : uint8_t {
 /**
  * @brief Map a raw surface=* value onto a material slot
  *
- * The mapping is deliberately coarse. A game map needs one texture per surface
- * family, not the several hundred distinct surface values OSM carries. The
- * families are: bituminous, cementitious, laid paving units, loose aggregate,
- * bare soil, and vegetation.
+ * There is exactly ONE surface table, and it lives in road_style.cpp. This used
+ * to be a second one, and the two disagreed on every modular running surface:
+ * road_style puts a cobbled carriageway in MaterialId::Asphalt with
+ * variants::kCobblestone, because it is driveable, while this file put it in
+ * MaterialId::Sidewalk. Since strip_material() may never change the slot it is
+ * handed, that disagreement resolved a cobbled lane to the FOOTWAY's brick
+ * variant -- byte-identical to the pavement beside it, so the two merged into one
+ * draw range -- and made kCobblestone, kSett and kPavingStones unreachable from
+ * any way in any extract. It also suppressed the smoothness refinement wherever
+ * the slots differed, because that pass only refines a strip whose slot matches
+ * the carriageway's.
  *
- * Paving units -- setts, cobbles, bricks, slabs -- map to MaterialId::Sidewalk
- * because that is the paving-unit texture in the material set, whatever the
- * strip using it happens to be. A cobbled carriageway is cobbles.
+ * The road CLASS fallback stays here, because it is this file's business: a
+ * footway with no surface tag is Sidewalk and a track is Dirt, where
+ * road_style.cpp's own step 2 would say Asphalt.
  *
- * @param surface Lowercased surface=* value; empty when the tag is absent
+ * @param surface  Lowercased surface=* value; empty when the tag is absent
  * @param fallback Material to use for an absent or unrecognised value
  */
-[[nodiscard]] MaterialId surface_material(const std::string& surface, MaterialId fallback) {
-    if (surface.empty()) return fallback;
-
-    if (surface == "asphalt" || surface == "paved" || surface == "chipseal" ||
-        surface == "bitmac" || surface == "tarmac" || surface == "asphalt:lanes")
-        return MaterialId::Asphalt;
-    // concrete:plates is cast concrete laid in bays, not asphalt.
-    if (surface == "concrete" || surface == "concrete:plates" ||
-        surface == "concrete:lanes" || surface == "cement")
-        return MaterialId::Concrete;
-    if (surface == "paving_stones" || surface == "sett" || surface == "cobblestone" ||
-        surface == "unhewn_cobblestone" || surface == "bricks" || surface == "brick" ||
-        surface == "metal" || surface == "wood")
-        return MaterialId::Sidewalk;
-    if (surface == "gravel" || surface == "compacted" || surface == "fine_gravel" ||
-        surface == "pebblestone" || surface == "unpaved" || surface == "rock" ||
-        surface == "stone" || surface == "chippings" || surface == "shells")
-        return MaterialId::Gravel;
-    if (surface == "dirt" || surface == "ground" || surface == "earth" ||
-        surface == "mud" || surface == "sand" || surface == "clay" ||
-        surface == "soil" || surface == "woodchips")
-        return MaterialId::Dirt;
-    if (surface == "grass" || surface == "grass_paver")
-        return MaterialId::Grass;
-
+[[nodiscard]] MaterialId surface_slot(const std::string& surface, MaterialId fallback) {
+    MaterialKey tagged{};
+    // Qualified because this file is inside namespace stratum::osm::road already,
+    // and the name is only meaningful as road_style.hpp's.
+    if (::stratum::osm::road::surface_material_from_tag(surface, tagged)) {
+        return tagged.material;
+    }
     return fallback;
 }
 
@@ -745,8 +737,15 @@ bool RoadProfile::is_valid() const {
 // build_profile
 // ============================================================================
 
-RoadProfile build_profile(const GraphEdge& edge, const ProfileConfig& cfg, const TagMap* tags,
-                          SideFlags suppress_sidewalk) {
+/**
+ * @brief Build the strip list, before any material variant is decided
+ *
+ * Split out of build_profile() so the variant pass below runs on EVERY return
+ * path -- the single-strip classes return early, and a footway that missed the
+ * pass would be the one surface whose `surface=*` tag did nothing.
+ */
+static RoadProfile build_profile_strips(const GraphEdge& edge, const ProfileConfig& cfg,
+                                        const TagMap* tags, SideFlags suppress_sidewalk) {
     RoadProfile profile;
     std::vector<Strip>& out = profile.strips;
 
@@ -755,7 +754,18 @@ RoadProfile build_profile(const GraphEdge& edge, const ProfileConfig& cfg, const
         apply_service_rules(rules, read_service_kind(tags), cfg);
     }
 
-    const MaterialId surface = surface_material(edge.surface, rules.default_material);
+    // road_style.cpp's table answers for a RUNNING SURFACE, and its slot policy is
+    // a carriageway's: `paving_stones` is driveable, so it is Asphalt with a
+    // paving variant. A footway is not a carriageway. Its slot stays Sidewalk and
+    // its surface becomes a VARIANT of Sidewalk in assign_strip_variants(), which
+    // is what kSidewalkPaved and kSidewalkAsphalt exist for -- strip_material()
+    // may never change the slot it is handed, so a footway moved out of the
+    // Sidewalk slot here can never reach them. Every other class, single-strip or
+    // not, really is a running surface and takes the shared table's answer.
+    const bool footway_surface = rules.single_strip && rules.single_kind == StripKind::Sidewalk;
+    const MaterialId surface = footway_surface
+                                   ? rules.default_material
+                                   : surface_slot(edge.surface, rules.default_material);
     const bool unpaved = surface_is_unpaved(edge.surface);
 
     // ------------------------------------------------------------------------
@@ -1019,6 +1029,98 @@ RoadProfile build_profile(const GraphEdge& edge, const ProfileConfig& cfg, const
         }
     }
 
+    return profile;
+}
+
+// ============================================================================
+// Material variants
+// ============================================================================
+
+namespace {
+
+/**
+ * @brief Whether the parent way's own surface grade describes this strip
+ *
+ * A smoothness survey is taken on what a vehicle drives on. It says nothing
+ * about the kerb beside it, the verge behind that, or the footway beyond, so the
+ * grade is applied only to the strips that ARE the running surface.
+ */
+[[nodiscard]] bool kind_is_running_surface(StripKind kind) {
+    switch (kind) {
+        case StripKind::Lane:
+        case StripKind::Gutter:
+        case StripKind::Shoulder:
+        case StripKind::CycleLane:
+        case StripKind::ParkingLane:
+        case StripKind::Median:
+            return true;
+        case StripKind::CurbFace:
+        case StripKind::CurbTop:
+        case StripKind::Sidewalk:
+        case StripKind::Verge:
+        case StripKind::Count:
+            break;
+    }
+    return false;
+}
+
+/// One tag value, lowercased, for the keys the parser does not normalise
+[[nodiscard]] std::string lowercased_tag(const TagMap* tags, const char* key) {
+    const std::string* raw = find_tag(tags, key);
+    if (raw == nullptr) return std::string();
+    std::string value = *raw;
+    for (char& c : value) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+/**
+ * @brief Give every strip the variant its tags resolve to
+ *
+ * road_style.hpp is the only place in the build that decides a variant, so this
+ * pass reads and never invents. The composition rule is the one that file
+ * documents: strip_material() first, because a tag naming a substance always
+ * beats an inference, and the carriageway's smoothness grade afterwards, only
+ * where no tag resolved a variant and only on the running surface the grade was
+ * measured on.
+ *
+ * The slot is never changed. build_profile_strips() already chose it from
+ * `surface=*` where that was the right thing to do -- a gravel road is Gravel
+ * strips, not Asphalt strips with a gravel variant -- and moving a strip to a
+ * different slot here would move it into a SubMesh range the extruder never
+ * opened for it.
+ *
+ * @param profile Strips to annotate, modified in place
+ * @param edge    Graph edge the strips were built for; supplies type and surface
+ * @param tags    Raw way tags, for smoothness and the narrow per-feature keys
+ */
+void assign_strip_variants(RoadProfile& profile, const GraphEdge& edge, const TagMap* tags) {
+    const std::string smoothness = lowercased_tag(tags, "smoothness");
+    // The SAME call build_profile_strips() took the slot from, so the guard below
+    // -- refine only where the strip's slot IS the carriageway's -- compares two
+    // answers from one table rather than from two that disagree.
+    const MaterialKey carriageway =
+        ::stratum::osm::road::surface_material(edge.type, edge.surface, smoothness);
+
+    for (Strip& strip : profile.strips) {
+        MaterialKey key = strip_material(strip.kind, strip.material, edge.surface, tags);
+
+        if (key.variant == 0 && key.material == carriageway.material &&
+            kind_is_running_surface(strip.kind)) {
+            key.variant = carriageway.variant;
+        }
+
+        strip.variant = key.variant;
+    }
+}
+
+} // namespace
+
+RoadProfile build_profile(const GraphEdge& edge, const ProfileConfig& cfg, const TagMap* tags,
+                          SideFlags suppress_sidewalk) {
+    RoadProfile profile = build_profile_strips(edge, cfg, tags, suppress_sidewalk);
+    assign_strip_variants(profile, edge, tags);
     return profile;
 }
 

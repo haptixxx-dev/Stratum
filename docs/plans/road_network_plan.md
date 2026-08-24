@@ -503,11 +503,11 @@ travel.
 
 ## Implementation Status
 
-Last updated 2026-08-23. Branch `feat/road-network`. Build green.
+Last updated 2026-08-24. Branch `feat/road-optimization`. Build green.
 
-- `./build/bin/stratum_tests` — **330 passed / 0 failed** across 27 suites.
+- `./build/bin/stratum_tests` — **423 passed / 0 failed**.
 - `./build/bin/stratum_gpu_tests` — 16 passed / 0 failed (10 `GPUBufferPool`, 6 `GPUUploadBatch`).
-- `ctest --test-dir build` — **29/29 suites passed**.
+- `ctest --test-dir build` — **36/36 suites passed**.
 
 | Phase | State |
 |---|---|
@@ -520,6 +520,7 @@ Last updated 2026-08-23. Branch `feat/road-network`. Build green.
 | P6 Bridges / tunnels | **Done.** Decks, parapets, piers, portals, layer separation. |
 | P7 Game-ready output | **Done.** Weld, meshoptimizer reorder + LOD chain, collision surface, chunked export. |
 | GPU memory (not in the original plan) | **Done.** Pooled device buffers, batched uploads, resident budget with eviction. |
+| P8 Geometry reduction (not in the original plan) | **Done.** Station decimation, coplanar quad merge, chunk LOD chains, tag-to-variant material table. See below. |
 
 ### What P7 delivers
 
@@ -599,9 +600,113 @@ Known and deliberate, from this phase:
   come from the adjacent non-bridge edges. Deliberate, matches the header contract,
   worth confirming against the intended look.
 
+## P8 Geometry reduction and chunk LOD
+
+Branch `feat/road-optimization`, on top of P7. Two new modules and one new
+quadtree responsibility, plus the tag-to-appearance table the renderer binds
+against.
+
+| Module | What it does |
+|---|---|
+| `osm/road/tessellation.*` | Longitudinal station decimation (`select_stations` + `apply_station_selection`) and the lateral coplanar-quad merge (`merge_coplanar_quads`) |
+| `osm/road/lod_chunk.*` | `build_chunk_lod()` — merges a leaf's road meshes, welds them, and simplifies with the chunk border locked so neighbouring chunks cannot crack |
+| `osm/road/road_style.*` | The ONE table from OSM tags to `MaterialKey{slot, variant}`; `material_key_name()` is what an export writes |
+| `osm/quadtree.cpp` | Triangle-centroid routing when chunk LOD is on, `measure_seam_bands()`, `build_chunk_lods()`, per-leaf level residency |
+
+### Measured on the real extract
+
+`/home/sarah/Downloads/lucan.osm` — 65 MB, 10,326 roads, 24,576 buildings,
+2,122 areas; graph 18,443 nodes / 24,906 edges / 12,543 junctions. Default
+`RoadNetworkConfig`, curb rings on, Release build, 16 threads.
+
+| | `reduce_tessellation = false` | `reduce_tessellation = true` (default) |
+|---|---|---|
+| Pieces | 40,604 | 40,604 |
+| Vertices | 4,013,865 | **2,766,999** (−31.1%) |
+| Triangles | 3,417,509 | **2,190,467** (−35.9%) |
+| Stations extruded | 316,518 | **184,108** (−41.8%) |
+| Quads merged laterally | 0 | 204,683 |
+| `build()` | 336 ms | 371 ms |
+
+The two passes cost about 35 ms on this extract and remove a third of the
+geometry. Splitting them: the longitudinal pass takes the corridor to 2,599,833
+triangles, and the lateral merge takes that to 2,190,467.
+
+Chunk LOD over the same network — 1,489 road-bearing leaves, 311 ms, widest
+measured seam band 78.72 m:
+
+| Level | Triangles | Vertices | Chunks |
+|---|---|---|---|
+| 0 | 2,190,467 | 2,817,466 | 1,489 |
+| 1 | 1,155,433 | 1,621,876 | 1,127 |
+| 2 | 271,973 | 399,813 | 390 |
+| 3 | 13,528 | 20,383 | 40 |
+
+Host memory high-water across `assign_road_pieces()`: **1,089 MB before the
+per-chunk free, 1,078 MB after**. See the note under "Known and deliberate" for
+why that is 11 MB and not the 194 MB the arithmetic suggests.
+
+### Defects fixed in the P8 review pass
+
+Seven findings survived adversarial refutation and are fixed, each with a
+regression test verified to fail with its fix reverted.
+
+| Where | Defect |
+|---|---|
+| `tessellation.cpp` | `apply_station_selection()` rebuilt the FIRST and LAST station's frame from the decimated chord and charged the absorbed runs' fold bounds to them. Those two stations are the ones the junction solver already consumed — `arm_end()` slices the same centerline at the same trim and offsets `stations.front()` to place the arm mouth and the curb ring's arm reach — so a decimated arm's ribbon stopped registering with its junction mouth. Because a trim almost never lands on an existing station, `slice()` synthesises that station with an INTERPOLATED miter frame while leaving the tangent equal to the band chord, so the rewrite rotated the normal (2.3 degrees on a 25 m kerb line, 0.25 m at a 7 m offset) with nothing else flagging it, and the fold tightening could clamp the same column metres further inboard. Both ends are now carried verbatim; interior stations still get the corrected bisector. |
+| `quadtree.cpp` | The visible-leaf gate still asked `feature_count() > 0 \|\| !road_meshes.empty()`, and `build_chunk_lods()` CLEARS `road_meshes`. A leaf holding no feature centroid of its own — ordinary under triangle-centroid routing — was therefore never traversed, never uploaded and simply absent from the viewport with chunk LOD on. 12 leaves carrying 3,975 triangles on the Lucan extract. `has_road_lod()` is now the third arm of the gate. |
+| `quadtree.cpp` | `build_chunk_lods()` held every chunk's input AND its whole chain until the parallel sweep finished. Each worker owns its leaf exclusively and `measure_seam_bands()` has already read every leaf, so the input is released inside the worker now. |
+| `junction_polygon.cpp` | The adjacent-face clipping's inversion guard collapses an over-clipped arm onto its own midpoint but leaves its two NEIGHBOURS holding the crossing points, so a trident node comes back with a ring that is SIMPLE and CLOCKWISE. `ring_self_intersects()` correctly did not flag it, so the convex-hull fallback stopped firing and a backwards sliver became the asphalt fill and the terrain carve's winding test. `JunctionPolygon::inverted` reports it and every consumer asks `needs_hull_fallback()`. |
+| `junction_trim.cpp` / `junction_builder.cpp` / `road_network_builder.cpp` / `crossings.cpp` | A near-coincident cluster's arms all go to the primary and every other member is solved away, and NOTHING recorded which junction absorbed which node. Every consumer keyed on a node id then dropped its feature silently: an approach to an absorbed member got no stop line and no give-way bar, and a junction crossing on it demanded a kerb drop from a ring that does not exist while the corridor still laid its own drop up to the trim station — the full-curb step `corridor_kerb_drops()` exists to remove. `collect_arms()` now fills an optional cluster out-parameter on every path, `JunctionBuilder::junction_owner()` publishes the node-to-primary map, and `dropped_kerb_spans()` takes the nodes a ring covers. Fires about 45 times per Dublin-sized build. |
+| `road_profile.cpp` | The profile builder kept its OWN `surface=*` table and it disagreed with `road_style.cpp`'s on every modular running surface — cobblestone, sett, paving_stones, bricks went to `MaterialId::Sidewalk` here and `MaterialId::Asphalt` there. `strip_material()` may never change the slot it is handed, so a cobbled LANE resolved to the footway's brick variant, byte-identical to the pavement beside it; `sort_submeshes_by_material()` merged carriageway and footway into one draw range, `variants::kCobblestone`, `kSett` and `kPavingStones` were unreachable from any way in any extract, and the smoothness refinement was suppressed wherever the slots differed. There is one table now. |
+| `road_export.cpp` | The exporter was variant-blind: triangles were bucketed by SLOT and `finish_chunk()` merged the ranges before any writer ran, so `{Asphalt, 0}` and `{Asphalt, kAsphaltWorn}` came out as one `usemtl`, one glTF material and one `newmtl`. `road_style.hpp` already documented `material_key_name()` as the name that travels in exported files and nothing in `src/` called it. Export is keyed on `MaterialKey::packed()` now. |
+
+Also cleaned up: `MaterialId::Wall` and `MaterialId::Roof` left three switches
+non-exhaustive. `tests/obj_dump.cpp`, `road_export.cpp` and `corridor.cpp` have
+their arms back, so a new slot is a warning rather than a silent grey fallback.
+
+### Known and deliberate, from P8
+
+- **A bend absorbed into an edge's FIRST or LAST band is not represented in that
+  band's end frame or fold bound.** Freezing the two end stations is what keeps
+  the ribbon registered with its junction mouth, and the alternative is a visible
+  wedge at every decimated arm. The band is inside the deviation budget by
+  construction.
+- **The eager per-chunk free is worth 11 MB, not 194 MB.** The chain is larger
+  than the input it replaces, so glibc reuses the freed blocks for the next
+  chunk's levels whether the free happens in the worker or in the serial pass;
+  what the eager free removes is only the tail overlap. Kept because the running
+  total is now monotonic and the window where both live is one chunk wide.
+- **`build_junction_polygon()` still produces an inverted ring on a trident
+  node.** The fix restores the hull fallback and the disc carve for it; it does
+  not repair the ring. Propagating the collapse to an inverted arm's two
+  neighbours is the real repair and is not written. Measured on the Lucan
+  extract, no real junction reaches it — 0 negative-area rings across 12,498
+  solved junctions.
+- **An absorbed cluster member's approach is painted against the PRIMARY's
+  plane.** That is right for the paint and still leaves the documented node-height
+  step of up to `radius * max_grade` at its arm mouth, which is a separate,
+  already-known consequence of the merge.
+- **`surface=rock`, `stone`, `chippings`, `shells`, `clay`, `woodchips`, `metal`
+  and `wood` now take the road class default slot** rather than the profile
+  builder's old private mapping, because `road_style.cpp`'s table deliberately
+  holds only running surfaces and `test_road_style.cpp` pins the
+  unrecognised-falls-back-to-the-class contract. `cement`, `bitmac`, `tarmac` and
+  `asphalt:lanes` were added to that table so nothing else was lost.
+- **A surveyed footway keeps the `Sidewalk` slot whatever it is paved with.**
+  `road_style.cpp`'s slot policy is a carriageway's — `paving_stones` is
+  driveable, so Asphalt — and a footway is not a carriageway. Moving it would take
+  its collision classification, its 2 m UV tiling and every `kSidewalk*` variant
+  with it, and `strip_material()` cannot put it back.
+
 ### Working tree
 
-Everything is uncommitted on `feat/road-network`: `src/osm/road/`,
+Everything is uncommitted on `feat/road-optimization`: `src/osm/road/`,
 `src/procgen/terrain_carve.*`, `src/renderer/gpu_buffer_pool.*` and `tests/` are new,
 alongside modifications to the parser, quadtree, renderer, terrain and editor.
 `src/osm/tile_manager.*` is staged for deletion.
+
+`src/renderer/mesh.hpp` carries `SubMesh::variant` and `MaterialKey`, and this
+branch appends `MaterialId::Wall` and `MaterialId::Roof` before the `Count`
+sentinel. `feat/road-materials` owns the renderer side of the same contract and
+will conflict on that file.

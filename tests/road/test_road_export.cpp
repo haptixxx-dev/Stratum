@@ -33,6 +33,7 @@
 #include "road/p7_fixtures.hpp"
 
 #include "osm/road/road_export.hpp"
+#include "osm/road/road_style.hpp"
 #include "osm/road/road_network_builder.hpp"
 #include "renderer/mesh.hpp"
 
@@ -60,6 +61,7 @@ using stratum::MaterialId;
 using stratum::Mesh;
 using stratum::Vertex;
 using stratum::material_id_name;
+using stratum::SubMesh;
 using stratum::osm::road::ExportConfig;
 using stratum::osm::road::ExportStats;
 using stratum::osm::road::RoadNetwork;
@@ -724,4 +726,166 @@ TEST(RoadExport, lod_levels_reach_disk_and_cover_the_whole_network) {
         CHECK_EQ(on_disk, expected);
         CHECK_TRUE(on_disk < total_triangles(network.pieces));
     }
+}
+
+// ============================================================================
+// The variant axis reaches the file
+// ============================================================================
+
+namespace {
+
+/**
+ * @brief Two quads in the SAME slot with DIFFERENT variants, plus one other slot
+ *
+ * The shape the exporter used to collapse: `{Asphalt, 0}` and
+ * `{Asphalt, kAsphaltWorn}` are two materials, and a resurfaced stretch beside an
+ * ordinary one is exactly how a real extract produces them.
+ */
+Mesh two_variants_mesh() {
+    Mesh mesh;
+    const stratum::MaterialKey keys[3] = {
+        { MaterialId::Asphalt,  0 },
+        { MaterialId::Asphalt,  stratum::osm::road::variants::kAsphaltWorn },
+        { MaterialId::Sidewalk, stratum::osm::road::variants::kSidewalkBrick },
+    };
+
+    for (int q = 0; q < 3; ++q) {
+        const uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
+        const uint32_t first = static_cast<uint32_t>(mesh.indices.size());
+        for (int i = 0; i < 4; ++i) {
+            Vertex v{};
+            v.position = glm::vec3(static_cast<float>(10 * q + (i & 1)), 0.0f,
+                                   -static_cast<float>((i >> 1) & 1));
+            v.normal = glm::vec3(0.0f, 1.0f, 0.0f);
+            v.color = glm::vec4(1.0f);
+            mesh.vertices.push_back(v);
+            mesh.bounds.expand(v.position);
+        }
+        for (uint32_t idx : { base, base + 1u, base + 2u, base + 1u, base + 3u, base + 2u }) {
+            mesh.indices.push_back(idx);
+        }
+        stratum::SubMesh range;
+        range.index_offset = first;
+        range.index_count = 6u;
+        range.material = keys[q].material;
+        range.variant = keys[q].variant;
+        mesh.submeshes.push_back(range);
+    }
+    return mesh;
+}
+
+/// Count occurrences of a `newmtl <name>` record in an MTL file
+size_t count_newmtl(const std::filesystem::path& path, const std::string& name) {
+    std::ifstream in(path);
+    std::string line;
+    size_t n = 0;
+    while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line == "newmtl " + name) ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+/**
+ * Two ranges sharing a slot and differing in variant export as TWO materials.
+ *
+ * ### What was wrong
+ *
+ * The exporter named materials with material_id_name() and bucketed triangles by
+ * SLOT: `triangle_materials()` cast `SubMesh::material` to a uint8 and dropped
+ * `SubMesh::variant` on the floor, `ChunkAccum::by_material` was a fixed array
+ * indexed by slot, and `finish_chunk()` physically merged the two ranges before
+ * any writer ran. One `g`, one `usemtl`, one glTF material and one `newmtl` came
+ * out, so an ordinary asphalt carriageway and a worn one could not be given
+ * different textures in the target engine -- the entire variant axis this branch
+ * adds was invisible in the product deliverable. road_style.hpp already documented
+ * material_key_name() as the name that "travels in exported files"; nothing in
+ * src/ called it.
+ *
+ * ### How this test fails without the fix
+ *
+ * `obj.groups` comes back with two entries instead of three, both Asphalt ranges
+ * carry `usemtl stratum_Asphalt`, and the MTL holds a single `newmtl` for them.
+ */
+TEST(RoadExport, a_variant_is_its_own_exported_material) {
+    const Mesh mesh = two_variants_mesh();
+
+    const std::filesystem::path dir = p7::scratch_dir("variants");
+    const std::filesystem::path path = dir / "variants.obj";
+    ExportConfig cfg;
+    cfg.material_prefix = "stratum_";
+    CHECK_TRUE(export_mesh(mesh, path, cfg));
+
+    const p7::ObjFile obj = p7::read_obj(path);
+    CHECK_TRUE(obj.ok);
+
+    // Three materials, not two: the slot alone is not the identity.
+    CHECK_EQ(obj.groups.size(), size_t{3});
+
+    const std::string expected[3] = {
+        "stratum_Asphalt",
+        "stratum_Asphalt.Worn",
+        "stratum_Sidewalk.Brick",
+    };
+    for (const std::string& name : expected) {
+        if (std::find(obj.groups.begin(), obj.groups.end(), name) == obj.groups.end()) {
+            stratum::test::report_failure(__FILE__, __LINE__, "variant reached the OBJ",
+                                          "no usemtl " + name + " in the file");
+        }
+    }
+
+    // One triangle pair per material, so nothing was merged on the way.
+    std::map<std::string, size_t> faces_per_material;
+    for (const p7::ObjFace& f : obj.faces) {
+        CHECK_TRUE(!f.material.empty());
+        ++faces_per_material[f.material];
+    }
+    CHECK_EQ(faces_per_material.size(), size_t{3});
+    for (const auto& [name, count] : faces_per_material) {
+        (void)name;
+        CHECK_EQ(count, size_t{2});
+    }
+
+    // The MTL library names all three, and names them apart.
+    CHECK_TRUE(!obj.mtllibs.empty());
+    if (obj.mtllibs.empty()) return;
+    const std::filesystem::path mtl = dir / obj.mtllibs.front();
+    CHECK_TRUE(std::filesystem::exists(mtl));
+    for (const std::string& name : expected) {
+        CHECK_EQ(count_newmtl(mtl, name), size_t{1});
+    }
+}
+
+/**
+ * The chunked path keeps the variants too, and still conserves every triangle.
+ *
+ * `accumulate_mesh()` routes per triangle, so it is the other place the slot-only
+ * key collapsed the two ranges -- and the one that runs on a real export.
+ */
+TEST(RoadExport, chunked_export_keeps_the_variants_apart) {
+    std::vector<RoadPiece> pieces;
+    RoadPiece piece;
+    piece.edge = 0;
+    piece.anchor = { 0.0, 0.0 };
+    piece.mesh = two_variants_mesh();
+    const size_t triangles = p7::triangle_count(piece.mesh);
+    pieces.push_back(std::move(piece));
+
+    const std::filesystem::path dir = p7::scratch_dir("variant_chunks");
+    ExportConfig cfg;
+    cfg.chunk_size = 0.0f;               // one chunk, so the read-back is one file
+    cfg.export_collision = false;
+    cfg.material_prefix = "stratum_";
+    const ExportStats stats = export_road_network(pieces, dir, cfg);
+
+    CHECK_EQ(stats.triangles, triangles);
+    CHECK_TRUE(stats.chunks >= size_t{1});
+
+    // Chunking off writes one `road.obj` rather than a grid cell.
+    const p7::ObjFile obj = p7::read_obj(dir / "road.obj");
+    CHECK_TRUE(obj.ok);
+    CHECK_EQ(obj.groups.size(), size_t{3});
+    CHECK_EQ(p7::valid_face_count(obj), triangles);
 }

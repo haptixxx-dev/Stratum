@@ -191,6 +191,20 @@ struct CurbRingConfig {
  * Spans from dropped_kerb_spans() and driveway_kerb_spans() may simply be
  * concatenated into @ref spans: where two overlap the deeper drop wins, so they
  * need no merging across the two sources.
+ *
+ * ### This is only half of a crossing's kerb drop
+ *
+ * A ring covers the kerb between two arm mouths and nothing else. The kerb
+ * running the OTHER way from an arm's carriage corner, up the approach and away
+ * from the junction, belongs to that edge's corridor, and a span here cannot
+ * reach it. A junction crossing that drops the ring alone therefore meets the
+ * arm's own kerb at the mouth with the full curb height between them.
+ *
+ * corridor_kerb_drops() in crossings.hpp is the other half, and it lays each
+ * junction crossing's corridor run right up to the arm's trim station with no
+ * ramp, so the two are at DroppedKerbSpan::height where they meet. A caller that
+ * fills this structure must consume that list too; a mid-block crossing has no
+ * ring at all and is expressed there alone.
  */
 struct KerbDrops {
     /**

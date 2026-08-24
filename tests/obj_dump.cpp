@@ -43,6 +43,11 @@ namespace {
         case MaterialId::Grass:      return {0.30f, 0.55f, 0.25f};
         case MaterialId::BridgeDeck: return {0.60f, 0.60f, 0.65f};
         case MaterialId::Parapet:    return {0.80f, 0.75f, 0.55f};
+        // Building slots. No road piece carries either, but the switch stays
+        // exhaustive so a new MaterialId is a compile warning here rather than a
+        // silent white patch in a dump.
+        case MaterialId::Wall:       return {0.75f, 0.65f, 0.55f};
+        case MaterialId::Roof:       return {0.50f, 0.30f, 0.28f};
         case MaterialId::Count:      break;
     }
     return {1.0f, 1.0f, 1.0f};

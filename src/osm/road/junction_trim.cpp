@@ -107,6 +107,32 @@ constexpr double kMinRibbonLength = 0.05;
  */
 constexpr double kMaxReserveTanHalf = 2.0;
 
+/**
+ * @brief Largest near-coincident cluster collect_arms() will merge into one junction
+ *
+ * Two graph nodes a few centimetres apart are a data defect. Nine of them in one
+ * connected knot is a defect of a kind this file has no model for -- a collapsed
+ * roundabout, a whole junction imported twice -- and merging it would produce a
+ * twenty-arm junction whose bearing order means nothing. coincident_cluster()
+ * gives up on such a component entirely, and every node in it is then solved
+ * exactly as it was before merging existed.
+ */
+constexpr size_t kMaxClusterNodes = 8;
+
+/**
+ * @brief Shortest lever arm used to order a merged cluster's arms, metres
+ *
+ * The ordering key is the direction from the cluster centre to a point one lever
+ * out along each arm, so the lever sets how much an arm's STARTING POINT counts
+ * against its direction. It scales with the cluster's own spread, and this floor
+ * keeps it meaningful for a cluster whose members are millimetres apart, where
+ * the spread carries no information and the bearing is the whole answer.
+ */
+constexpr double kMinClusterLever = 4.0;
+
+/// A quarter turn in radians; the ceiling TrimConfig::min_pair_angle is clamped to
+constexpr double kHalfPi = 1.57079632679489661923;
+
 // ============================================================================
 // Small geometry helpers
 // ============================================================================
@@ -354,6 +380,96 @@ constexpr double kMaxReserveTanHalf = 2.0;
     return std::max(0.0, centerline_span(cl));
 }
 
+/**
+ * @brief Junction nodes tied to @p node by stub edges shorter than @p radius
+ *
+ * The near-coincident cluster described in collect_arms(). Two graph nodes a few
+ * centimetres apart are one junction that RoadGraph could not merge, because its
+ * own duplicate test is exact to 1e-6 m; this finds them so the junction can be
+ * solved once instead of twice.
+ *
+ * The walk is a breadth-first flood over edges whose LENGTH is below @p radius
+ * and whose far node is itself of degree 3 or more. Length rather than endpoint
+ * distance, so a genuine loop road returning to a nearby node is not swallowed:
+ * that edge is a real approach and must stay an arm.
+ *
+ * The result is the connected component, so it does not depend on which member
+ * the walk started from -- which is what lets every member agree on who the
+ * primary is without any shared state. A component larger than kMaxClusterNodes
+ * is not bad data but something this function does not understand, and it gives
+ * up on the whole component rather than truncating it, because a truncated walk
+ * WOULD depend on where it started.
+ *
+ * @param graph  Built road graph
+ * @param node   Node to cluster around; must be a valid junction node
+ * @param radius Metres below which a stub edge means "the same junction"
+ * @return The cluster in ascending GraphNodeId order, always containing @p node.
+ *         Just @p node when nothing is near it or the component is too large.
+ */
+[[nodiscard]] std::vector<GraphNodeId> coincident_cluster(const RoadGraph& graph,
+                                                          GraphNodeId node,
+                                                          double radius) {
+    std::vector<GraphNodeId> cluster{ node };
+    if (!(radius > 0.0) || !std::isfinite(radius)) return cluster;
+
+    // Breadth-first over the stub edges. `cluster` doubles as the visited set and
+    // as the queue; it is kept sorted so membership is a binary search and the
+    // output order is canonical.
+    for (size_t head = 0; head < cluster.size(); ++head) {
+        const GraphNode& n = graph.node(cluster[head]);
+        for (const Arm& a : n.arms) {
+            if (a.edge == kInvalidId || a.edge >= graph.edges().size()) continue;
+
+            const GraphEdge& e = graph.edge(a.edge);
+            const GraphNodeId far = a.at_start ? e.to : e.from;
+            if (far == kInvalidId || far >= graph.nodes().size()) continue;
+            if (far == cluster[head]) continue;              // a closed loop
+            if (graph.node(far).arms.size() < 3) continue;   // not a junction
+            if (!(e.length() < radius)) continue;            // a real approach
+
+            const auto at = std::lower_bound(cluster.begin(), cluster.end(), far);
+            if (at != cluster.end() && *at == far) continue; // already in
+            if (cluster.size() >= kMaxClusterNodes) {
+                return { node };                             // too tangled to merge
+            }
+            cluster.insert(at, far);
+        }
+    }
+
+    return cluster;
+}
+
+/// True when @p edge holds a cluster together: short, and both ends inside it
+[[nodiscard]] bool is_internal_stub(const RoadGraph& graph,
+                                    const std::vector<GraphNodeId>& cluster,
+                                    EdgeId edge,
+                                    double radius) {
+    if (cluster.size() < 2 || edge == kInvalidId || edge >= graph.edges().size()) return false;
+
+    const GraphEdge& e = graph.edge(edge);
+    if (!(e.length() < radius)) return false;
+
+    const auto holds = [&cluster](GraphNodeId id) {
+        const auto at = std::lower_bound(cluster.begin(), cluster.end(), id);
+        return at != cluster.end() && *at == id;
+    };
+    return holds(e.from) && holds(e.to);
+}
+
+/// Fill an ArmRef's widths from the arm's own profile; the outputs are left alone
+void fill_widths(const std::vector<RoadProfile>& profiles, ArmRef& ref) {
+    // An arm with no usable profile still takes its place in the cycle, at zero
+    // width. Dropping it would make two arms that are not neighbours adjacent,
+    // and every pair demand after it would be solved against the wrong partner.
+    if (ref.edge != kInvalidId && ref.edge < profiles.size()) {
+        const RoadProfile& p = profiles[ref.edge];
+        if (p.is_valid()) {
+            ref.half_width = static_cast<double>(p.total_width()) * 0.5;
+            ref.carriageway_half = carriageway_half_extent(p);
+        }
+    }
+}
+
 } // namespace
 
 // ============================================================================
@@ -362,31 +478,137 @@ constexpr double kMaxReserveTanHalf = 2.0;
 
 std::vector<ArmRef> collect_arms(const RoadGraph& graph,
                                  const std::vector<RoadProfile>& profiles,
-                                 GraphNodeId node) {
+                                 GraphNodeId node,
+                                 double coincident_radius,
+                                 std::vector<GraphNodeId>* out_cluster) {
     std::vector<ArmRef> out;
+    if (out_cluster != nullptr) out_cluster->clear();
     if (node == kInvalidId || node >= graph.nodes().size()) return out;
 
     const GraphNode& n = graph.node(node);
-    out.reserve(n.arms.size());
 
+    // A node that merges with nothing still reports the cluster {node}, so a
+    // caller resolving a member to its primary never has to tell "no cluster"
+    // apart from "not a junction".
+    if (out_cluster != nullptr) out_cluster->assign(1, node);
+
+    // ------------------------------------------------------------------------
+    // Near-coincident junctions are ONE junction. Only a node that is already a
+    // junction can absorb another, and a cluster of one -- the overwhelmingly
+    // common case -- falls straight through to the plain collection below with
+    // its arms in the order the graph sorted them.
+    // ------------------------------------------------------------------------
+    if (n.arms.size() >= 3 && coincident_radius > 0.0) {
+        const std::vector<GraphNodeId> cluster = coincident_cluster(graph, node, coincident_radius);
+        if (out_cluster != nullptr) *out_cluster = cluster;
+        if (cluster.size() > 1) {
+            if (cluster.front() != node) {
+                // Not the primary. Emitting nothing is the whole point: the
+                // primary has already taken these arms, and two junctions on one
+                // patch of ground is the artefact being removed.
+                spdlog::debug("collect_arms: node {} is {} m from node {} and is solved as part "
+                              "of it",
+                              node, glm::length(graph.node(cluster.front()).position - n.position),
+                              cluster.front());
+                return out;
+            }
+
+            for (GraphNodeId member : cluster) {
+                for (const Arm& a : graph.node(member).arms) {
+                    if (is_internal_stub(graph, cluster, a.edge, coincident_radius)) {
+                        continue;   // the stub that made them one junction
+                    }
+                    ArmRef ref;
+                    ref.edge = a.edge;
+                    ref.at_start = a.at_start;
+                    ref.bearing = a.bearing;
+                    fill_widths(profiles, ref);
+                    out.push_back(ref);
+                }
+            }
+
+            // ----------------------------------------------------------------
+            // Re-order the merged list around the cluster.
+            //
+            // The graph sorted each node's arms about ITS OWN node, so a merged
+            // list is interleaved and has to be sorted again -- every later step,
+            // the pairwise cycle, the ring winding, arm_ring_start, depends on
+            // one ascending cyclic order.
+            //
+            // Sorting on Arm::bearing alone is not that order. Two arms leaving
+            // different members of the cluster on the same bearing -- the two
+            // halves of a dual carriageway are exactly that -- come out adjacent
+            // and in an arbitrary order, and their neighbours in the cycle are
+            // then not their neighbours on the ground. The pair solve trims each
+            // against the wrong partner and the ring crosses itself.
+            //
+            // So each arm is ordered by the direction from the cluster's CENTRE
+            // to a point one lever arm out along it. The lever is the cluster's
+            // own size, so an arm leaving a member on the far side of the cluster
+            // is ranked by where it goes AND by where it starts, and for a
+            // cluster of nearly coincident nodes -- where the members are
+            // centimetres apart -- it reduces to the bearing it always was.
+            // ----------------------------------------------------------------
+            glm::dvec2 centre(0.0);
+            for (GraphNodeId member : cluster) centre += graph.node(member).position;
+            centre /= static_cast<double>(cluster.size());
+
+            double spread = 0.0;
+            for (GraphNodeId member : cluster) {
+                spread = std::max(spread, glm::length(graph.node(member).position - centre));
+            }
+            const double lever = std::max(2.0 * spread, kMinClusterLever);
+
+            std::vector<std::pair<double, ArmRef>> keyed;
+            keyed.reserve(out.size());
+            for (const ArmRef& ref : out) {
+                glm::dvec2 from = centre;
+                if (ref.edge != kInvalidId && ref.edge < graph.edges().size()) {
+                    const GraphEdge& e = graph.edge(ref.edge);
+                    const GraphNodeId own = ref.at_start ? e.from : e.to;
+                    if (own != kInvalidId && own < graph.nodes().size()) {
+                        from = graph.node(own).position;
+                    }
+                }
+
+                Arm ga;
+                ga.edge = ref.edge;
+                ga.at_start = ref.at_start;
+                ga.bearing = ref.bearing;
+                glm::dvec2 d = graph.arm_direction(ga);
+                if (glm::dot(d, d) > kDirEpsilonSq) {
+                    d = glm::normalize(d);
+                } else {
+                    d = glm::dvec2(std::cos(ref.bearing), std::sin(ref.bearing));
+                }
+
+                const glm::dvec2 out_point = (from + d * lever) - centre;
+                const double key = (glm::dot(out_point, out_point) > kDirEpsilonSq)
+                                       ? std::atan2(out_point.y, out_point.x)
+                                       : ref.bearing;
+                keyed.emplace_back(key, ref);
+            }
+
+            // The edge and end tie-break keeps two arms that really do rank
+            // identically in a fixed order run to run.
+            std::sort(keyed.begin(), keyed.end(), [](const auto& a, const auto& b) {
+                if (a.first != b.first) return a.first < b.first;
+                if (a.second.edge != b.second.edge) return a.second.edge < b.second.edge;
+                return static_cast<int>(a.second.at_start) > static_cast<int>(b.second.at_start);
+            });
+
+            for (size_t i = 0; i < keyed.size(); ++i) out[i] = keyed[i].second;
+            return out;
+        }
+    }
+
+    out.reserve(n.arms.size());
     for (const Arm& a : n.arms) {
         ArmRef ref;
         ref.edge = a.edge;
         ref.at_start = a.at_start;
         ref.bearing = a.bearing;
-
-        // An arm with no usable profile still takes its place in the cycle, at
-        // zero width. Dropping it would make two arms that are not neighbours
-        // adjacent, and every pair demand after it would be solved against the
-        // wrong partner.
-        if (a.edge != kInvalidId && a.edge < profiles.size()) {
-            const RoadProfile& p = profiles[a.edge];
-            if (p.is_valid()) {
-                ref.half_width = static_cast<double>(p.total_width()) * 0.5;
-                ref.carriageway_half = carriageway_half_extent(p);
-            }
-        }
-
+        fill_widths(profiles, ref);
         out.push_back(ref);
     }
 
@@ -461,10 +683,26 @@ bool solve_arm_trims(const RoadGraph& graph,
         return false;
     }
 
-    const glm::dvec2 origin = graph.node(node).position;
+    const glm::dvec2 node_origin = graph.node(node).position;
 
+    // Every arm is measured from ITS OWN node, which for an ordinary junction is
+    // the node itself and for a near-coincident cluster (see collect_arms) is a
+    // point a few centimetres away. Carrying the origins separately is what makes
+    // a merged cluster geometrically honest: the pair intersection below is then
+    // between two lines that really do start where their arms start, instead of
+    // both being slid onto the primary's position first.
+    std::vector<glm::dvec2> origin(n, node_origin);
     std::vector<glm::dvec2> dir(n);
-    for (size_t i = 0; i < n; ++i) dir[i] = leaving_direction(graph, centerlines, arms[i]);
+    for (size_t i = 0; i < n; ++i) {
+        dir[i] = leaving_direction(graph, centerlines, arms[i]);
+        if (arms[i].edge != kInvalidId && arms[i].edge < graph.edges().size()) {
+            const GraphEdge& e = graph.edge(arms[i].edge);
+            const GraphNodeId own = arms[i].at_start ? e.from : e.to;
+            if (own != kInvalidId && own < graph.nodes().size()) {
+                origin[i] = graph.node(own).position;
+            }
+        }
+    }
 
     // ------------------------------------------------------------------------
     // Pair demands. Each adjacent pair in the bearing cycle -- including the one
@@ -512,6 +750,22 @@ bool solve_arm_trims(const RoadGraph& graph,
             // clamp have the final word.
             // ----------------------------------------------------------------
             if (glm::dot(da, db) > 0.0) {
+                // Two co-directional arms leaving the SAME point always overlap.
+                // Two leaving points far enough apart across their own direction
+                // do not overlap at all -- the two halves of a dual carriageway
+                // sharing one graph node, or a service road running alongside --
+                // and the gap between their near-side edges says which it is.
+                const glm::dvec2 gap = (origin[j] - left_normal(db) * wb) -
+                                       (origin[i] + left_normal(da) * wa);
+                if (glm::dot(gap, left_normal(da)) > 0.0) {
+                    // b's right edge is already left of a's left edge: the two
+                    // carriageways are disjoint and neither has to retreat.
+                    ++usable_pairs;
+                    demand[i] = std::max(demand[i], 0.0);
+                    demand[j] = std::max(demand[j], 0.0);
+                    continue;
+                }
+
                 ta = wa + wb;
                 tb = ta;
 
@@ -530,12 +784,28 @@ bool solve_arm_trims(const RoadGraph& graph,
             const glm::dvec2 na = left_normal(da);
             const glm::dvec2 nb = left_normal(db);
 
-            // La(t) = P + na*wa + da*t  meets  Lb(s) = P - nb*wb + db*s.
-            // Subtracting P and rearranging: da*t - db*s = R.
-            const glm::dvec2 r = -(na * wa + nb * wb);
+            // La(t) = Pa + na*wa + da*t  meets  Lb(s) = Pb - nb*wb + db*s.
+            // Rearranged: da*t - db*s = D, with D the vector from a's left edge
+            // origin to b's right edge origin. For two arms sharing one node D
+            // collapses to the -(na*wa + nb*wb) of the header's derivation.
+            const glm::dvec2 r = (origin[j] - nb * wb) - (origin[i] + na * wa);
 
-            ta = cross2(r, db) / denom;
-            tb = -cross2(da, r) / denom;
+            // Both directions are unit, so the determinant IS sin(theta) and
+            // flooring its magnitude is flooring the angle. Below
+            // TrimConfig::min_pair_angle the pair is solved as though its two arms
+            // were exactly that far apart, which bounds a demand that otherwise
+            // diverges as 1/theta and produces two-hundred-metre junctions out of
+            // a slip road leaving at half a degree. The SIGN is preserved, so
+            // which side of the pair each arm is on does not change. See
+            // TrimConfig::min_pair_angle.
+            double solve_denom = denom;
+            const double floor_sin = std::sin(std::clamp(cfg.min_pair_angle, 0.0, kHalfPi));
+            if (std::fabs(solve_denom) < floor_sin) {
+                solve_denom = std::copysign(floor_sin, solve_denom);
+            }
+
+            ta = cross2(r, db) / solve_denom;
+            tb = -cross2(da, r) / solve_denom;
 
             // The corner between these two arms is rounded, and the arc is
             // tangent to each offset line `R * tan(theta / 2)` BACK FROM the
@@ -588,7 +858,7 @@ bool solve_arm_trims(const RoadGraph& graph,
 
         double arc = demand[i];
         if (a.edge != kInvalidId && a.edge < centerlines.size()) {
-            arc = projection_to_arclength(centerlines[a.edge], a.at_start, origin, dir[i],
+            arc = projection_to_arclength(centerlines[a.edge], a.at_start, origin[i], dir[i],
                                           demand[i]);
         }
 

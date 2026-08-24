@@ -77,6 +77,8 @@ enum class MaterialId : uint8_t {
     Grass,          ///< Verge and median planting
     BridgeDeck,     ///< Bridge deck slab, including its underside and edges
     Parapet,        ///< Bridge parapet or railing solid
+    Wall,           ///< Building facade; see osm/road/road_style.hpp building_wall_material()
+    Roof,           ///< Building roof surface; see osm/road/road_style.hpp building_roof_material()
     Count           ///< Sentinel: number of material slots. Not a valid material.
 };
 
@@ -370,6 +372,8 @@ public:
         case MaterialId::Grass:      return "Grass";
         case MaterialId::BridgeDeck: return "BridgeDeck";
         case MaterialId::Parapet:    return "Parapet";
+        case MaterialId::Wall:       return "Wall";
+        case MaterialId::Roof:       return "Roof";
         case MaterialId::Count:      return "Unknown";
     }
     return "Unknown";

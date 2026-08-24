@@ -289,11 +289,59 @@ struct TrimConfig {
      * differs between arms pointing the same way and arms pointing opposite ways.
      */
     double parallel_epsilon = 1e-6;
+
+    /**
+     * @brief Floor on the angle between two arms when solving their pair demand, radians
+     *
+     * The exact pairwise answer for two arms `theta` apart, with carriageway half
+     * widths `wa` and `wb`, is `(wb + wa * cos theta) / sin theta`. That is right
+     * and it is unbounded: it diverges as `1 / theta`, so a slip road leaving a
+     * trunk at five degrees demands eighty metres of trim, one at two degrees
+     * demands two hundred, and one at half a degree demands a kilometre. Measured
+     * on a 63 MB Dublin extract before this floor existed, the longest solved trim
+     * was 294 m and the largest junction polygon covered 38,000 m^2 -- an
+     * intersection two hundred metres long, filled with asphalt.
+     *
+     * Nothing about that is an improvement on the overlap it removes. Worse, an
+     * arm short enough to hit TrimConfig::max_trim_fraction is then cut to a
+     * fraction of the demand, which is the one condition under which two adjacent
+     * cut faces cross each other and the junction ring stops being simple.
+     *
+     * So the angle used in the division is floored here: below `min_pair_angle`
+     * the pair is solved AS IF the two arms were exactly this far apart, which
+     * bounds its demand at `(wa + wb) / sin(min_pair_angle)` -- 3.86 times the
+     * combined half widths at the default 15 degrees, and 27 m for two ordinary
+     * 7 m carriageways. The two arms then still overlap beyond the cut, which is
+     * honest: a five-degree fork's carriageways really do overlap for eighty
+     * metres, and no trim short of eighty removes that. What the floor buys is
+     * that the overlap stays a local defect at the nose of the gore instead of
+     * becoming a two-hundred-metre junction polygon.
+     *
+     * The floor binds only below itself, so every junction that reads as a
+     * junction rather than as a fork is solved exactly as before. Set it to zero
+     * to restore the unbounded exact answer.
+     *
+     * @note This does NOT change the exactly-parallel co-directional case, which
+     *       is not solved by the formula at all and contributes `wa + wb`. The two
+     *       therefore still disagree across `parallel_epsilon`, by a factor of
+     *       `1 / sin(min_pair_angle)`, but the gap they disagree across is a
+     *       millionth of a radian wide and both answers are now bounded.
+     */
+    double min_pair_angle = 0.2617993877991494;   // 15 degrees
 };
 
 // ============================================================================
 // Solve
 // ============================================================================
+
+/**
+ * @brief Default JunctionBuilder radius below which two junction nodes are one
+ *
+ * The default argument of collect_arms(), named so the builder can pass it
+ * explicitly alongside the cluster out-parameter without restating the literal.
+ * See the collect_arms() documentation for why it is where it is.
+ */
+constexpr double kCoincidentRadius = 1.0;
 
 /**
  * @brief Resolve a node's graph arms into ArmRefs, ready for the trim solve
@@ -308,14 +356,102 @@ struct TrimConfig {
  * change the arm CYCLE and therefore silently pair two arms that are not
  * neighbours.
  *
- * @param graph    Built road graph
- * @param profiles Parallel to graph.edges(); profiles[i] belongs to edge i
- * @param node     Node to collect the arms of
- * @return The arms in ascending bearing order; empty when @p node is out of range
+ * ### Near-coincident junctions are collected as ONE junction
+ *
+ * RoadGraph merges two OSM nodes into one graph node only when their positions
+ * agree to 1e-6 m, which is the exact-duplicate defect. A pair a few CENTIMETRES
+ * apart -- two mappers tracing the same crossroads, a way split twice at what
+ * was meant to be one point, a stub left behind by a conflation -- survives as
+ * two graph nodes joined by a stub edge shorter than either junction is wide.
+ * Solved separately they produce two junction polygons covering the same ground:
+ * two fills, two curb rings, two carve footprints, all overlapping, which is a
+ * worse artefact than either junction alone.
+ *
+ * So a node of degree 3 or more first collects its CLUSTER: itself, plus every
+ * junction node reachable from it over edges shorter than @p coincident_radius.
+ * The cluster is a property of the graph and not of where the walk started, so
+ * every member computes the same one, and the member with the LOWEST GraphNodeId
+ * is the cluster's primary.
+ *
+ * - The **primary** is given the arms of every node in the cluster, minus the
+ *   internal stubs that hold the cluster together, re-sorted into ascending
+ *   bearing order. It is one junction with all the real approaches, which is what
+ *   the geometry should have been in the first place.
+ * - Every **other member** is given NO arms at all. solve_arm_trims() then
+ *   reports it degenerate and the caller emits nothing for it, which is the
+ *   intended outcome: the primary already covers that ground.
+ *
+ * @note A suppressed member is counted by JunctionBuilder::Stats::degenerate,
+ *       alongside genuinely unsolvable nodes. The two are not distinguished
+ *       today.
+ *
+ * ### The cluster must be reported, not just acted on
+ *
+ * Returning an empty arm list is not enough on its own. Several consumers key off
+ * a node id rather than off a junction -- approach markings ask
+ * `node_has_junction[edge.from]`, and dropped_kerb_spans() filters crossings on
+ * `Crossing::node` -- and an absorbed member answers "no junction here" to all of
+ * them even though its approaches were trimmed back by the primary's solve. The
+ * result is silent: an approach to a merged junction loses its stop line, and a
+ * junction crossing on it demands a kerb drop from a ring that does not exist,
+ * so the corridor's dropped kerb butts an undropped ring at the arm mouth.
+ *
+ * @p out_cluster exists so the caller can resolve a member to its primary. It is
+ * filled on EVERY path -- a lone junction reports the cluster `{node}` -- so the
+ * caller never has to distinguish "no cluster" from "not asked".
+ *
+ * The origin every pair demand is measured from is the PRIMARY's position, so an
+ * absorbed arm's demand carries an error of at most @p coincident_radius. That is
+ * the whole point of keeping the radius small: it must be well under a
+ * carriageway width, or a merge moves geometry further than it repairs.
+ *
+ * Set @p coincident_radius to zero to disable merging and collect exactly the
+ * node's own arms, which is the behaviour this function had before merging
+ * existed.
+ *
+ * @param graph              Built road graph
+ * @param profiles           Parallel to graph.edges(); profiles[i] belongs to edge i
+ * @param node               Node to collect the arms of
+ * @param coincident_radius  Metres below which a stub edge between two junction
+ *                           nodes means they are one junction. Zero disables the
+ *                           merge. Degree 1 and 2 nodes never merge, whatever it
+ *                           is set to.
+ *
+ *                           The default 1.0 is deliberately short of what the
+ *                           geometry alone would justify. Measured on a Dublin
+ *                           extract, raising it to 2 m merges 194 nodes instead of
+ *                           45 and cuts the number of OVERLAPPING junction
+ *                           polygon pairs from 288 to 162, which is the largest
+ *                           single win available here. Two side effects are what
+ *                           hold it back, and both are outside this file:
+ *
+ *                           - the internal stub edge is left untrimmed, so its
+ *                             ribbon lies coplanar inside the merged fill. The
+ *                             caller wants to consume such an edge the way a
+ *                             roundabout's ring edges are consumed.
+ *                           - the suppressed member keeps its OWN solved node
+ *                             height, while the fill sits at the primary's, so an
+ *                             arm mouth can open a step of up to
+ *                             `radius * max_grade`.
+ *
+ *                           Both are bounded by the radius, which is why the
+ *                           default is where it is: at 1 m they are a 1 m stub and
+ *                           a 10 cm step.
+ * @param out_cluster        Optional. Receives the coincident cluster @p node
+ *                           belongs to, in ascending GraphNodeId order, so
+ *                           `front()` is the primary. Filled on every path that
+ *                           reaches a valid node, including the common case of a
+ *                           node that merges with nothing, which reports
+ *                           `{node}`. Left EMPTY only when @p node is out of
+ *                           range. Any prior contents are overwritten.
+ * @return The arms in ascending bearing order; empty when @p node is out of
+ *         range, or when it is a non-primary member of a coincident cluster
  */
 [[nodiscard]] std::vector<ArmRef> collect_arms(const RoadGraph& graph,
                                                const std::vector<RoadProfile>& profiles,
-                                               GraphNodeId node);
+                                               GraphNodeId node,
+                                               double coincident_radius = kCoincidentRadius,
+                                               std::vector<GraphNodeId>* out_cluster = nullptr);
 
 /**
  * @brief Solve the trim distance for every arm of one node
@@ -344,6 +480,12 @@ struct TrimConfig {
  * TrimConfig's four `fillet_*` fields exactly as build_junction_polygon() derives
  * it from FilletConfig. A pair whose corner would be drawn as a chord -- shallower
  * than fillet_min_arc_angle, or turning the wrong way -- reserves nothing.
+ *
+ * The angle the pair is solved at is floored at TrimConfig::min_pair_angle, which
+ * bounds a very acute pair's demand at `(wa + wb) / sin(min_pair_angle)` instead
+ * of letting it diverge as `1 / theta`. See that field: the floor binds only
+ * below itself, so an ordinary junction is solved exactly as it was before the
+ * floor existed.
  *
  * A pair whose |cross(da, db)| is below TrimConfig::parallel_epsilon has no
  * intersection to project, and the two ways that happens behave oppositely:

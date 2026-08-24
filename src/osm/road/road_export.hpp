@@ -157,10 +157,16 @@ struct ExportConfig {
     /**
      * @brief Prefix for every emitted material name
      *
-     * A material is named `<material_prefix><MaterialId name>`, using
-     * material_id_name(), so MaterialId::Asphalt becomes `stratum_Asphalt` by
-     * default. The prefix exists so an import into a project with its own
+     * A material is named `<material_prefix><MaterialKey name>`, using
+     * material_key_name(), so `{Asphalt, 0}` becomes `stratum_Asphalt` and
+     * `{Asphalt, variants::kCobblestone}` becomes `stratum_Asphalt.Cobblestone`
+     * by default. The prefix exists so an import into a project with its own
      * `Asphalt` material does not silently bind to it.
+     *
+     * The VARIANT is part of the name because it is part of the material: two
+     * ranges sharing a slot and differing in variant are exported as two
+     * materials, two `usemtl` lines and two `newmtl` blocks, so they can be given
+     * different textures in the target engine.
      */
     std::string material_prefix = "stratum_";
 };

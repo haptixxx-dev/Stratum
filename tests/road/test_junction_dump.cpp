@@ -282,6 +282,17 @@ struct Row {
     size_t cap_triangles = 0;       ///< Dead-end caps and degree-2 tapers
 
     /**
+     * @brief Triangles the junction SOLVER produced, before the per-piece finish
+     *
+     * The denominator the kind split is checked against. junction_triangles is
+     * counted from the pieces that reached the network, and the P7 finish is
+     * allowed to remove triangles from those -- merge_coplanar_quads() collapses
+     * a flat fill -- so the split can only be reconciled against the meshes the
+     * split itself is read from.
+     */
+    size_t solver_triangles = 0;
+
+    /**
      * @brief Kerbed intersections that came back with no corner sidewalk at all
      *
      * An intersection whose arms carry sidewalks, whose junction polygon is valid,
@@ -341,6 +352,7 @@ Row row_of(const char* fixture, const RoadNetwork& network) {
     // crossroads is the smaller part. Split by kind so the table says which.
     for (const Junction& j : network.junctions) {
         const size_t tris = j.mesh.indices.size() / 3;
+        r.solver_triangles += tris;
         switch (j.kind) {
             case JunctionKind::Intersection:
             case JunctionKind::Roundabout:
@@ -579,12 +591,12 @@ TEST(JunctionDump, every_fixture_writes_a_junction_obj_and_a_stats_row) {
     // The split has to account for every junction triangle, or the table's two
     // detail columns and its total describe different things.
     for (const Row& r : rows) {
-        if (r.fill_triangles + r.cap_triangles != r.junction_triangles) {
+        if (r.fill_triangles + r.cap_triangles != r.solver_triangles) {
             stratum::test::report_failure(
                 __FILE__, __LINE__, "the kind split accounts for every junction triangle",
                 r.fixture + ": fill " + std::to_string(r.fill_triangles) + " + cap " +
                     std::to_string(r.cap_triangles) + " != " +
-                    std::to_string(r.junction_triangles));
+                    std::to_string(r.solver_triangles));
         }
     }
 
