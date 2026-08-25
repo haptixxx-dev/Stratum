@@ -158,6 +158,15 @@ void Application::render() {
     // Prepare ImGui draw data BEFORE render pass
     ImGui_ImplSDLGPU3_PrepareDrawData(draw_data, m_gpu_renderer.get_command_buffer());
 
+    // --- Shadow phase: depth-only passes, BEFORE the pass that samples them ---
+    //
+    // The camera has to be published first: the cascades are fitted to slices of
+    // the CAMERA frustum, so a stale view matrix here fits them to where the
+    // camera was last frame and the near cascade trails behind fast movement.
+    // Editor::render_3d() publishes it again, which costs two matrix assignments.
+    m_editor.publish_camera(m_gpu_renderer);
+    m_gpu_renderer.render_shadow_cascades();
+
     // --- Pass 1: 3D scene, WITH depth attachment ---
     m_gpu_renderer.begin_render_pass();
     m_editor.render_3d(m_gpu_renderer);

@@ -26,12 +26,28 @@ struct Vertex {
     glm::vec4 color{1.0f};
     glm::vec4 tangent{1.0f, 0.0f, 0.0f, 1.0f};  // xyz = tangent direction, w = bitangent sign
 
+    /**
+     * @brief Baked ambient occlusion. 1 = fully open sky, 0 = fully enclosed
+     *
+     * MULTIPLIES the material's ao, and therefore attenuates the AMBIENT term
+     * only -- see mesh_pbr.frag. That is the whole reason this is its own channel
+     * instead of being folded into `color`: a vertex colour multiplies albedo, so
+     * it would darken direct sunlight too, and a surface in full sun does not get
+     * darker for being near a wall.
+     *
+     * Defaults to 1, so geometry from a builder that never bakes it is lit exactly
+     * as it was before this channel existed. Baked by AmbientOcclusionBaker (see
+     * core/ambient_occlusion.hpp), never authored by hand.
+     */
+    float ao = 1.0f;
+
     bool operator==(const Vertex& other) const {
         return position == other.position && 
                normal == other.normal && 
                uv == other.uv && 
                color == other.color &&
-               tangent == other.tangent;
+               tangent == other.tangent &&
+               ao == other.ao;
     }
 };
 

@@ -417,10 +417,18 @@ TEST(GPUBufferPool, offsets_honour_the_alignment_asked_for) {
     if (!start(vertex_pool, kUnit * 8)) return;
 
     live.clear();
+    // 64, the renderer's kVertexAlignment, and deliberately NOT sizeof(Vertex).
+    // The two were the same number until Vertex grew its baked ambient occlusion
+    // channel and became 68 bytes. A 68-byte alignment is not a power of two, so
+    // asking for it would have the pool round up to 128 and pad every allocation
+    // by up to 127 bytes -- and the stride does not need to divide the offset in
+    // any case, because every draw binds the range at the mesh's first vertex and
+    // uses a vertex offset of 0.
+    constexpr uint32_t kVertexAlignment = 64u;
     for (uint32_t size : sizes) {
-        const BufferAlloc a = vertex_pool.allocate(size, sizeof(stratum::Vertex));
+        const BufferAlloc a = vertex_pool.allocate(size, kVertexAlignment);
         CHECK_TRUE(a.valid());
-        CHECK_EQ(a.offset % sizeof(stratum::Vertex), size_t{0});
+        CHECK_EQ(a.offset % kVertexAlignment, uint32_t{0});
         live.push_back(a);
     }
 

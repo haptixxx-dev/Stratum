@@ -75,10 +75,14 @@ set(STRATUM_TEST_SOURCES
 
     procgen/test_terrain_carve.cpp
     osm/test_quadtree_roads.cpp
+
+    # Engine-agnostic geometry processing.
+    geometry/test_ambient_occlusion.cpp
 )
 
 # Suite names registered with ctest so each can be run and reported separately.
 set(STRATUM_TEST_SUITES
+    AmbientOcclusion
     RoadGraph
     Centerline
     RoadProfile
@@ -280,6 +284,13 @@ if(TARGET stratum_editor_lib AND EXISTS ${CMAKE_SOURCE_DIR}/src/renderer/gpu_buf
 
     list(APPEND STRATUM_GPU_TEST_SOURCES renderer/test_pbr_shader.cpp)
     list(APPEND STRATUM_GPU_DEVICE_SUITES PbrShader)
+
+    # Sky renders the checked-in sky .spv through a pipeline with NO vertex input
+    # at all. It matters more than a background usually would: sky_common.glsl is
+    # shared with mesh_pbr.frag, so the dome it asserts IS the scene's ambient
+    # light, and a regression in one is a regression in the other.
+    list(APPEND STRATUM_GPU_TEST_SOURCES renderer/test_sky.cpp)
+    list(APPEND STRATUM_GPU_DEVICE_SUITES Sky)
 
     add_executable(stratum_gpu_tests ${STRATUM_GPU_TEST_SOURCES})
 

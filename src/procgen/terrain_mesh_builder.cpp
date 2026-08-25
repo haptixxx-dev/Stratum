@@ -177,7 +177,16 @@ Mesh TerrainMeshBuilder::build_terrain_mesh(const Heightmap& heightmap, const Te
     
     mesh.compute_bounds();
     mesh.compute_tangents();
-    
+
+    // AFTER the normals and tangents exist: the bake samples a hemisphere around
+    // each vertex normal, so it needs the normals to be final.
+    //
+    // The terrain tile is its own occluder and nothing else is available at this
+    // point, which is the right scope: what this is measuring is how much sky a
+    // valley floor sees compared with the ridge above it. Buildings sitting on the
+    // terrain are baked separately, against each other, in QuadTree.
+    geometry::bake_ambient_occlusion(mesh, config.ambient_occlusion);
+
     return mesh;
 }
 
@@ -268,7 +277,14 @@ Mesh TerrainMeshBuilder::build_terrain_mesh_custom(
     
     mesh.compute_bounds();
     mesh.compute_tangents();
-    
+
+    // NO ambient occlusion bake here, unlike build_terrain_mesh(). This overload
+    // takes a colour function rather than a TerrainMeshConfig, so it has no
+    // settings to bake with, and inventing a default would mean this path shaded
+    // differently from the configured one for no reason a caller could see. A
+    // caller that wants AO here can call geometry::bake_ambient_occlusion() on the
+    // result.
+
     return mesh;
 }
 

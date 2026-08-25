@@ -31,22 +31,19 @@
 // separate `texture2D`/`sampler` objects would not bind.
 // ============================================================================
 
+// The scene uniform block, the analytic sky, the split-sum BRDF fit and the
+// output transform all live here, SHARED with sky.frag. A surface lit by a
+// different sky than the one drawn behind it is the "objects from another
+// scene" look; sharing the function is what prevents it.
+#include "sky_common.glsl"
+
 const float PI = 3.14159265359;
 const float EPSILON = 0.00001;
 
 // ----------------------------------------------------------------------------
 // Fragment uniform buffers -- set 3
 // ----------------------------------------------------------------------------
-
-// Scene block. Unchanged. Pushed to fragment uniform slot 0 (kSceneUniformSlot).
-layout(set = 3, binding = 0) uniform SceneUniforms {
-    vec4 camera_position;   // xyz = position, w = exposure
-    vec4 sun_direction;     // xyz = normalized direction, w = intensity
-    vec4 sun_color;         // rgb = color, a = ambient intensity
-    vec4 fog_params;        // x = start, y = end, z = density, w = enabled
-    vec4 fog_color;         // rgb = color, a = unused
-    vec4 pbr_params;        // x = metallic, y = roughness, z = ao, w = unused
-} scene;
+// Scene is at binding 0 and is declared by sky_common.glsl.
 
 // Per-draw material block. Pushed to fragment uniform slot 1
 // (kMaterialUniformSlot). MUST match struct MaterialUniforms in
@@ -70,6 +67,51 @@ layout(set = 2, binding = 0) uniform sampler2D albedo_map;
 layout(set = 2, binding = 1) uniform sampler2D normal_map;
 layout(set = 2, binding = 2) uniform sampler2D orm_map;
 
+// Cascaded shadow map -- set 2, binding 3 (kShadowSamplerSlot).
+//
+// NOT part of the material set. bind_material() binds three consecutive samplers
+// from slot 0; this one is bound once per render pass, because it is frame state.
+//
+// A sampler2DShadow, not a plain sampler2D: the sampler is created with
+// enable_compare, so texture() returns the RESULT of the depth comparison,
+// filtered in hardware. That turns each of the taps below into a bilinear
+// percentage-closer sample for the cost of one fetch -- a 3x3 kernel this way is
+// as smooth as a much wider one done by hand.
+//
+// ONE 2D TEXTURE, CASCADES TILED SIDE BY SIDE, not a 2D array. SDL_GPU rejects
+// array textures with DEPTH_STENCIL_TARGET usage outright -- see the assertion in
+// SDL_CreateGPUTexture, "For array textures: usage must not contain
+// DEPTH_STENCIL_TARGET" -- so an array is not available whatever its merits. The
+// atlas turns out to be the better shape anyway: all the cascades are filled in a
+// SINGLE render pass with one clear and a viewport change per tile, rather than
+// one pass and one clear each.
+layout(set = 2, binding = 3) uniform sampler2DShadow shadow_map;
+
+// ----------------------------------------------------------------------------
+// Shadow block -- set 3, binding 2 (kShadowUniformSlot)
+// ----------------------------------------------------------------------------
+//
+// MUST match struct ShadowUniforms in src/renderer/gpu_renderer.hpp field for
+// field and byte for byte.
+//
+// shadow_params.x is the live cascade COUNT, and zero is a legal value meaning
+// "shadows off". That is what lets a caller that never renders a cascade -- the
+// PBR shader test suite, or Simple shader mode -- push a zeroed block and get
+// fully lit geometry rather than undefined comparisons against an uninitialised
+// depth texture.
+layout(set = 3, binding = 2) uniform ShadowUniforms {
+    mat4 light_view_proj[4];    // world -> cascade clip, one per cascade
+    vec4 cascade_texel_world;   // world size of one shadow texel, per cascade
+    vec4 cascade_depth_bias;    // constant depth bias in clip [0,1], per cascade
+    vec4 shadow_params;         // x = cascade count, y = normal offset scale,
+                                // z = strength, w = 1 / shadow map size
+    vec4 shadow_fade;           // x = fade start, y = fade end, z = PCF radius in
+                                // texels, w = 1 / cascade count, the atlas tile
+                                // width in UV
+} shadows;
+
+const int kMaxShadowCascades = 4;
+
 // DEBUG: Set to 1 to show raw uniform values as colors
 #define DEBUG_UNIFORMS 0
 
@@ -82,6 +124,7 @@ layout(location = 2) in vec2 frag_uv;
 layout(location = 3) in vec4 frag_color;
 layout(location = 4) in vec3 frag_tangent;
 layout(location = 5) in vec3 frag_bitangent;
+layout(location = 6) in float frag_ao;
 
 // ============================================================================
 // Output
@@ -117,24 +160,15 @@ vec3 F_Schlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(max(1.0 - cosTheta, 0.0), 5.0);
 }
 
-// Linear to sRGB
-vec3 linear_to_srgb(vec3 color) {
-    return pow(color, vec3(1.0 / 2.2));
-}
-
-// ACES tone mapping
-vec3 tonemap_aces(vec3 x) {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
-}
+// linear_to_srgb() and tonemap_aces() come from sky_common.glsl, so this shader
+// and the sky behind it cannot end up on different output transforms.
 
 // Fog calculation
 // fog_params: x = start, y = end, z = density, w = enabled (0 = off, 1 = linear, 2 = exponential, 3 = exponential squared)
-vec3 apply_fog(vec3 color, float distance) {
+//
+// @param view_dir Normalised direction from the EYE towards this fragment. Only
+//                 aerial perspective uses it.
+vec3 apply_fog(vec3 color, float distance, vec3 view_dir) {
     if (scene.fog_params.w < 0.5) {
         return color; // Fog disabled
     }
@@ -158,7 +192,146 @@ vec3 apply_fog(vec3 color, float distance) {
         fog_factor = exp(-d * d);
     }
 
-    return mix(scene.fog_color.rgb, color, fog_factor);
+    // AERIAL PERSPECTIVE. Distance haze is the sky seen through the air in front
+    // of the subject, so its colour is the sky's colour IN THAT DIRECTION -- pale
+    // near the horizon, deeper higher up, warm towards the sun. A single authored
+    // fog_color cannot do that, and the wide city shot showed exactly what it
+    // costs: the far half of the map lost contrast and then fell to the
+    // background colour instead of meeting a horizon.
+    //
+    // ibl_params.z blends between the authored colour (0) and the sky (1), so a
+    // deliberately stylised fog is still reachable.
+    const vec3 haze = mix(scene.fog_color.rgb, sky_radiance(view_dir),
+                          clamp(scene.ibl_params.z, 0.0, 1.0));
+
+    return mix(haze, color, fog_factor);
+}
+
+// ============================================================================
+// Cascaded shadows
+// ============================================================================
+
+/**
+ * @brief Fraction of the sun reaching this fragment. 1 = fully lit, 0 = shadowed
+ *
+ * @param world_pos Fragment position in world space
+ * @param n         Shading normal, already flipped for double-sidedness
+ * @param n_dot_l   Cosine of the angle to the sun, clamped at 0
+ * @param view_dist Distance from the eye, for the far fade
+ *
+ * CASCADE SELECTION IS BY PROJECTION, NOT BY DISTANCE. The obvious scheme --
+ * compare the view depth against a split table -- disagrees with how the
+ * cascades are actually fitted: GPURenderer bounds each split's sub-frustum with
+ * a SPHERE, so that rotating the camera cannot change the fitted volume and make
+ * the shadows shimmer, and a sphere covers more than the slice it was fitted to.
+ * Walking the cascades in order and taking the first one the fragment actually
+ * projects inside uses that slack instead of fighting it, and it cannot select a
+ * cascade that does not contain the fragment.
+ *
+ * The border inset matters: a fragment right at the edge of a cascade would have
+ * its PCF kernel reach outside the map, where there is no depth, so it is pushed
+ * to the next cascade out while it still has one.
+ */
+float sample_sun_shadow(vec3 world_pos, vec3 n, float n_dot_l, float view_dist) {
+    const int cascade_count = int(shadows.shadow_params.x);
+    if (cascade_count <= 0) {
+        return 1.0;   // shadows disabled -- see the note on the block above
+    }
+
+    // Texel size WITHIN A TILE. The atlas is `cascade_count` tiles wide, so a step
+    // of one texel in the atlas is this divided by the count along x, and exactly
+    // this along y.
+    const float texel = shadows.shadow_params.w;
+    const float pcf_radius = max(shadows.shadow_fade.z, 0.0);
+    const float tile_width = shadows.shadow_fade.w;   // 1 / cascade count
+    const vec2 atlas_texel = vec2(texel * tile_width, texel);
+
+    // One PCF kernel radius, plus a texel of margin, expressed in TILE UV. This
+    // inset does two jobs: it keeps the kernel from reaching past the edge of the
+    // shadow map, and -- because the tiles abut with no gutter -- it keeps a
+    // fragment near a tile edge from bleeding into its NEIGHBOURING CASCADE, which
+    // would show as a hard wrong-scale shadow seam.
+    const float border = texel * (pcf_radius + 1.0);
+
+    int cascade = -1;
+    vec3 coord = vec3(0.0);
+
+    for (int i = 0; i < kMaxShadowCascades; ++i) {
+        if (i >= cascade_count) break;
+
+        // NORMAL OFFSET, applied before projection and scaled by THIS cascade's
+        // texel size. Offsetting along the surface normal is what removes the
+        // self-shadowing acne that a pure depth bias can only trade against peter
+        // panning: it moves the sample off the surface by roughly the world size
+        // of the texel that is aliasing, which is exactly the error being
+        // corrected. It is scaled by (1 - NdotL) because a surface facing the sun
+        // head-on has no slope error to correct.
+        const float offset = shadows.cascade_texel_world[i] * shadows.shadow_params.y *
+                             clamp(1.0 - n_dot_l, 0.0, 1.0);
+        const vec4 light_clip = shadows.light_view_proj[i] * vec4(world_pos + n * offset, 1.0);
+
+        // w is 1 for the orthographic cascade projections, but dividing anyway
+        // costs nothing and keeps this correct if a perspective cascade is ever
+        // added for a spot light.
+        const vec3 ndc = light_clip.xyz / light_clip.w;
+
+        // V IS FLIPPED, and this is not a sign slip. SDL's Vulkan backend
+        // rasterises with a NEGATIVE viewport height -- the standard trick that
+        // makes Vulkan's y-down clip space behave like OpenGL's y-up -- so clip
+        // y = -1 ends up at the BOTTOM row of the depth image, not the top. The
+        // textbook `ndc.y * 0.5 + 0.5` therefore samples the mirror image of what
+        // the cascade pass wrote.
+        //
+        // The failure it produces is quiet and convincing: shadows still appear,
+        // still have the right shape, and still move with the sun -- they are just
+        // reflected about the middle of the map, so they sit on the wrong side of
+        // their casters. PbrShader.a_caster_shadows_the_ground_beneath_it_and_nowhere_else
+        // places its caster off-centre in both axes precisely to catch it.
+        const vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+
+        const bool inside =
+            all(greaterThanEqual(uv, vec2(border))) &&
+            all(lessThanEqual(uv, vec2(1.0 - border))) &&
+            ndc.z >= 0.0 && ndc.z <= 1.0;
+
+        if (inside) {
+            cascade = i;
+            // Into atlas space: tile i occupies u in [i/count, (i+1)/count).
+            const vec2 atlas_uv = vec2((float(i) + uv.x) * tile_width, uv.y);
+            coord = vec3(atlas_uv, ndc.z - shadows.cascade_depth_bias[i]);
+            break;
+        }
+    }
+
+    // Past the last cascade there is no shadow data at all. Returning "lit" is
+    // the only honest answer; the fade below is what keeps the boundary from
+    // being a visible line.
+    if (cascade < 0) {
+        return 1.0;
+    }
+
+    // 3x3 PCF. Each tap is already bilinear-compared in hardware, so nine of them
+    // cover the same area a much larger hand-rolled kernel would.
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            const vec2 tap = coord.xy + vec2(float(x), float(y)) * atlas_texel * pcf_radius;
+            sum += texture(shadow_map, vec3(tap, coord.z));
+        }
+    }
+    float lit = sum * (1.0 / 9.0);
+
+    // Fade the whole effect out towards the far edge of the shadow range, so the
+    // last cascade ends in a gradient rather than in an edge.
+    const float fade_start = shadows.shadow_fade.x;
+    const float fade_end = max(shadows.shadow_fade.y, fade_start + 1.0);
+    const float fade = clamp((view_dist - fade_start) / (fade_end - fade_start), 0.0, 1.0);
+    lit = mix(lit, 1.0, fade);
+
+    // Strength below 1 lifts the shadow towards lit, which is a stylistic control
+    // and not a physical one -- in reality a shadowed surface is lit by the sky,
+    // and that is the ambient term, which shadows do not touch.
+    return mix(1.0, lit, clamp(shadows.shadow_params.z, 0.0, 1.0));
 }
 
 // ============================================================================
@@ -222,7 +395,15 @@ void main() {
     vec3 T  = normalize(frag_tangent);
     vec3 B  = frag_bitangent;   // normalised below, AFTER the degeneracy guard
 
-    vec3 V = normalize(-frag_world_pos);  // Assume camera near origin for simplicity
+    // View vector. scene.camera_position.xyz is the ONLY correct origin for
+    // this: a map is placed in local metres around a projection origin the
+    // camera is typically hundreds to thousands of metres away from, so the old
+    // normalize(-frag_world_pos) -- "assume the camera is near the origin" --
+    // aimed the specular lobe at the map origin AND, worse, fed the
+    // double-sided flip below a vector pointing at the origin instead of at the
+    // eye. Every facade on the far side of the origin had its normal inverted:
+    // sunlit walls read dark and shadowed walls read lit.
+    vec3 V = normalize(scene.camera_position.xyz - frag_world_pos);
 
     // Double-sided support. Flipping the normal alone would leave (T, B, N)
     // left-handed and mirror every normal-map detail, so the bitangent flips
@@ -279,7 +460,12 @@ void main() {
     // are the only source of the three values: scene.pbr_params is not read by this
     // shader at all, and the Render Settings sliders that used to drive it are gone.
     vec3 orm = texture(orm_map, uv).rgb;
-    float ao        = material.pbr_params.z * orm.r;
+    // Three factors, and each answers a different question. material.pbr_params.z
+    // is what the MATERIAL says; orm.r is what the TEXTURE says, at texture
+    // resolution; frag_ao is what the GEOMETRY says -- baked per vertex, so it is
+    // the only one of the three that knows a wall is standing next to another
+    // wall. Multiplying is right because they are independent occluders.
+    float ao        = material.pbr_params.z * orm.r * clamp(frag_ao, 0.0, 1.0);
     float roughness = clamp(material.pbr_params.y * orm.g, 0.04, 1.0);
     float metallic  = clamp(material.pbr_params.x * orm.b, 0.0, 1.0);
     float emissive  = material.pbr_params.w;
@@ -313,22 +499,68 @@ void main() {
     vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
     vec3 diffuse = kD * albedo / PI;
 
-    // Direct lighting
-    vec3 Lo = (diffuse + specular) * light_color * light_intensity * NdotL;
+    // Direct lighting, occluded by the cascaded shadow map.
+    //
+    // The DIRECT term only. Ambient is the sky integrated over the hemisphere,
+    // and a surface in shadow is still under that sky -- multiplying it here is
+    // what makes shadows read as black holes rather than as shade.
+    vec3 to_eye = scene.camera_position.xyz - frag_world_pos;
+    float eye_distance = length(to_eye);
+    float sun_visibility = sample_sun_shadow(frag_world_pos, N, NdotL, eye_distance);
 
-    // Ambient. Ambient occlusion attenuates this term ONLY -- applying it to the
-    // direct term darkens surfaces the sun actually reaches.
-    vec3 ambient = albedo * ambient_intensity * ao;
+    vec3 Lo = (diffuse + specular) * light_color * light_intensity * NdotL * sun_visibility;
+
+    // ------------------------------------------------------------------------
+    // 6. Ambient -- image-based, from the same sky that is drawn behind this
+    // ------------------------------------------------------------------------
+    // This replaced `albedo * ambient_intensity`, a single constant applied to
+    // every surface at every orientation. That constant is what made the
+    // underside of a bridge deck exactly as bright as its top, a north wall
+    // exactly as bright as a south one, and every metal read as grey plastic.
+    //
+    // ambient_intensity survives as a MASTER SCALE on both lobes rather than as
+    // the light itself, so the Ambient slider still means "how much fill", and
+    // the sky parameters mean "what colour, from which direction".
+
+    // Diffuse: cosine-weighted hemisphere irradiance at this normal. Ambient
+    // occlusion attenuates this ONLY -- applying it to the direct term darkens
+    // surfaces the sun demonstrably reaches.
+    // kD from the SUN's half-vector Fresnel would be the wrong weight here: that
+    // F was evaluated at HdotV for one specific light direction, and ambient
+    // arrives from the whole hemisphere. The view-angle Fresnel is the standard
+    // stand-in for the hemisphere average.
+    vec3 F_ambient = F_Schlick(NdotV, F0);
+    vec3 kD_ambient = (vec3(1.0) - F_ambient) * (1.0 - metallic);
+    vec3 ambient_diffuse = kD_ambient * albedo * sky_irradiance(N) * ao;
+
+    // Specular: the split sum. sky_prefiltered() stands in for a prefiltered
+    // environment cube's mip chain and env_brdf_approx() for the BRDF
+    // integration LUT, so this is a full image-based specular term with no
+    // cubemap, no prefilter pass and no lookup texture. It is what stops asphalt
+    // and glass reading as matte paper, and it is the only reason a metal can
+    // look like a metal here: F0-tinted sky is ALL a metal reflects.
+    vec3 R = reflect(-V, N);
+    vec3 prefiltered = sky_prefiltered(R, roughness);
+    vec3 env_brdf = env_brdf_approx(F0, roughness, NdotV);
+    float spec_ao = specular_occlusion(NdotV, ao, roughness);
+    vec3 ambient_specular = prefiltered * env_brdf * spec_ao * scene.ibl_params.x;
+
+    vec3 ambient = (ambient_diffuse + ambient_specular) * ambient_intensity;
 
     // Final color. Emissive is added after the direct term and before fog and
     // tone mapping, so an emissive surface still fogs out with distance.
     vec3 color = ambient + Lo + albedo * emissive;
 
-    // Apply fog based on distance from camera
-    float frag_distance = length(frag_world_pos - scene.camera_position.xyz);
-    color = apply_fog(color, frag_distance);
+    // Apply fog based on distance from camera. eye_distance and to_eye were
+    // already needed by the shadow lookup above; the view ray is their negation.
+    color = apply_fog(color, eye_distance, -to_eye / max(eye_distance, EPSILON));
 
-    // Tone mapping and gamma correction
+    // Exposure, then tone mapping and gamma correction. camera_position.w is the
+    // exposure the Render Settings slider writes; it multiplies scene-referred
+    // radiance BEFORE the tone curve, which is the only place it means anything
+    // -- after tonemap_aces() the value is already clamped to 0..1 and the
+    // slider would only wash out or crush.
+    color *= scene.camera_position.w;
     color = tonemap_aces(color);
     color = linear_to_srgb(color);
 
