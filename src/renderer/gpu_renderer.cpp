@@ -24,7 +24,13 @@ namespace {
  * every backend is happy with, and it costs at most 63 bytes of padding on a
  * range that is tens of kilobytes.
  */
-constexpr uint32_t kVertexAlignment = static_cast<uint32_t>(sizeof(Vertex));
+// 64, and NO LONGER sizeof(Vertex). The two coincided until Vertex grew its baked
+// ambient occlusion channel and became 68 bytes; a 68-byte alignment is not a
+// power of two, so the pool would round it up to 128 and pad every allocation by
+// up to 127 bytes for no benefit. The binding offset does not have to be a
+// multiple of the stride here in any case: every draw binds the range at the
+// mesh's first vertex and uses a vertex offset of 0, with mesh-local indices.
+constexpr uint32_t kVertexAlignment = 64u;
 
 /**
  * @brief Alignment demanded of a pooled INDEX range
@@ -55,7 +61,7 @@ static_assert(kIndexAlignment == 4u, "draw_mesh() converts an index range's byte
  * @warning @p state borrows the caller's storage. All three must share a scope.
  */
 void describe_pbr_vertex_input(SDL_GPUVertexBufferDescription& buffer_desc,
-                               SDL_GPUVertexAttribute (&attrs)[5],
+                               SDL_GPUVertexAttribute (&attrs)[6],
                                SDL_GPUVertexInputState& state) {
     buffer_desc = {};
     buffer_desc.slot = 0;
@@ -96,11 +102,19 @@ void describe_pbr_vertex_input(SDL_GPUVertexBufferDescription& buffer_desc,
     attrs[4].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4;
     attrs[4].offset = offsetof(Vertex, tangent);
 
+    // Baked ambient occlusion: float. Its own channel rather than a factor folded
+    // into `color`, because it must attenuate the ambient term ONLY -- a vertex
+    // colour multiplies albedo and would darken direct sunlight with it.
+    attrs[5].location = 5;
+    attrs[5].buffer_slot = 0;
+    attrs[5].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT;
+    attrs[5].offset = offsetof(Vertex, ao);
+
     state = {};
     state.vertex_buffer_descriptions = &buffer_desc;
     state.num_vertex_buffers = 1;
     state.vertex_attributes = attrs;
-    state.num_vertex_attributes = 5;
+    state.num_vertex_attributes = 6;
 }
 
 } // namespace
@@ -217,6 +231,13 @@ void GPURenderer::shutdown() {
         m_transfer_buffer = nullptr;
     }
 
+    // The shadow map and its sampler. Released here rather than in
+    // release_pipelines(), because release_pipelines() also runs on an MSAA change,
+    // and the shadow map has no relationship with the sample count.
+    release_shadow_resources();
+    m_shadow_casters_recording.clear();
+    m_shadow_casters_ready.clear();
+
     // Textures go before the device, and before the pipelines that sample them.
     //
     // GPURenderer does NOT own the texture manager -- the editor does -- but it
@@ -311,6 +332,38 @@ void GPURenderer::release_pipelines() {
     // this mid-session -- cannot skip the first bind of the new pipelines.
     reset_material_binding();
 
+    // The shadow pipeline is NOT rebuilt by set_msaa_level(): it renders to its own
+    // single-sampled depth target. It is released here all the same, because this
+    // function also runs at shutdown.
+    if (m_shadow_pipeline) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_shadow_pipeline);
+        m_shadow_pipeline = nullptr;
+    }
+    if (m_shadow_vertex_shader) {
+        SDL_ReleaseGPUShader(m_device, m_shadow_vertex_shader);
+        m_shadow_vertex_shader = nullptr;
+    }
+    if (m_shadow_fragment_shader) {
+        SDL_ReleaseGPUShader(m_device, m_shadow_fragment_shader);
+        m_shadow_fragment_shader = nullptr;
+    }
+
+    // Release the sky pipeline. It travels with the PBR set because it shares the
+    // MSAA sample count; a set_msaa_level() that rebuilt one and not the other
+    // would leave a pipeline whose sample count no longer matches its pass.
+    if (m_sky_pipeline) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_sky_pipeline);
+        m_sky_pipeline = nullptr;
+    }
+    if (m_sky_vertex_shader) {
+        SDL_ReleaseGPUShader(m_device, m_sky_vertex_shader);
+        m_sky_vertex_shader = nullptr;
+    }
+    if (m_sky_fragment_shader) {
+        SDL_ReleaseGPUShader(m_device, m_sky_fragment_shader);
+        m_sky_fragment_shader = nullptr;
+    }
+
     // Release PBR shaders
     if (m_pbr_vertex_shader) {
         SDL_ReleaseGPUShader(m_device, m_pbr_vertex_shader);
@@ -332,7 +385,17 @@ bool GPURenderer::load_shaders() {
         spdlog::warn("PBR shaders not available - PBR mode disabled");
         // Not a fatal error - simple mode still works
     }
-    
+
+    // Same contract as the PBR pair: a checkout without these keeps running, it
+    // just falls back to the flat clear colour.
+    if (!load_sky_shaders()) {
+        spdlog::warn("Sky shaders not available - flat background");
+    }
+
+    if (!load_shadow_shaders()) {
+        spdlog::warn("Shadow shaders not available - shadows disabled");
+    }
+
     return true;
 }
 
@@ -388,10 +451,14 @@ bool GPURenderer::load_pbr_shaders() {
     // that header is what assets/shaders/mesh_pbr.frag is documented against --
     // if the GLSL grows a fourth map, the constant moves and this call site does
     // not have to be remembered.
+    // kPbrFragmentSamplerCount, NOT kMaterialSamplerCount: the shader declares the
+    // material's three plus the shadow map at binding 3. SDL validates this number
+    // against the SPIR-V reflection, and getting it wrong either fails outright in
+    // SDL_CreateGPUShader or builds a layout in which the shadow map binds nowhere.
     m_pbr_fragment_shader =
         load_shader(frag_path.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT,
                     static_cast<int>(kPbrFragmentUniformBufferCount), 0,
-                    static_cast<int>(kMaterialSamplerCount));
+                    static_cast<int>(kPbrFragmentSamplerCount));
     if (!m_pbr_fragment_shader) {
         spdlog::error("Failed to load PBR fragment shader: {}", frag_path);
         SDL_ReleaseGPUShader(m_device, m_pbr_vertex_shader);
@@ -400,6 +467,74 @@ bool GPURenderer::load_pbr_shaders() {
     }
 
     spdlog::info("PBR shaders loaded successfully");
+    return true;
+}
+
+bool GPURenderer::load_sky_shaders() {
+    const char* base = SDL_GetBasePath();
+    std::string base_path = base ? base : "";
+
+    std::string vert_path = base_path + "../../assets/shaders/sky.vert.spv";
+    std::string frag_path = base_path + "../../assets/shaders/sky.frag.spv";
+
+    if (!std::filesystem::exists(vert_path) || !std::filesystem::exists(frag_path)) {
+        spdlog::warn("Sky shaders not found at {}", vert_path);
+        return false;
+    }
+
+    // Vertex: one uniform buffer, SkyUniforms at set 1 binding 0. No samplers and
+    // NO VERTEX ATTRIBUTES -- the three vertices come from gl_VertexIndex.
+    m_sky_vertex_shader = load_shader(vert_path.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 1, 0);
+    if (!m_sky_vertex_shader) {
+        spdlog::error("Failed to load sky vertex shader: {}", vert_path);
+        return false;
+    }
+
+    // Fragment: one uniform buffer, the SAME SceneUniforms the PBR shader reads,
+    // at the same slot. sky_common.glsl declares that block for both of them, so
+    // the count here is 1 and not kPbrFragmentUniformBufferCount -- the sky has
+    // no per-material block.
+    m_sky_fragment_shader = load_shader(frag_path.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0);
+    if (!m_sky_fragment_shader) {
+        spdlog::error("Failed to load sky fragment shader: {}", frag_path);
+        SDL_ReleaseGPUShader(m_device, m_sky_vertex_shader);
+        m_sky_vertex_shader = nullptr;
+        return false;
+    }
+
+    spdlog::info("Sky shaders loaded successfully");
+    return true;
+}
+
+bool GPURenderer::load_shadow_shaders() {
+    const char* base = SDL_GetBasePath();
+    std::string base_path = base ? base : "";
+
+    std::string vert_path = base_path + "../../assets/shaders/shadow.vert.spv";
+    std::string frag_path = base_path + "../../assets/shaders/shadow.frag.spv";
+
+    if (!std::filesystem::exists(vert_path) || !std::filesystem::exists(frag_path)) {
+        spdlog::warn("Shadow shaders not found at {}", vert_path);
+        return false;
+    }
+
+    // Vertex: one uniform buffer, the light MVP. Fragment: nothing at all -- it
+    // has no outputs, the pipeline has no colour targets, and depth comes out of
+    // the rasteriser.
+    m_shadow_vertex_shader = load_shader(vert_path.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 1, 0);
+    if (!m_shadow_vertex_shader) {
+        spdlog::error("Failed to load shadow vertex shader: {}", vert_path);
+        return false;
+    }
+    m_shadow_fragment_shader = load_shader(frag_path.c_str(), SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 0);
+    if (!m_shadow_fragment_shader) {
+        spdlog::error("Failed to load shadow fragment shader: {}", frag_path);
+        SDL_ReleaseGPUShader(m_device, m_shadow_vertex_shader);
+        m_shadow_vertex_shader = nullptr;
+        return false;
+    }
+
+    spdlog::info("Shadow shaders loaded successfully");
     return true;
 }
 
@@ -464,7 +599,282 @@ bool GPURenderer::create_pipelines() {
             spdlog::warn("Failed to create PBR pipelines - PBR mode disabled");
         }
     }
-    
+
+    if (m_sky_vertex_shader && m_sky_fragment_shader) {
+        if (!create_sky_pipeline()) {
+            spdlog::warn("Failed to create sky pipeline - flat background");
+        }
+    }
+
+    // Guarded on already-existing rather than rebuilt unconditionally, because
+    // set_msaa_level() re-enters this function. Neither the shadow pipeline nor
+    // the shadow map has anything to do with the swapchain's sample count -- the
+    // cascade passes render to their own single-sampled depth target -- so a
+    // rebuild here would free and reallocate a 2048x2048x3 texture for no reason.
+    if (m_shadow_vertex_shader && m_shadow_fragment_shader) {
+        const bool pipeline_ok = m_shadow_pipeline != nullptr || create_shadow_pipeline();
+        const bool resources_ok = m_shadow_texture != nullptr || create_shadow_resources();
+        if (!pipeline_ok || !resources_ok) {
+            spdlog::warn("Failed to create shadow resources - shadows disabled");
+            m_shadow_config.enabled = false;
+        }
+    } else {
+        m_shadow_config.enabled = false;
+    }
+
+    return true;
+}
+
+bool GPURenderer::create_shadow_pipeline() {
+    // ONE vertex attribute over a full-Vertex stride. The shadow pass reads
+    // position and nothing else, so declaring the other four would make the input
+    // assembler fetch normals, UVs, colours and tangents on every cascade for a
+    // shader that discards them. The stride still has to be sizeof(Vertex),
+    // because the buffer being bound is the same one the colour pass uses.
+    SDL_GPUVertexBufferDescription buffer_desc{};
+    buffer_desc.slot = 0;
+    buffer_desc.pitch = sizeof(Vertex);
+    buffer_desc.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+
+    SDL_GPUVertexAttribute position_attr{};
+    position_attr.location = 0;
+    position_attr.buffer_slot = 0;
+    position_attr.format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;
+    position_attr.offset = offsetof(Vertex, position);
+
+    SDL_GPUVertexInputState vertex_input{};
+    vertex_input.vertex_buffer_descriptions = &buffer_desc;
+    vertex_input.num_vertex_buffers = 1;
+    vertex_input.vertex_attributes = &position_attr;
+    vertex_input.num_vertex_attributes = 1;
+
+    SDL_GPURasterizerState rasterizer{};
+    rasterizer.fill_mode = SDL_GPU_FILLMODE_FILL;
+    // FRONT face culling, not back. Rendering only back faces into the shadow map
+    // moves the stored depth to the far side of every solid object, which puts the
+    // depth comparison a whole wall thickness away from the surface being shaded
+    // and removes most self-shadowing acne before any bias is applied. The cost is
+    // that open, single-sided geometry -- which this scene has, in road decals and
+    // terrain skirts -- casts nothing; those are flat on the ground and cast
+    // nothing worth having anyway.
+    rasterizer.cull_mode = SDL_GPU_CULLMODE_FRONT;
+    rasterizer.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+    rasterizer.enable_depth_bias = false;
+    rasterizer.enable_depth_clip = true;
+
+    // FORWARD depth here, unlike the colour pass. Reverse-Z buys floating point
+    // precision against a perspective projection's 1/z distribution; a cascade is
+    // ORTHOGRAPHIC, so its depth is already linear and there is nothing to win.
+    // Standard LESS against a 1.0 clear keeps the shader's comparison the obvious
+    // way round.
+    SDL_GPUDepthStencilState depth_stencil{};
+    depth_stencil.compare_op = SDL_GPU_COMPAREOP_LESS;
+    depth_stencil.enable_depth_test = true;
+    depth_stencil.enable_depth_write = true;
+    depth_stencil.enable_stencil_test = false;
+
+    // NO COLOUR TARGETS. Depth only.
+    SDL_GPUGraphicsPipelineTargetInfo target_info{};
+    target_info.color_target_descriptions = nullptr;
+    target_info.num_color_targets = 0;
+    target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    target_info.has_depth_stencil_target = true;
+
+    // Always 1 sample. The shadow map is its own target and has nothing to do with
+    // the swapchain's MSAA level, which is why this pipeline does NOT have to be
+    // rebuilt by set_msaa_level().
+    SDL_GPUMultisampleState multisample{};
+    multisample.sample_count = SDL_GPU_SAMPLECOUNT_1;
+
+    SDL_GPUGraphicsPipelineCreateInfo pipeline_info{};
+    pipeline_info.vertex_shader = m_shadow_vertex_shader;
+    pipeline_info.fragment_shader = m_shadow_fragment_shader;
+    pipeline_info.vertex_input_state = vertex_input;
+    pipeline_info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    pipeline_info.rasterizer_state = rasterizer;
+    pipeline_info.multisample_state = multisample;
+    pipeline_info.depth_stencil_state = depth_stencil;
+    pipeline_info.target_info = target_info;
+
+    m_shadow_pipeline = SDL_CreateGPUGraphicsPipeline(m_device, &pipeline_info);
+    if (!m_shadow_pipeline) {
+        spdlog::error("Failed to create shadow pipeline: {}", SDL_GetError());
+        return false;
+    }
+
+    spdlog::info("Shadow pipeline created");
+    return true;
+}
+
+bool GPURenderer::create_shadow_resources() {
+    release_shadow_resources();
+
+    const int layers = std::clamp(m_shadow_config.cascade_count, 1, kMaxShadowCascades);
+    const uint32_t size = std::clamp(m_shadow_config.map_size, 256u, 8192u);
+
+    // ONE 2D TEXTURE, CASCADES TILED SIDE BY SIDE. A 2D array would be the natural
+    // shape and is not available: SDL_GPU rejects it outright, "For array
+    // textures: usage must not contain DEPTH_STENCIL_TARGET" (see the validation
+    // in SDL_CreateGPUTexture). The atlas is the better shape regardless, because
+    // every cascade is then filled in a SINGLE render pass with one clear and a
+    // viewport change per tile.
+    SDL_GPUTextureCreateInfo info{};
+    info.type = SDL_GPU_TEXTURETYPE_2D;
+    info.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    info.width = size * static_cast<uint32_t>(layers);
+    info.height = size;
+    info.layer_count_or_depth = 1;
+    info.num_levels = 1;
+    info.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    // Both usages: written as a depth target by the cascade pass, read as a
+    // sampled texture by mesh_pbr.frag.
+    info.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+
+    m_shadow_texture = SDL_CreateGPUTexture(m_device, &info);
+    if (!m_shadow_texture) {
+        spdlog::error("Failed to create {}x{} shadow atlas ({} cascades): {}",
+                      info.width, info.height, layers, SDL_GetError());
+        return false;
+    }
+
+    SDL_GPUSamplerCreateInfo sampler_info{};
+    // LINEAR with enable_compare is what makes each PCF tap a bilinear PERCENTAGE
+    // rather than a single binary in-or-out test. Nearest here would make the 3x3
+    // kernel produce ten discrete shades and read as stair-stepped.
+    sampler_info.min_filter = SDL_GPU_FILTER_LINEAR;
+    sampler_info.mag_filter = SDL_GPU_FILTER_LINEAR;
+    sampler_info.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+    // CLAMP_TO_EDGE, and the shader additionally insets its cascade test by a
+    // kernel radius, so a fragment near a cascade edge moves outward to a cascade
+    // that still has data instead of smearing the border texel across the gap.
+    sampler_info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    sampler_info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    sampler_info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    sampler_info.enable_compare = true;
+    // LESS: the reference is the fragment's own depth in cascade clip space, and
+    // it passes -- is lit -- when it is nearer than what the caster pass stored.
+    sampler_info.compare_op = SDL_GPU_COMPAREOP_LESS;
+
+    m_shadow_sampler = SDL_CreateGPUSampler(m_device, &sampler_info);
+    if (!m_shadow_sampler) {
+        spdlog::error("Failed to create shadow sampler: {}", SDL_GetError());
+        SDL_ReleaseGPUTexture(m_device, m_shadow_texture);
+        m_shadow_texture = nullptr;
+        return false;
+    }
+
+    m_shadow_allocated_size = size;
+    m_shadow_allocated_layers = layers;
+    spdlog::info("Shadow atlas created: {}x{} ({} cascades of {}x{})",
+                 size * static_cast<uint32_t>(layers), size, layers, size, size);
+    return true;
+}
+
+void GPURenderer::release_shadow_resources() {
+    if (m_shadow_sampler) {
+        SDL_ReleaseGPUSampler(m_device, m_shadow_sampler);
+        m_shadow_sampler = nullptr;
+    }
+    if (m_shadow_texture) {
+        SDL_ReleaseGPUTexture(m_device, m_shadow_texture);
+        m_shadow_texture = nullptr;
+    }
+    m_shadow_allocated_size = 0;
+    m_shadow_allocated_layers = 0;
+}
+
+void GPURenderer::set_shadow_config(const ShadowConfig& config) {
+    const bool needs_realloc =
+        config.map_size != m_shadow_allocated_size ||
+        std::clamp(config.cascade_count, 1, kMaxShadowCascades) != m_shadow_allocated_layers;
+
+    m_shadow_config = config;
+    m_shadow_config.cascade_count = std::clamp(config.cascade_count, 1, kMaxShadowCascades);
+
+    if (needs_realloc && m_shadow_pipeline) {
+        // A texture the GPU may still be reading from must not be freed under it.
+        // This is a settings change, not a per-frame path, so the simplest correct
+        // answer is the right one.
+        SDL_WaitForGPUIdle(m_device);
+        if (!create_shadow_resources()) {
+            m_shadow_config.enabled = false;
+        }
+    }
+}
+
+bool GPURenderer::create_sky_pipeline() {
+    // set_msaa_level() re-enters create_pipelines(), and this pipeline DOES depend
+    // on the sample count, so it is genuinely rebuilt -- which means the previous
+    // one has to go first or it leaks on every MSAA change.
+    if (m_sky_pipeline) {
+        SDL_ReleaseGPUGraphicsPipeline(m_device, m_sky_pipeline);
+        m_sky_pipeline = nullptr;
+    }
+
+    // NO VERTEX INPUT AT ALL. A zero-binding, zero-attribute input state is legal
+    // and is what lets draw_sky() issue SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0)
+    // with nothing bound: sky.vert derives its three positions from
+    // gl_VertexIndex. Leaving the mesh vertex layout declared here instead would
+    // make the pipeline require a vertex buffer that will never be bound.
+    SDL_GPUVertexInputState vertex_input{};
+    vertex_input.num_vertex_buffers = 0;
+    vertex_input.num_vertex_attributes = 0;
+
+    SDL_GPURasterizerState rasterizer{};
+    rasterizer.fill_mode = SDL_GPU_FILLMODE_FILL;
+    // The generated triangle's winding is whatever gl_VertexIndex produces, and
+    // it is not worth reasoning about: culling nothing is correct for a single
+    // fullscreen primitive and cannot be got wrong by a later edit.
+    rasterizer.cull_mode = SDL_GPU_CULLMODE_NONE;
+    rasterizer.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+    rasterizer.enable_depth_bias = false;
+    rasterizer.enable_depth_clip = true;
+
+    // Depth OFF in both directions. The sky is drawn first and painted over, so
+    // it needs no test; and it must not write, or every subsequent GREATER test
+    // in the reverse-Z depth buffer would be compared against the sky's own
+    // depth instead of the cleared far plane.
+    SDL_GPUDepthStencilState depth_stencil{};
+    depth_stencil.enable_depth_test = false;
+    depth_stencil.enable_depth_write = false;
+    depth_stencil.enable_stencil_test = false;
+
+    SDL_GPUColorTargetDescription color_target{};
+    color_target.format = SDL_GetGPUSwapchainTextureFormat(m_device, m_window);
+    SDL_GPUColorTargetBlendState blend{};
+    blend.enable_blend = false;
+    blend.color_write_mask = SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G |
+                             SDL_GPU_COLORCOMPONENT_B | SDL_GPU_COLORCOMPONENT_A;
+    color_target.blend_state = blend;
+
+    SDL_GPUGraphicsPipelineTargetInfo target_info{};
+    target_info.color_target_descriptions = &color_target;
+    target_info.num_color_targets = 1;
+    // The pass this runs in HAS a depth attachment, so the pipeline must declare
+    // one and its format must match, even though nothing here touches it.
+    target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    target_info.has_depth_stencil_target = true;
+
+    SDL_GPUMultisampleState multisample{};
+    multisample.sample_count = m_sample_count;
+
+    SDL_GPUGraphicsPipelineCreateInfo pipeline_info{};
+    pipeline_info.vertex_shader = m_sky_vertex_shader;
+    pipeline_info.fragment_shader = m_sky_fragment_shader;
+    pipeline_info.vertex_input_state = vertex_input;
+    pipeline_info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    pipeline_info.rasterizer_state = rasterizer;
+    pipeline_info.multisample_state = multisample;
+    pipeline_info.depth_stencil_state = depth_stencil;
+    pipeline_info.target_info = target_info;
+
+    m_sky_pipeline = SDL_CreateGPUGraphicsPipeline(m_device, &pipeline_info);
+    if (!m_sky_pipeline) {
+        spdlog::error("Failed to create sky pipeline: {}", SDL_GetError());
+        return false;
+    }
+
+    spdlog::info("Sky pipeline created");
     return true;
 }
 
@@ -590,9 +1000,9 @@ bool GPURenderer::create_simple_pipelines() {
 }
 
 bool GPURenderer::create_pbr_pipelines() {
-    // PBR shader uses 5 vertex attributes (including tangent)
+    // PBR shader uses 6 vertex attributes (tangent and baked AO included)
     SDL_GPUVertexBufferDescription vertex_buffer_desc{};
-    SDL_GPUVertexAttribute vertex_attributes[5]{};
+    SDL_GPUVertexAttribute vertex_attributes[6]{};
     SDL_GPUVertexInputState vertex_input{};
     describe_pbr_vertex_input(vertex_buffer_desc, vertex_attributes, vertex_input);
 
@@ -722,7 +1132,7 @@ SDL_GPUGraphicsPipeline* GPURenderer::decal_pipeline_for(float depth_bias) {
 
 SDL_GPUGraphicsPipeline* GPURenderer::create_decal_pipeline(float depth_bias) {
     SDL_GPUVertexBufferDescription vertex_buffer_desc{};
-    SDL_GPUVertexAttribute vertex_attributes[5]{};
+    SDL_GPUVertexAttribute vertex_attributes[6]{};
     SDL_GPUVertexInputState vertex_input{};
     describe_pbr_vertex_input(vertex_buffer_desc, vertex_attributes, vertex_input);
 
@@ -1341,6 +1751,18 @@ bool GPURenderer::begin_frame() {
     // Everything staged or freed from here on is accounted against this frame.
     ++m_frame_index;
 
+    // Close last frame's caster recording and start a new one. The shadow pass
+    // that runs shortly after this replays the CLOSED list, because the recording
+    // for this frame does not exist until Editor has traversed the scene, which
+    // happens inside the colour pass -- after the shadow map has to be finished.
+    // See render_shadow_cascades() for why replaying the visible set is preferred
+    // over traversing again per cascade.
+    m_shadow_casters_ready = std::move(m_shadow_casters_recording);
+    m_shadow_casters_recording.clear();
+    // Keep the capacity the recording had settled on, so a city-scale frame does
+    // not reallocate its way up to thousands of entries every frame.
+    m_shadow_casters_recording.reserve(m_shadow_casters_ready.size());
+
     // Drain staged mesh copies BEFORE this frame's command buffer exists, so the
     // upload is one self-contained submit rather than thousands interleaved with
     // an open render pass. Budgeted per frame, so a large import streams in.
@@ -1620,6 +2042,11 @@ void GPURenderer::bind_mesh_pipeline() {
         if (using_pbr()) {
             SDL_PushGPUFragmentUniformData(m_cmd_buffer, kSceneUniformSlot, &m_scene_uniforms,
                                            sizeof(m_scene_uniforms));
+            // The shadow map and its block go with them, and for the same reason:
+            // mesh_pbr.frag declares that sampler unconditionally, so leaving it
+            // unbound after a pipeline change is a validation error rather than
+            // merely a wrong-looking frame.
+            bind_shadow_resources();
         }
     }
 }
@@ -1828,9 +2255,11 @@ void GPURenderer::bind_neutral_material() {
     if (opaque && opaque != m_bound_pipeline) {
         SDL_BindGPUGraphicsPipeline(m_render_pass, opaque);
         m_bound_pipeline = opaque;
-        // Rebinding the pipeline drops the scene uniforms with it.
+        // Rebinding the pipeline drops the scene uniforms with it -- and the
+        // shadow block and shadow sampler alongside them.
         SDL_PushGPUFragmentUniformData(m_cmd_buffer, kSceneUniformSlot, &m_scene_uniforms,
                                        sizeof(m_scene_uniforms));
+        bind_shadow_resources();
     }
 
     // The header's in-class initialisers ARE the "no material" appearance: white
@@ -1944,9 +2373,11 @@ void GPURenderer::bind_material(MaterialKey key) {
         // Rebinding the pipeline drops the scene uniforms with it, so they
         // have to be re-pushed. This is the one place a pipeline change
         // happens mid-pass, and forgetting it here is what would black out
-        // every road drawn after the first marking.
+        // every road drawn after the first marking. The shadow block and the
+        // shadow sampler ride along for the same reason.
         SDL_PushGPUFragmentUniformData(m_cmd_buffer, kSceneUniformSlot, &m_scene_uniforms,
                                        sizeof(m_scene_uniforms));
+        bind_shadow_resources();
     }
 
     // --- Uniforms --------------------------------------------------------------
@@ -2005,6 +2436,14 @@ void GPURenderer::draw_mesh(uint32_t mesh_id, const glm::mat4& model,
     // Its buffers exist but the copy has not run yet -- drawing now would render
     // uninitialised device memory. It appears next frame instead.
     if (!mesh.ready) return;
+
+    // Record this draw as a shadow caster for the NEXT frame's cascade passes.
+    // Recorded here, after the validity checks, so the list never contains a mesh
+    // that was not worth drawing; the shadow pass re-checks anyway, because a
+    // mesh can be released between the two frames.
+    if (m_shadow_config.enabled && using_pbr()) {
+        m_shadow_casters_recording.push_back(CapturedDraw{ mesh_id, model });
+    }
 
     if (using_pbr()) {
         // PBR shader uniform layout: { mvp, model, normal_matrix, color_tint, camera_position }
@@ -2121,6 +2560,287 @@ void GPURenderer::set_viewport(const SDL_GPUViewport& viewport) {
     }
 }
 
+void GPURenderer::update_shadow_cascades() {
+    const int count = std::clamp(m_shadow_config.cascade_count, 1, kMaxShadowCascades);
+    const float map_size = static_cast<float>(std::max(m_shadow_allocated_size, 1u));
+
+    m_shadow_uniforms = ShadowUniforms{};
+    m_shadow_uniforms.shadow_params =
+        glm::vec4(static_cast<float>(count), m_shadow_config.normal_offset,
+                  m_shadow_config.strength, 1.0f / map_size);
+    // The fade covers the last fifth of the range, so the outer cascade ends in a
+    // gradient rather than in a visible circle.
+    // w is the atlas tile width in UV, i.e. 1 / cascade count. The shader needs it
+    // both to place a tile and to step one texel along x inside it.
+    m_shadow_uniforms.shadow_fade =
+        glm::vec4(m_shadow_config.max_distance * 0.8f, m_shadow_config.max_distance,
+                  m_shadow_config.pcf_radius, 1.0f / static_cast<float>(count));
+
+    // The camera frustum's half-angles, recovered from the projection matrix
+    // rather than from the camera object. The camera builds a REVERSE-Z projection
+    // by handing glm::perspective its far and near the wrong way round, which
+    // flips signs in the third column but leaves the first two alone -- so these
+    // two entries are the tangents whichever convention is in use, and this code
+    // does not have to know which.
+    const float tan_half_h = 1.0f / std::max(std::abs(m_projection[0][0]), 1e-6f);
+    const float tan_half_v = 1.0f / std::max(std::abs(m_projection[1][1]), 1e-6f);
+    const glm::mat4 inv_view = glm::inverse(m_view);
+
+    const float near_d = 1.0f;
+    const float far_d = std::max(m_shadow_config.max_distance, near_d + 1.0f);
+    const float lambda = std::clamp(m_shadow_config.split_lambda, 0.0f, 1.0f);
+
+    const glm::vec3 sun = glm::normalize(glm::vec3(m_scene_uniforms.sun_direction));
+
+    float split_near = near_d;
+    for (int i = 0; i < count; ++i) {
+        // Practical split scheme. A uniform split wastes almost all of the near
+        // cascade's resolution on distance; a purely logarithmic one makes the far
+        // cascade cover a volume so large its texels are useless. lambda blends.
+        const float p = static_cast<float>(i + 1) / static_cast<float>(count);
+        const float logarithmic = near_d * std::pow(far_d / near_d, p);
+        const float uniform = near_d + (far_d - near_d) * p;
+        const float split_far = glm::mix(uniform, logarithmic, lambda);
+
+        // The eight corners of this slice, in world space. View space here is
+        // right-handed looking down -Z, which is what glm::lookAt produces.
+        glm::vec3 corners[8];
+        int c = 0;
+        for (const float d : { split_near, split_far }) {
+            for (const float sy : { -1.0f, 1.0f }) {
+                for (const float sx : { -1.0f, 1.0f }) {
+                    const glm::vec4 view_corner(sx * d * tan_half_h, sy * d * tan_half_v, -d, 1.0f);
+                    corners[c++] = glm::vec3(inv_view * view_corner);
+                }
+            }
+        }
+
+        // A BOUNDING SPHERE, not a bounding box. This is the whole reason the
+        // cascades do not shimmer: a sphere is invariant under rotation, so
+        // turning the camera on the spot cannot change the fitted volume, and
+        // therefore cannot change which texel any given surface point lands in. A
+        // box refitted per frame changes size as the camera turns, and every
+        // shadow edge in the scene crawls.
+        glm::vec3 center(0.0f);
+        for (const glm::vec3& corner : corners) center += corner;
+        center /= 8.0f;
+
+        float radius = 0.0f;
+        for (const glm::vec3& corner : corners) {
+            radius = std::max(radius, glm::length(corner - center));
+        }
+        // Quantised so that a sub-texel change in the fit cannot resize the
+        // projection at all.
+        radius = std::ceil(radius * 16.0f) / 16.0f;
+
+        // Pull the light far enough back to clear anything that could cast into
+        // the sphere. Everything between the light and the sphere is a caster.
+        const float pull_back = radius + 100.0f;
+        const glm::vec3 eye = center + sun * pull_back;
+        const glm::vec3 up = (std::abs(sun.y) > 0.99f) ? glm::vec3(0.0f, 0.0f, 1.0f)
+                                                       : glm::vec3(0.0f, 1.0f, 0.0f);
+        const glm::mat4 light_view = glm::lookAt(eye, center, up);
+
+        const float depth_range = pull_back + radius;
+        // GLM_FORCE_DEPTH_ZERO_TO_ONE is set project-wide (see CMakeLists), so this
+        // is a 0..1 depth ortho, which is what the D32 target and the comparison
+        // sampler expect. Forward depth, not reverse-Z: see create_shadow_pipeline().
+        glm::mat4 light_proj = glm::ortho(-radius, radius, -radius, radius, 0.0f, depth_range);
+
+        // TEXEL SNAPPING. Without it the projection slides continuously as the
+        // camera moves and every shadow edge swims by up to a texel per frame, which
+        // is far more visible than the aliasing it comes from. Rounding the origin
+        // to whole texels makes the sampling grid move in whole-texel steps instead.
+        {
+            const glm::mat4 view_proj = light_proj * light_view;
+            glm::vec4 origin = view_proj * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+            origin *= map_size * 0.5f;
+            const glm::vec4 rounded = glm::round(origin);
+            const glm::vec4 offset = (rounded - origin) * (2.0f / map_size);
+            light_proj[3][0] += offset.x;
+            light_proj[3][1] += offset.y;
+        }
+
+        m_shadow_uniforms.light_view_proj[i] = light_proj * light_view;
+        m_shadow_uniforms.cascade_texel_world[i] = (2.0f * radius) / map_size;
+        // The configured bias is in METRES, so it converts through this cascade's
+        // own depth range. Expressing it in normalised units instead would make the
+        // near cascade wildly over-biased relative to the far one, or the far one
+        // under-biased, depending on which end it was tuned at.
+        m_shadow_uniforms.cascade_depth_bias[i] =
+            m_shadow_config.depth_bias_metres / std::max(depth_range, 1e-3f);
+
+        split_near = split_far;
+    }
+}
+
+void GPURenderer::render_shadow_cascades() {
+    if (!m_cmd_buffer) return;
+    if (!m_shadow_config.enabled || !m_shadow_pipeline || !m_shadow_texture) return;
+    // Simple shader mode does not sample the map, so filling it would be pure cost.
+    if (!using_pbr()) return;
+
+    // A render pass must not already be open: these open their own.
+    if (m_render_pass) return;
+
+    update_scene_uniforms();
+    update_shadow_cascades();
+
+    const int count = std::clamp(m_shadow_config.cascade_count, 1, m_shadow_allocated_layers);
+    const float tile = static_cast<float>(m_shadow_allocated_size);
+
+    // ONE pass over the whole atlas: one depth clear instead of one per cascade,
+    // and no repeated attachment transitions.
+    SDL_GPUDepthStencilTargetInfo depth_target{};
+    depth_target.texture = m_shadow_texture;
+    depth_target.clear_depth = 1.0f;   // forward depth: 1 is the far plane
+    depth_target.load_op = SDL_GPU_LOADOP_CLEAR;
+    depth_target.store_op = SDL_GPU_STOREOP_STORE;   // the whole point
+    depth_target.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
+    depth_target.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
+    depth_target.cycle = false;
+
+    // No colour targets at all, matching the pipeline.
+    SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(m_cmd_buffer, nullptr, 0, &depth_target);
+    if (!pass) {
+        spdlog::error("Failed to begin shadow pass: {}", SDL_GetError());
+        return;
+    }
+    SDL_BindGPUGraphicsPipeline(pass, m_shadow_pipeline);
+
+    for (int cascade = 0; cascade < count; ++cascade) {
+        // The viewport maps this cascade's clip space onto its own tile. A scissor
+        // matching it is belt and braces: the projection already confines the
+        // geometry to the viewport rect, but a viewport does not clip in Vulkan
+        // and a scissor does, so one cascade cannot write into another's tile.
+        SDL_GPUViewport viewport{};
+        viewport.x = static_cast<float>(cascade) * tile;
+        viewport.y = 0.0f;
+        viewport.w = tile;
+        viewport.h = tile;
+        viewport.min_depth = 0.0f;
+        viewport.max_depth = 1.0f;
+        SDL_SetGPUViewport(pass, &viewport);
+
+        SDL_Rect scissor{};
+        scissor.x = cascade * static_cast<int>(m_shadow_allocated_size);
+        scissor.y = 0;
+        scissor.w = static_cast<int>(m_shadow_allocated_size);
+        scissor.h = static_cast<int>(m_shadow_allocated_size);
+        SDL_SetGPUScissor(pass, &scissor);
+
+        const glm::mat4& light_view_proj = m_shadow_uniforms.light_view_proj[cascade];
+
+        for (const CapturedDraw& draw : m_shadow_casters_ready) {
+            auto it = m_meshes.find(draw.mesh_id);
+            if (it == m_meshes.end()) continue;   // released since it was recorded
+            const GPUMesh& mesh = it->second;
+            if (!mesh.is_valid() || !mesh.ready) continue;
+
+            ShadowMeshUniforms uniforms{};
+            uniforms.light_mvp = light_view_proj * draw.model;
+            SDL_PushGPUVertexUniformData(m_cmd_buffer, 0, &uniforms, sizeof(uniforms));
+
+            SDL_GPUBufferBinding vertex_binding{};
+            vertex_binding.buffer = mesh.vertex_alloc.buffer;
+            vertex_binding.offset = mesh.vertex_alloc.offset;
+            SDL_BindGPUVertexBuffers(pass, 0, &vertex_binding, 1);
+
+            SDL_GPUBufferBinding index_binding{};
+            index_binding.buffer = mesh.index_alloc.buffer;
+            index_binding.offset = mesh.index_alloc.offset;
+            SDL_BindGPUIndexBuffer(pass, &index_binding, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+
+            // The WHOLE index range in one draw, ignoring the submesh split. The
+            // submeshes exist to change material between ranges, and the depth pass
+            // has no material -- so walking them here would issue several draws
+            // that differ in nothing.
+            SDL_DrawGPUIndexedPrimitives(pass, mesh.index_count, 1, 0, 0, 0);
+        }
+    }
+
+    SDL_EndGPURenderPass(pass);
+}
+
+void GPURenderer::bind_shadow_resources() {
+    if (!m_render_pass || !m_cmd_buffer) return;
+    if (!using_pbr()) return;
+
+    // mesh_pbr.frag DECLARES the shadow sampler unconditionally, so it has to be
+    // bound whether or not shadows are on -- an unbound declared sampler is a
+    // validation error and, on some backends, garbage reads. When shadows are off
+    // the uniform block's cascade count is zero and the shader never samples it.
+    if (m_shadow_texture && m_shadow_sampler) {
+        SDL_GPUTextureSamplerBinding binding{};
+        binding.texture = m_shadow_texture;
+        binding.sampler = m_shadow_sampler;
+        SDL_BindGPUFragmentSamplers(m_render_pass, kShadowSamplerSlot, &binding, 1);
+    }
+
+    // If no cascade was rendered this frame, publish a zeroed block: cascade count
+    // 0 means "fully lit" rather than "compare against whatever is in the texture".
+    if (m_shadow_config.enabled && m_shadow_pipeline && m_shadow_texture) {
+        SDL_PushGPUFragmentUniformData(m_cmd_buffer, kShadowUniformSlot, &m_shadow_uniforms,
+                                       sizeof(m_shadow_uniforms));
+    } else {
+        const ShadowUniforms off{};
+        SDL_PushGPUFragmentUniformData(m_cmd_buffer, kShadowUniformSlot, &off, sizeof(off));
+    }
+}
+
+void GPURenderer::draw_sky() {
+    if (!m_render_pass || !m_cmd_buffer || !m_sky_pipeline) return;
+
+    // Simple mode has no sky. mesh.frag reads no scene uniforms at all, so a sky
+    // drawn behind it would be a background that lights nothing -- exactly the
+    // mismatch this pass exists to remove.
+    if (!using_pbr()) return;
+
+    // The seeding that begin_render_pass() normally does happens before any draw;
+    // calling it again here is harmless and makes draw_sky() correct even if a
+    // caller ever draws the sky as the first thing in a pass it opened itself.
+    update_scene_uniforms();
+
+    SDL_BindGPUGraphicsPipeline(m_render_pass, m_sky_pipeline);
+
+    SkyUniforms sky{};
+    // The pixel-to-ray reconstruction in sky.vert needs the INVERSE of exactly
+    // the matrix the geometry is drawn with, or the horizon sits at a different
+    // angle from the ground plane meeting it.
+    sky.inv_view_projection = glm::inverse(m_view_projection);
+    sky.camera_position = glm::vec4(m_camera_position, 0.0f);
+
+    SDL_PushGPUVertexUniformData(m_cmd_buffer, 0, &sky, sizeof(sky));
+    SDL_PushGPUFragmentUniformData(m_cmd_buffer, kSceneUniformSlot, &m_scene_uniforms,
+                                   sizeof(m_scene_uniforms));
+
+    // Three vertices, no vertex buffer, no index buffer. sky.vert builds the
+    // covering triangle from gl_VertexIndex.
+    SDL_DrawGPUPrimitives(m_render_pass, 3, 1, 0, 0);
+
+    // This pass now has the sky pipeline bound and no material state. Both caches
+    // have to be told, or the next bind_material() will skip a bind it needs.
+    m_bound_pipeline = m_sky_pipeline;
+    reset_material_binding();
+}
+
+void GPURenderer::set_sky(const glm::vec3& zenith, const glm::vec3& horizon,
+                          const glm::vec3& ground, float sky_intensity,
+                          float ground_intensity, float falloff) {
+    m_scene_uniforms.sky_zenith = glm::vec4(zenith, sky_intensity);
+    m_scene_uniforms.sky_horizon = glm::vec4(horizon, falloff);
+    m_scene_uniforms.ground_color = glm::vec4(ground, ground_intensity);
+}
+
+void GPURenderer::set_ibl_params(float specular_scale, float sun_angular_deg,
+                                 float aerial_perspective, float sun_glow_exponent) {
+    // The shader wants cos(HALF the angular diameter) so that a dot product
+    // against the sun direction can be compared against it directly.
+    const float half_angle = glm::radians(sun_angular_deg) * 0.5f;
+    m_scene_uniforms.ibl_params = glm::vec4(specular_scale, std::cos(half_angle),
+                                            aerial_perspective, sun_glow_exponent);
+}
+
 void GPURenderer::set_camera_position(const glm::vec3& position) {
     m_camera_position = position;
     m_scene_uniforms.camera_position = glm::vec4(position, m_scene_uniforms.camera_position.w);
@@ -2149,15 +2869,60 @@ void GPURenderer::update_scene_uniforms() {
     // Called at the start of each frame to ensure scene uniforms are current
     // The actual push happens in draw_mesh, but this ensures defaults are set
     
-    // Default sun lighting
-    if (m_scene_uniforms.sun_direction.w <= 0.0f) {
-        m_scene_uniforms.sun_direction = glm::vec4(glm::normalize(glm::vec3(0.5f, 1.0f, 0.3f)), 1.0f);
-        m_scene_uniforms.sun_color = glm::vec4(1.0f, 0.98f, 0.95f, 0.3f);  // Warm white, 0.3 ambient
-    }
-    
-    // Default exposure
-    if (m_scene_uniforms.camera_position.w <= 0.0f) {
-        m_scene_uniforms.camera_position.w = 1.0f;
+    // Seeded ONCE, on an explicit flag rather than on "does the field still look
+    // unset". The old guards were `sun_direction.w <= 0.0f` and
+    // `camera_position.w <= 0.0f`, which read the intensity and the exposure as
+    // their own not-yet-initialised markers: dragging the Sun Intensity slider
+    // to 0 -- a legitimate value, and the only way to preview the ambient term
+    // alone -- made this function overwrite the whole light block with the
+    // defaults again on the very next frame, so the slider snapped back.
+    if (!m_scene_lighting_seeded) {
+        m_scene_lighting_seeded = true;
+
+        // Matches the Render Settings sliders' own initial positions (azimuth
+        // 45 degrees, height 60 degrees) so the panel does not disagree with
+        // what is on screen before anything is touched.
+        const float az_rad = glm::radians(45.0f);
+        const float h_rad  = glm::radians(60.0f);
+        m_scene_uniforms.sun_direction = glm::vec4(
+            glm::normalize(glm::vec3(std::cos(h_rad) * std::sin(az_rad),
+                                     std::sin(h_rad),
+                                     std::cos(h_rad) * std::cos(az_rad))),
+            // Radiance, not a 0..1 factor. The shader's diffuse term is
+            // albedo / PI, so a unit-intensity sun lights a white surface facing
+            // it to 1/PI ~= 0.32 -- the flat, grey, underexposed look this scene
+            // had. ~PI puts that surface back at 1.0 before the tone curve.
+            3.14159265f);
+        // sun_color.a is the ambient MASTER SCALE now, not the ambient light
+        // itself. The light is the sky below, integrated over the hemisphere in
+        // sky_common.glsl, so 1.0 means "the sky as authored" rather than the old
+        // 0.3 meaning "30% grey everywhere".
+        m_scene_uniforms.sun_color = glm::vec4(1.0f, 0.98f, 0.95f, 1.0f);
+        m_scene_uniforms.camera_position.w = 1.0f;                         // Exposure
+
+        // A clear midday sky, in scene-referred radiance to match the sun above.
+        // Blue-heavy at the zenith, pale and bright at the horizon; the ground
+        // bounce is a desaturated mid-green because most of what this renderer
+        // draws stands on grass or asphalt.
+        set_sky(/*zenith*/  glm::vec3(0.16f, 0.30f, 0.62f),
+                /*horizon*/ glm::vec3(0.56f, 0.68f, 0.86f),
+                /*ground*/  glm::vec3(0.14f, 0.14f, 0.12f),
+                /*sky_intensity*/ 1.0f,
+                /*ground_intensity*/ 0.7f,
+                /*falloff*/ 0.45f);
+
+        // 0.53 degrees is the real sun's angular diameter. Aerial perspective
+        // full on: with a sky to fade into, there is no reason to fade into an
+        // arbitrary colour instead.
+        set_ibl_params(/*specular_scale*/ 1.0f, /*sun_angular_deg*/ 0.53f,
+                       /*aerial_perspective*/ 1.0f, /*sun_glow_exponent*/ 64.0f);
+
+        // Exponential distance haze, on by default. Off, the far edge of a city
+        // extract keeps full contrast right up to the horizon and then stops --
+        // the single strongest cue that a scene has no atmosphere. The density is
+        // scaled for kilometres because that is the extent of an OSM extract.
+        m_scene_uniforms.fog_params = glm::vec4(50.0f, 4000.0f, 0.00035f, 2.0f);
+        m_scene_uniforms.fog_color = glm::vec4(0.62f, 0.72f, 0.85f, 1.0f);
     }
     
     // SceneUniforms::pbr_params is RESERVED and unread; mesh_pbr.frag takes

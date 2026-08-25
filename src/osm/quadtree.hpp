@@ -2,6 +2,7 @@
 
 #include "osm/road/lod_chunk.hpp"
 #include "osm/road/road_network_builder.hpp"
+#include "geometry/ambient_occlusion.hpp"
 #include "osm/types.hpp"
 #include "renderer/mesh.hpp"
 #include <glm/glm.hpp>
@@ -291,6 +292,19 @@ public:
      */
     void set_chunk_lod(bool enabled, const road::ChunkLodConfig& cfg);
 
+    /**
+     * @brief Settings for the per-vertex ambient occlusion bake on building meshes
+     *
+     * Baked once per leaf, on the MERGED mesh, so the buildings in a leaf occlude
+     * each other -- which is where most of the useful darkening comes from, and
+     * which baking per building before the merge would lose.
+     *
+     * Set AOSettings::strength to 0 to skip the bake entirely; every vertex then
+     * keeps the 1.0 that means "no occlusion".
+     */
+    void set_building_ao(const stratum::geometry::AOSettings& settings) { m_building_ao = settings; }
+    [[nodiscard]] const stratum::geometry::AOSettings& building_ao() const { return m_building_ao; }
+
     /// Whether the chain will be built by the next assign_road_pieces()
     bool chunk_lod_enabled() const { return m_chunk_lod_enabled; }
 
@@ -338,6 +352,24 @@ public:
     QuadTreeNode* root() { return m_root.get(); }
 
 private:
+    /**
+     * @brief Ambient occlusion applied to building meshes as they are built
+     *
+     * Defaults are tuned for building scale, and for IMPORT TIME: 8 rays is
+     * already smooth on a flat wall, and the bake runs on whichever worker thread
+     * is building the leaf, so it asks for one thread rather than fighting the
+     * pool it is inside.
+     */
+    stratum::geometry::AOSettings m_building_ao = [] {
+        stratum::geometry::AOSettings settings;
+        settings.ray_count = 8;
+        settings.max_distance = 10.0f;
+        settings.min_ao = 0.25f;
+        settings.use_ground_plane = true;
+        settings.thread_count = 1;
+        return settings;
+    }();
+
     void subdivide(QuadTreeNode* node);
     void insert_road(QuadTreeNode* node, const Road& road);
     void insert_building(QuadTreeNode* node, const Building& building);

@@ -191,11 +191,35 @@ inline constexpr uint32_t kNormalSamplerSlot = 1;
 /// Fragment sampler slot of the ORM map. Set 2, binding 2.
 inline constexpr uint32_t kOrmSamplerSlot = 2;
 
-/// Fragment samplers mesh_pbr.frag declares. SDL_GPUShaderCreateInfo::num_samplers.
+/// Fragment sampler slot of the cascaded shadow map. Set 2, binding 3.
+///
+/// NOT part of the material set. bind_material() binds three consecutive
+/// samplers from slot 0 and never touches this one; the shadow map is bound once
+/// per render pass in bind_mesh_pipeline(), because it is frame state rather than
+/// per-draw state. The two must not be merged: a fourth entry in the material
+/// array would make every material rebind the shadow map, thousands of times a
+/// frame, for a texture that never changes within a pass.
+inline constexpr uint32_t kShadowSamplerSlot = 3;
+
+/// Fragment samplers the MATERIAL owns: albedo, normal, ORM. The count passed to
+/// SDL_BindGPUFragmentSamplers, NOT the count declared on the shader.
 inline constexpr uint32_t kMaterialSamplerCount = 3;
 
+/// Fragment samplers mesh_pbr.frag declares. SDL_GPUShaderCreateInfo::num_samplers.
+///
+/// The material's three plus the shadow map. This is the number SDL validates
+/// against the SPIR-V reflection, and it is deliberately a separate constant from
+/// kMaterialSamplerCount: they mean different things and only coincidentally
+/// tracked each other before the shadow map existed.
+inline constexpr uint32_t kPbrFragmentSamplerCount = kMaterialSamplerCount + 1;
+
+/// Fragment uniform-buffer slot of the shadow block. Set 3, binding 2.
+inline constexpr uint32_t kShadowUniformSlot = 2;
+
 /// Fragment uniform buffers mesh_pbr.frag declares. num_uniform_buffers.
-inline constexpr uint32_t kPbrFragmentUniformBufferCount = 2;
+///
+/// Scene, material, shadow.
+inline constexpr uint32_t kPbrFragmentUniformBufferCount = 3;
 
 // ============================================================================
 // MaterialUniforms

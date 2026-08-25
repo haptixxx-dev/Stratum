@@ -1,5 +1,6 @@
 #pragma once
 
+#include "geometry/ambient_occlusion.hpp"
 #include "procgen/terrain_generator.hpp"
 #include "renderer/mesh.hpp"
 #include <glm/glm.hpp>
@@ -54,6 +55,33 @@ struct TerrainMeshConfig {
     
     // LOD settings
     int lod_level = 0;  // 0 = full resolution, 1 = half, 2 = quarter, etc.
+
+    /**
+     * @brief Per-vertex ambient occlusion baked into the terrain mesh
+     *
+     * Terrain is the one surface here where AO is genuinely large-scale rather
+     * than a contact detail: a valley floor sees a fraction of the sky a ridge
+     * does, and with a hemisphere ambient and no occlusion the two get lit
+     * identically. That is most of what makes procedural terrain read as flat
+     * under a sky.
+     *
+     * NO GROUND PLANE, unlike the building bake. Here the ground IS the geometry,
+     * and a plane through it would occlude every downhill ray.
+     *
+     * Set AOSettings::strength to 0 to skip the bake.
+     */
+    geometry::AOSettings ambient_occlusion = [] {
+        geometry::AOSettings settings;
+        settings.ray_count = 8;
+        // Tens of metres, not the single digits building contacts want: the
+        // feature being measured is the shape of a hillside, not the join between
+        // a wall and a pavement.
+        settings.max_distance = 60.0f;
+        settings.min_ao = 0.35f;
+        settings.strength = 0.8f;
+        settings.use_ground_plane = false;
+        return settings;
+    }();
 };
 
 /**

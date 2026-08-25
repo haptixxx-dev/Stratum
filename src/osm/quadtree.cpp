@@ -1112,6 +1112,22 @@ QuadTree::BuiltMeshes QuadTree::build_node_meshes_internal(const QuadTreeNode& n
         }
         Mesh merged = MeshBuilder::merge_meshes(individual);
         if (merged.is_valid()) {
+            // Baked AFTER the merge, so the buildings in this leaf occlude each
+            // other -- the narrow gap between two terraced houses, the inside
+            // corner of an L-shaped block. Baking each building alone first would
+            // see only its own walls and lose all of that.
+            //
+            // The ground plane sits at the merged mesh's lowest point. An OSM
+            // building is walls and a roof with no floor, so without a closed
+            // ground the foot of every wall bakes as open as its top, and buildings
+            // read as hovering. Using the leaf's minimum rather than each
+            // building's own base is an approximation that costs accuracy only
+            // where a single leaf spans real terrain relief, and it under-darkens
+            // there rather than over-darkening, which is the safe direction.
+            stratum::geometry::AOSettings ao = m_building_ao;
+            ao.ground_height = merged.bounds.min.y;
+            stratum::geometry::bake_ambient_occlusion(merged, ao);
+
             result.building_meshes.push_back(std::move(merged));
         }
     }

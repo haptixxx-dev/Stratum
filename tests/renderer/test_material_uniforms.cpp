@@ -46,6 +46,7 @@
 
 #include "framework.hpp"
 
+#include "renderer/gpu_renderer.hpp"
 #include "renderer/material_library.hpp"
 
 #include <cstddef>
@@ -254,10 +255,21 @@ TEST(MaterialUniforms, glsl_declares_the_same_block_at_set_3_binding_1) {
     CHECK_EQ(members, size_t{3});
 }
 
-/// The scene block must stay at set 3 binding 0, or the material block's push
-/// slot collides with it and both draws read each other's bytes.
+/**
+ * @brief The scene block must stay at set 3 binding 0
+ *
+ * Or the material block's push slot collides with it and both draws read each
+ * other's bytes.
+ *
+ * The block moved out of mesh_pbr.frag and into sky_common.glsl when sky.frag
+ * started needing the same uniforms: two copies of one std140 layout is exactly
+ * the drift this file exists to catch, so there is now one copy and both shaders
+ * include it. The include itself is asserted below, because a mesh_pbr.frag that
+ * stopped including the header would not fail to compile -- it would fail to
+ * find `scene`, which IS a compile error, but only after someone rebuilt.
+ */
 TEST(MaterialUniforms, glsl_keeps_the_scene_block_at_set_3_binding_0) {
-    const std::string source = read_shader("mesh_pbr.frag");
+    const std::string source = read_shader("sky_common.glsl");
     if (source.empty()) {
         CHECK_FALSE(source.empty());
         return;
@@ -269,7 +281,68 @@ TEST(MaterialUniforms, glsl_keeps_the_scene_block_at_set_3_binding_0) {
 
     CHECK_EQ(stratum::kSceneUniformSlot, uint32_t{0});
     CHECK_EQ(stratum::kMaterialUniformSlot, uint32_t{1});
-    CHECK_EQ(stratum::kPbrFragmentUniformBufferCount, uint32_t{2});
+    // Three: scene, material, shadow.
+    CHECK_EQ(stratum::kPbrFragmentUniformBufferCount, uint32_t{3});
+    CHECK_EQ(stratum::kShadowUniformSlot, uint32_t{2});
+
+    const std::string pbr = strip_spaces(read_shader("mesh_pbr.frag"));
+    const std::string sky = strip_spaces(read_shader("sky.frag"));
+    CHECK(pbr.find("#include\"sky_common.glsl\"") != std::string::npos);
+    CHECK(sky.find("#include\"sky_common.glsl\"") != std::string::npos);
+}
+
+/**
+ * @brief SceneUniforms and its GLSL block hold the same members in the same order
+ *
+ * std140 gives a block of nothing but vec4s the same layout as the packed C++
+ * struct, so member COUNT and ORDER are the whole contract -- and neither SDL nor
+ * the driver will complain if they disagree, because the push is a byte blob.
+ * The sky and IBL members were appended to a block that had six members and now
+ * has ten; appending to one side only would have silently shifted every field
+ * after the insertion point.
+ */
+TEST(MaterialUniforms, glsl_scene_block_members_match_the_cpp_struct) {
+    const std::string flat = strip_spaces(read_shader("sky_common.glsl"));
+    if (flat.empty()) {
+        CHECK_FALSE(flat.empty());
+        return;
+    }
+
+    const size_t block = flat.find("uniformSceneUniforms{");
+    CHECK(block != std::string::npos);
+    if (block == std::string::npos) return;
+    const size_t close = flat.find("}scene;", block);
+    CHECK(close != std::string::npos);
+    if (close == std::string::npos) return;
+
+    const std::string body = flat.substr(block, close - block);
+
+    // In declaration order. Each must appear, and each must follow the last.
+    const char* expected[] = {
+        "vec4camera_position;", "vec4sun_direction;", "vec4sun_color;",
+        "vec4fog_params;",      "vec4fog_color;",     "vec4pbr_params;",
+        "vec4sky_zenith;",      "vec4sky_horizon;",   "vec4ground_color;",
+        "vec4ibl_params;",
+    };
+    size_t previous = 0;
+    for (const char* member : expected) {
+        const size_t at = body.find(member);
+        CHECK(at != std::string::npos);
+        if (at == std::string::npos) return;
+        CHECK(at >= previous);
+        previous = at;
+    }
+
+    // And no ELEVENTH member: the body holds exactly as many semicolons as there
+    // are declarations above.
+    size_t members = 0;
+    for (const char c : body) {
+        if (c == ';') ++members;
+    }
+    CHECK_EQ(members, sizeof(expected) / sizeof(expected[0]));
+
+    // The C++ side is all vec4 and nothing else, so its size is the count times 16.
+    CHECK_EQ(sizeof(stratum::SceneUniforms), members * sizeof(glm::vec4));
 }
 
 /**
@@ -628,14 +701,19 @@ TEST(MaterialUniforms, compiled_spirv_keeps_the_scene_block_at_set_3_binding_0) 
 }
 
 /**
- * @brief The three sampler bindings exist in the compiled module, as sampled images
+ * @brief The four sampler bindings exist in the compiled module, as sampled images
  *
- * SDL_CreateGPUShader is told num_samplers = kMaterialSamplerCount. Declaring
+ * SDL_CreateGPUShader is told num_samplers = kPbrFragmentSamplerCount. Declaring
  * more samplers than the module actually contains wastes a descriptor; declaring
  * fewer is a hard SDL error at pipeline creation. This pins the count to what the
  * binary really has, at the bindings the C++ slot constants name.
+ *
+ * The fourth is the cascaded shadow map, and it is deliberately NOT part of the
+ * material set: kMaterialSamplerCount is the number bind_material() binds from
+ * slot 0, kPbrFragmentSamplerCount is the number the shader declares. Merging
+ * them back into one constant would make every material rebind the shadow map.
  */
-TEST(MaterialUniforms, compiled_spirv_declares_the_three_sampler_bindings) {
+TEST(MaterialUniforms, compiled_spirv_declares_the_four_sampler_bindings) {
     const SpirvModule m{std::filesystem::path{STRATUM_TEST_SHADER_DIR} / "mesh_pbr.frag.spv"};
     CHECK_TRUE(m.is_valid());
     if (!m.is_valid()) {
@@ -645,8 +723,11 @@ TEST(MaterialUniforms, compiled_spirv_declares_the_three_sampler_bindings) {
     CHECK_TRUE(m.has_sampled_image_at(2, stratum::kAlbedoSamplerSlot));
     CHECK_TRUE(m.has_sampled_image_at(2, stratum::kNormalSamplerSlot));
     CHECK_TRUE(m.has_sampled_image_at(2, stratum::kOrmSamplerSlot));
+    CHECK_TRUE(m.has_sampled_image_at(2, stratum::kShadowSamplerSlot));
+
+    CHECK_EQ(stratum::kPbrFragmentSamplerCount, stratum::kMaterialSamplerCount + 1);
 
     // Exactly the declared count: the slot one past the end must be absent, or
     // num_samplers is under-declared and a future map binds into nothing.
-    CHECK_FALSE(m.has_sampled_image_at(2, stratum::kMaterialSamplerCount));
+    CHECK_FALSE(m.has_sampled_image_at(2, stratum::kPbrFragmentSamplerCount));
 }

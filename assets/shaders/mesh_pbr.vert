@@ -6,6 +6,10 @@ layout(location = 1) in vec3 in_normal;
 layout(location = 2) in vec2 in_uv;
 layout(location = 3) in vec4 in_color;
 layout(location = 4) in vec4 in_tangent;  // xyz = tangent, w = bitangent sign
+// Baked ambient occlusion, 1 = open sky. Its own channel, not folded into
+// in_color, because it must attenuate AMBIENT only: a vertex colour multiplies
+// albedo and would darken direct sunlight with it.
+layout(location = 5) in float in_ao;
 
 // Uniforms - SDL_GPU requires set=1 for vertex shader uniform buffers
 layout(set = 1, binding = 0) uniform MeshUniforms {
@@ -23,6 +27,7 @@ layout(location = 2) out vec2 frag_uv;
 layout(location = 3) out vec4 frag_color;
 layout(location = 4) out vec3 frag_tangent;
 layout(location = 5) out vec3 frag_bitangent;
+layout(location = 6) out float frag_ao;
 
 void main() {
     gl_Position = uniforms.mvp * vec4(in_position, 1.0);
@@ -48,4 +53,5 @@ void main() {
     
     frag_uv = in_uv;
     frag_color = in_color * uniforms.color_tint;
+    frag_ao = in_ao;
 }

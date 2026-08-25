@@ -113,6 +113,10 @@ add_library(stratum_core STATIC
     # landed in which leaf, not by RoadNetworkBuilder; see lod_chunk.hpp.
     src/osm/road/lod_chunk.cpp
 
+    # Geometry processing. Engine-agnostic and mesh-generic: nothing in here
+    # knows about OSM, terrain or SDL.
+    src/geometry/ambient_occlusion.cpp
+
     # Procedural Generation
     src/procgen/noise.cpp
     src/procgen/terrain_generator.cpp
@@ -255,16 +259,24 @@ target_link_libraries(stratum PRIVATE stratum_editor_lib)
 #     target env emits SPIR-V that SDL_CreateGPUShader may reject.
 #
 # Incremental by construction: add_custom_command re-runs only when its DEPENDS
-# source is newer than its OUTPUT. No depfile is generated -- glslc's -MD writes
-# the .d next to the output, which would litter the source tree, and none of
-# these four shaders uses #include. Add one here if that ever changes.
+# source is newer than its OUTPUT -- OR when the depfile below names a changed
+# #include. That depfile is not optional any more: sky_common.glsl is included by
+# both sky.frag and mesh_pbr.frag, and without it, editing the shared sky would
+# rebuild neither. -MF puts the .d in the BUILD tree, so glslc's habit of writing
+# it next to the output does not litter the checked-in shader directory.
 find_program(STRATUM_GLSLC NAMES glslc HINTS /usr/bin /usr/sbin /usr/local/bin)
 
+# Compiled to .spv. sky_common.glsl is NOT listed: it is a header, it declares no
+# entry point, and glslc would reject it on its own.
 set(STRATUM_SHADER_SOURCES
     mesh.vert
     mesh.frag
     mesh_pbr.vert
     mesh_pbr.frag
+    sky.vert
+    sky.frag
+    shadow.vert
+    shadow.frag
 )
 
 set(STRATUM_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders)
@@ -273,15 +285,20 @@ if(STRATUM_GLSLC)
     message(STATUS "Shader compiler: ${STRATUM_GLSLC}")
 
     set(STRATUM_SPV_OUTPUTS "")
+    set(STRATUM_SHADER_DEPDIR ${CMAKE_CURRENT_BINARY_DIR}/shader-deps)
+    file(MAKE_DIRECTORY ${STRATUM_SHADER_DEPDIR})
     foreach(shader IN LISTS STRATUM_SHADER_SOURCES)
         add_custom_command(
             OUTPUT  ${STRATUM_SHADER_DIR}/${shader}.spv
             COMMAND ${STRATUM_GLSLC}
                     --target-env=vulkan1.0
                     -O
+                    -I ${STRATUM_SHADER_DIR}
+                    -MD -MF ${STRATUM_SHADER_DEPDIR}/${shader}.d
                     ${STRATUM_SHADER_DIR}/${shader}
                     -o ${STRATUM_SHADER_DIR}/${shader}.spv
             DEPENDS ${STRATUM_SHADER_DIR}/${shader}
+            DEPFILE ${STRATUM_SHADER_DEPDIR}/${shader}.d
             COMMENT "glslc ${shader}"
             VERBATIM
         )

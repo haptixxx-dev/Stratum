@@ -143,6 +143,131 @@ struct alignas(16) SceneUniforms {
     /// this member exists only to keep the std140 layout of the block matching the
     /// shader's. Do not add a control for it without adding a shader read first.
     glm::vec4 pbr_params;
+
+    // ------------------------------------------------------------------------
+    // Sky and image-based lighting
+    // ------------------------------------------------------------------------
+    // Read by assets/shaders/sky_common.glsl, which BOTH sky.frag and
+    // mesh_pbr.frag include. These four are what replaced a hand-picked clear
+    // colour sitting next to an unrelated hand-picked ambient constant: the
+    // background and the fill light are now two evaluations of one function, so
+    // they cannot disagree.
+    //
+    // The values are scene-referred radiance, not 0..1 display colours. Exposure
+    // and the ACES curve bring them to the screen.
+
+    /// rgb = zenith radiance, a = overall sky intensity.
+    glm::vec4 sky_zenith;
+
+    /// rgb = horizon radiance, a = zenith falloff exponent. The exponent is what
+    /// keeps the bright band hugging the horizon; a linear gradient puts it far
+    /// too high. Clamped away from 0 in the shader.
+    glm::vec4 sky_horizon;
+
+    /// rgb = ground bounce radiance, a = its intensity. This is the LOWER lobe of
+    /// the hemisphere ambient, i.e. what lights the underside of a bridge deck.
+    glm::vec4 ground_color;
+
+    /// x = specular ambient scale, y = cos(sun angular radius) for the drawn sun
+    /// disk, z = aerial perspective (0 = authored fog colour, 1 = sky colour),
+    /// w = sun glow exponent (haze tightness).
+    glm::vec4 ibl_params;
+};
+
+/// Cascades the shadow system can render. The GLSL array is sized to match, so
+/// raising this means editing kMaxShadowCascades in mesh_pbr.frag too.
+inline constexpr int kMaxShadowCascades = 4;
+
+/**
+ * @brief Fragment uniforms for the cascaded shadow lookup (set 3, binding 2)
+ *
+ * MUST match the ShadowUniforms block in assets/shaders/mesh_pbr.frag.
+ *
+ * shadow_params.x is the live cascade COUNT, and zero means "no shadows". That
+ * is not a fallback, it is the documented off switch: a caller that pushes a
+ * zeroed block gets fully lit geometry instead of comparisons against an
+ * uninitialised depth texture. The PBR shader test suite relies on it.
+ */
+struct alignas(16) ShadowUniforms {
+    /// World space to cascade clip space, one per cascade.
+    glm::mat4 light_view_proj[kMaxShadowCascades];
+
+    /// World size of one shadow texel, per cascade. Drives the normal offset,
+    /// which has to shrink as the cascades get tighter or the near cascade is
+    /// over-offset and its contact shadows detach.
+    glm::vec4 cascade_texel_world;
+
+    /// Constant depth bias in normalised [0, 1] clip depth, per cascade.
+    glm::vec4 cascade_depth_bias;
+
+    /// x = cascade count, y = normal offset in texels, z = strength,
+    /// w = 1 / shadow map size.
+    glm::vec4 shadow_params;
+
+    /// x = fade start distance, y = fade end distance, z = PCF radius in texels,
+    /// w = unused.
+    glm::vec4 shadow_fade;
+};
+
+/**
+ * @brief Vertex uniforms for the shadow depth pass (set 1, binding 0)
+ *
+ * MUST match the ShadowMeshUniforms block in assets/shaders/shadow.vert. Position
+ * only: the shadow pass reads no other vertex attribute and binds no material.
+ */
+struct alignas(16) ShadowMeshUniforms {
+    glm::mat4 light_mvp;
+};
+
+/**
+ * @brief Tunables for the cascaded shadow map
+ */
+struct ShadowConfig {
+    bool enabled = true;
+
+    /// 1 to kMaxShadowCascades. More cascades means more depth passes over the
+    /// whole caster list, so this is the main cost dial.
+    int cascade_count = 3;
+
+    /// Square edge of each cascade layer, in texels.
+    uint32_t map_size = 2048;
+
+    /// How far from the camera shadows are rendered at all. Beyond this the
+    /// shader fades to fully lit; there is no data further out.
+    float max_distance = 800.0f;
+
+    /// Blend between a uniform split (0) and a logarithmic one (1). Logarithmic
+    /// puts resolution where perspective needs it; a little uniform keeps the
+    /// far cascade from covering an absurd volume.
+    float split_lambda = 0.85f;
+
+    /// Offset along the surface normal before the depth comparison, in texels of
+    /// the selected cascade. This, not the depth bias, is what removes acne.
+    float normal_offset = 2.0f;
+
+    /// Constant depth bias, in WORLD METRES. Converted to each cascade's own
+    /// normalised depth range on the way to the shader, so changing
+    /// max_distance does not silently change how biased the near cascade is.
+    float depth_bias_metres = 0.05f;
+
+    /// 0 lifts shadows to fully lit, 1 is the full comparison result.
+    float strength = 1.0f;
+
+    /// PCF kernel spacing in texels. The kernel is 3x3 taps of a hardware
+    /// comparison sampler, so each tap is already bilinear-filtered.
+    float pcf_radius = 1.0f;
+};
+
+/**
+ * @brief Vertex uniforms for the fullscreen sky pass (set 1, binding 0)
+ *
+ * MUST match the SkyUniforms block in assets/shaders/sky.vert. The sky needs no
+ * geometry -- it turns each pixel into a world-space ray instead -- so the
+ * inverse view-projection and the eye position are the whole input.
+ */
+struct alignas(16) SkyUniforms {
+    glm::mat4 inv_view_projection;
+    glm::vec4 camera_position;   // xyz = world position, w = unused
 };
 
 // GPUMaterial used to be declared here: a four-vec4 block with bindless texture
@@ -495,6 +620,93 @@ public:
      * @brief Set camera position for lighting calculations
      */
     void set_camera_position(const glm::vec3& position);
+
+    /**
+     * @brief Render the sun's shadow cascades for this frame
+     *
+     * Call once per frame between begin_frame() and begin_render_pass(): it opens
+     * depth-only render passes of its own, and it must finish before anything
+     * samples the map.
+     *
+     * WHAT IT DRAWS IS LAST FRAME'S VISIBLE SET. draw_mesh() records every mesh it
+     * draws, and this replays the recording from the previous frame. The
+     * alternative -- traversing the scene again per cascade from the light's point
+     * of view -- would mean running Editor's quadtree traversal three more times a
+     * frame, which also drives level-of-detail selection, chunk streaming and the
+     * per-frame statistics; those would all fire three extra times for a pass that
+     * wants nothing from them.
+     *
+     * The cost of the shortcut is honest and worth stating: a caster that is
+     * outside the camera frustum does not cast into it. With the sun high this is
+     * invisible; with the sun low it shows as a missing shadow entering from a
+     * screen edge. The list is also one frame old, which is not observable at
+     * interactive rates -- and meshes released in between are skipped by
+     * draw_mesh()'s own validity check, so a stale handle is safe rather than a
+     * crash.
+     */
+    void render_shadow_cascades();
+
+    /// The live shadow settings. Assigning reallocates the map if the size or the
+    /// cascade count changed.
+    void set_shadow_config(const ShadowConfig& config);
+    const ShadowConfig& get_shadow_config() const { return m_shadow_config; }
+
+    /// True when a shadow map exists and cascades were rendered into it.
+    [[nodiscard]] bool shadows_active() const {
+        return m_shadow_config.enabled && m_shadow_texture != nullptr &&
+               m_shadow_pipeline != nullptr;
+    }
+
+    /**
+     * @brief Paint the analytic sky over the whole viewport
+     *
+     * Call once per frame INSIDE the 3D render pass and BEFORE any geometry, and
+     * after set_view_projection() and set_camera_position(): the pass reconstructs
+     * a world ray per pixel from the inverse view-projection, so a stale matrix
+     * points the sky in the wrong direction.
+     *
+     * Draws nothing in Simple shader mode -- mesh.frag has no scene uniforms and
+     * no sky to be consistent with, so a sky behind it would be a sky lighting
+     * nothing.
+     */
+    void draw_sky();
+
+    /**
+     * @brief Set the analytic sky, which is also the ambient light
+     *
+     * These are scene-referred radiances, not display colours; exposure and the
+     * tone curve bring them to the screen. There is deliberately no separate
+     * "ambient colour": the fill light IS this sky, integrated over the
+     * hemisphere in the shader.
+     *
+     * @param zenith          Radiance straight up
+     * @param horizon         Radiance at the horizon
+     * @param ground          Ground bounce radiance, the lower ambient lobe
+     * @param sky_intensity   Master scale on the dome
+     * @param ground_intensity Master scale on the bounce
+     * @param falloff         Zenith falloff exponent; smaller keeps the bright
+     *                        band tighter to the horizon
+     */
+    void set_sky(const glm::vec3& zenith, const glm::vec3& horizon, const glm::vec3& ground,
+                 float sky_intensity, float ground_intensity, float falloff);
+
+    /**
+     * @brief Set the image-based lighting and sun-disk parameters
+     *
+     * @param specular_scale    Scale on the ambient specular lobe, 1.0 = physical
+     * @param sun_angular_deg   Drawn sun disk diameter in degrees; the real sun is
+     *                          about 0.53
+     * @param aerial_perspective 0 keeps the authored fog colour, 1 fades distance
+     *                          into the sky along the view ray
+     * @param sun_glow_exponent Haze tightness around the sun; larger is tighter
+     */
+    void set_ibl_params(float specular_scale, float sun_angular_deg,
+                        float aerial_perspective, float sun_glow_exponent);
+
+    const glm::vec4& get_sky_zenith() const { return m_scene_uniforms.sky_zenith; }
+    const glm::vec4& get_sky_horizon() const { return m_scene_uniforms.sky_horizon; }
+    const glm::vec4& get_ground_color() const { return m_scene_uniforms.ground_color; }
+    const glm::vec4& get_ibl_params() const { return m_scene_uniforms.ibl_params; }
 
     /**
      * @brief Update scene lighting parameters
@@ -938,6 +1150,14 @@ private:
     bool load_shaders();
     bool load_simple_shaders();
     bool load_pbr_shaders();
+    bool load_sky_shaders();
+    bool create_sky_pipeline();
+    bool load_shadow_shaders();
+    bool create_shadow_pipeline();
+    bool create_shadow_resources();
+    void release_shadow_resources();
+    void update_shadow_cascades();
+    void bind_shadow_resources();
     void create_msaa_textures();
     void release_msaa_textures();
     void release_pipelines();
@@ -953,6 +1173,66 @@ private:
     SDL_GPUGraphicsPipeline* m_mesh_pipeline_wireframe = nullptr;
     SDL_GPUShader* m_vertex_shader = nullptr;
     SDL_GPUShader* m_fragment_shader = nullptr;
+
+    // ------------------------------------------------------------------------
+    // Cascaded shadow map
+    // ------------------------------------------------------------------------
+
+    /// D32_FLOAT 2D ATLAS, `cascade_count` square tiles side by side, so its width
+    /// is map_size * cascade_count and its height is map_size.
+    ///
+    /// An array texture would be the natural shape and is not available: SDL_GPU
+    /// rejects array textures with DEPTH_STENCIL_TARGET usage. The atlas is the
+    /// better shape anyway -- every cascade is filled in ONE render pass with a
+    /// single depth clear and a viewport change per tile.
+    SDL_GPUTexture* m_shadow_texture = nullptr;
+
+    /// Comparison sampler: enable_compare with COMPAREOP_LESS, so each texture()
+    /// call in the PCF kernel returns a hardware-filtered comparison result
+    /// rather than a depth value to compare by hand.
+    SDL_GPUSampler* m_shadow_sampler = nullptr;
+
+    SDL_GPUGraphicsPipeline* m_shadow_pipeline = nullptr;
+    SDL_GPUShader* m_shadow_vertex_shader = nullptr;
+    SDL_GPUShader* m_shadow_fragment_shader = nullptr;
+
+    ShadowConfig m_shadow_config{};
+    ShadowUniforms m_shadow_uniforms{};
+
+    /// Tile size and tile count the current m_shadow_texture was created with, so
+    /// set_shadow_config() knows whether it has to reallocate.
+    uint32_t m_shadow_allocated_size = 0;
+    int m_shadow_allocated_layers = 0;
+
+    /// One recorded draw_mesh() call. Material and colour tint are deliberately
+    /// absent: the depth pass has no use for either.
+    struct CapturedDraw {
+        uint32_t mesh_id = 0;
+        glm::mat4 model{1.0f};
+    };
+
+    /// Filled by draw_mesh() during the frame currently being recorded.
+    std::vector<CapturedDraw> m_shadow_casters_recording;
+
+    /// The completed recording from the previous frame, which is what
+    /// render_shadow_cascades() replays. begin_frame() moves one into the other.
+    std::vector<CapturedDraw> m_shadow_casters_ready;
+
+    /**
+     * @brief Fullscreen analytic sky, drawn before any geometry
+     *
+     * No vertex buffer and no depth interaction: three generated vertices, depth
+     * test and depth write both off. It runs first and everything else paints
+     * over it, which is why it needs neither.
+     *
+     * Created and released with the PBR set because it shares the swapchain
+     * format and the MSAA sample count, so a set_msaa_level() that rebuilt one
+     * and not the other would leave a pipeline whose sample count no longer
+     * matches its render pass.
+     */
+    SDL_GPUGraphicsPipeline* m_sky_pipeline = nullptr;
+    SDL_GPUShader* m_sky_vertex_shader = nullptr;
+    SDL_GPUShader* m_sky_fragment_shader = nullptr;
 
     // PBR shader pipelines
     SDL_GPUGraphicsPipeline* m_pbr_pipeline = nullptr;
@@ -1043,6 +1323,10 @@ private:
 
     // Scene uniforms (lighting, fog, etc.)
     SceneUniforms m_scene_uniforms{};
+    // Guards the one-time default seeding in update_scene_uniforms(). A separate
+    // flag, not a sentinel value inside m_scene_uniforms, so that every field of
+    // the light block stays a legal value the user may choose -- zero included.
+    bool m_scene_lighting_seeded{false};
 
     // Camera position (for specular calculations)
     glm::vec3 m_camera_position{0.0f};

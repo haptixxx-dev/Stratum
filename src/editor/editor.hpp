@@ -52,6 +52,16 @@ public:
     void render();
     void render_3d(GPURenderer& renderer);
 
+    /**
+     * @brief Publish this frame's camera to the renderer
+     *
+     * Separated out of render_3d() because the shadow cascades are fitted to
+     * slices of the camera frustum and are rendered BEFORE the colour pass opens,
+     * so they need the view and projection earlier than render_3d() runs.
+     * render_3d() still calls it, so the two paths cannot disagree.
+     */
+    void publish_camera(GPURenderer& renderer);
+
     void set_quit_callback(std::function<void()> callback) { m_quit_callback = callback; }
     void set_window_handle(void* window) { m_window_handle = window; }
 
