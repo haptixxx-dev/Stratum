@@ -36,6 +36,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -571,3 +572,135 @@ TEST(RoadNetwork, rebuilding_discards_the_previous_network) {
     CHECK_EQ(repeat.stats.vertices, second.stats.vertices);
     CHECK_EQ(repeat.stats.triangles, second.stats.triangles);
 }
+
+/**
+ * @brief A crossing way is topology, not pavement
+ *
+ * tests/data/crossing.osm way 10020 is `highway=footway` + `footway=crossing`: a
+ * pedestrian route ACROSS the carriageway, sharing node 1012 with it.
+ *
+ * The pipeline used to classify a way from `highway=*` alone, so this became
+ * RoadType::Footway, which build_profile() turns into a single 2 metre
+ * MaterialId::Sidewalk strip, which the corridor extruder swept into a slab of
+ * paving laid over the asphalt. On a real extract that is a pale ribbon crossing
+ * the road at every junction with a mapped crossing.
+ *
+ * BOTH halves are asserted, because the obvious fix breaks the other one. Removing
+ * the way from the graph also removes the crossing: find_crossings() locates the
+ * zebra where the crossing WAY meets the carriageway, so the edge has to survive
+ * and only its SURFACE may go. Crossings.skew_footway_crossing_lands_on_the_
+ * carriageway_it_crosses guards the zebra itself; this guards the pavement.
+ */
+TEST(RoadNetwork, a_crossing_way_produces_topology_but_no_pavement) {
+    const auto data = parse_fixture("crossing.osm");
+    if (!data) return;
+
+    RoadNetworkBuilder builder;
+    const RoadNetwork network = builder.build(*data, RoadNetworkConfig{});
+
+    constexpr stratum::osm::WayId kCrossingWay = 10020;
+    constexpr stratum::osm::WayId kCarriagewayWay = 10010;
+
+    // The edge exists. Without it there is no crossing to find.
+    bool crossing_edge_found = false;
+    for (size_t i = 0; i < builder.graph().edges().size(); ++i) {
+        if (builder.graph().edge(static_cast<stratum::osm::road::EdgeId>(i)).source_way ==
+            kCrossingWay) {
+            crossing_edge_found = true;
+            break;
+        }
+    }
+    CHECK_TRUE(crossing_edge_found);
+
+    // And it grew no geometry. Counted by triangles rather than by piece presence,
+    // so an empty piece emitted for bookkeeping would still pass and a one-triangle
+    // sliver would not.
+    size_t crossing_triangles = 0;
+    size_t carriageway_triangles = 0;
+    for (const RoadPiece& piece : network.pieces) {
+        if (piece.edge == kInvalidId) continue;
+        const auto& edge = builder.graph().edge(piece.edge);
+        if (edge.source_way == kCrossingWay) {
+            crossing_triangles += piece.mesh.indices.size() / 3;
+        } else if (edge.source_way == kCarriagewayWay) {
+            carriageway_triangles += piece.mesh.indices.size() / 3;
+        }
+    }
+
+    CHECK_EQ(crossing_triangles, size_t{0});
+
+    // The road it crosses is still built, which is what says the filter is
+    // selective rather than having emptied the fixture.
+    CHECK(carriageway_triangles > 0);
+}
+
+/**
+ * @brief Three footways meeting is not an intersection
+ *
+ * tests/data/footway_junction.osm: node 2002 is interior to a pavement and a
+ * `footway=crossing` leaves it. Degree 3, and every arm a 2 metre footway.
+ *
+ * Junctions used to be decided on DEGREE ALONE -- nothing in junction_trim.cpp,
+ * junction_builder.cpp or junction_polygon.cpp ever read a road class -- so this
+ * was solved like a road intersection: both halves of the pavement trimmed back
+ * from the node, a polygon fitted, and a kerb ring wrapped round the gap. There
+ * is one of these per mapped crossing, so on a city extract the pavement came out
+ * chopped into floating slabs with kerbs across them.
+ */
+TEST(RoadNetwork, three_footways_meeting_is_not_an_intersection) {
+    const auto data = parse_fixture("footway_junction.osm");
+    if (!data) return;
+
+    RoadNetworkBuilder builder;
+    const RoadNetwork network = builder.build(*data, RoadNetworkConfig{});
+    const RoadGraph& graph = builder.graph();
+
+    // Find node 2002 and confirm the fixture is the shape the test claims.
+    size_t meeting = SIZE_MAX;
+    for (size_t n = 0; n < graph.nodes().size(); ++n) {
+        if (graph.nodes()[n].osm_id == 2002) {
+            meeting = n;
+            break;
+        }
+    }
+    CHECK_TRUE(meeting != SIZE_MAX);
+    if (meeting == SIZE_MAX) return;
+
+    const auto& node = graph.nodes()[meeting];
+    CHECK_EQ(node.degree(), size_t{3});
+    CHECK_EQ(size_t{node.carriageway_arms}, size_t{0});
+
+    // Degree says junction; road class says otherwise, and road class decides.
+    CHECK_TRUE(node.is_junction());
+    CHECK_FALSE(node.is_road_junction());
+
+    // Nothing was solved here, so no arm was cut back. A trimmed pavement is the
+    // visible half of the bug: it is what opens the gap the kerb ring then fills.
+    for (const auto& arm : node.arms) {
+        const auto& edge = graph.edge(arm.edge);
+        const double trim = arm.at_start ? edge.trim_from : edge.trim_to;
+        CHECK_FALSE(trim > 0.0);
+    }
+
+    // No INTERSECTION was solved in this fixture. Counted from the stats rather
+    // than by looking for pieces with no edge, because dead-end caps are also
+    // pieces with no edge and this fixture has five dead ends.
+    CHECK_EQ(network.junction_stats.junctions, size_t{0});
+
+    // And nothing claims node 2002 as its centre.
+    for (const auto& junction : network.junctions) {
+        CHECK_TRUE(junction.node != static_cast<stratum::osm::road::GraphNodeId>(meeting));
+    }
+
+    // The unrelated carriageway is still built, which says the filter is
+    // selective rather than having switched junction solving off.
+    size_t carriageway_triangles = 0;
+    for (const RoadPiece& piece : network.pieces) {
+        if (piece.edge == kInvalidId) continue;
+        if (graph.edge(piece.edge).source_way == 20020) {
+            carriageway_triangles += piece.mesh.indices.size() / 3;
+        }
+    }
+    CHECK(carriageway_triangles > 0);
+}
+

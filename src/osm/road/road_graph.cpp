@@ -585,6 +585,30 @@ void RoadGraph::build(const ParsedOSMData& data) {
     for (auto& node : m_nodes) {
         std::sort(node.arms.begin(), node.arms.end(),
                   [](const Arm& a, const Arm& b) { return a.bearing < b.bearing; });
+
+        // Count the CARRIAGEWAY arms, which is what separates an intersection
+        // from a place where two pavements meet. Nothing in the junction path
+        // ever looked at a road class, so a degree-3 node made of three 2 metre
+        // footways -- which is every mapped crossing meeting the pavement it
+        // starts from, and in a city extract that is thousands of them -- was
+        // solved as a road junction: both pavements trimmed back and a kerb ring
+        // wrapped round the gap. See GraphNode::is_road_junction().
+        size_t carriageway = 0;
+        for (const Arm& arm : node.arms) {
+            if (arm.edge >= m_edges.size()) continue;
+            switch (m_edges[arm.edge].type) {
+                case RoadType::Footway:
+                case RoadType::Cycleway:
+                case RoadType::Path:
+                    break;
+                default:
+                    ++carriageway;
+                    break;
+            }
+        }
+        // Saturating: the field only ever feeds a `>= 2` test, and a node with
+        // more than 255 carriageway arms does not exist outside broken data.
+        node.carriageway_arms = static_cast<uint8_t>(std::min<size_t>(carriageway, 255));
     }
 
     const Stats s = stats();

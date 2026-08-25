@@ -75,6 +75,7 @@ add_library(stratum_core STATIC
     src/osm/quadtree.cpp
 
     # OSM road network
+    src/osm/road/way_semantics.cpp
     src/osm/road/road_graph.cpp
     src/osm/road/road_style.cpp
     src/osm/road/road_profile.cpp

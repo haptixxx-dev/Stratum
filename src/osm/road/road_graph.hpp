@@ -112,11 +112,45 @@ struct GraphNode {
     bool has_crossing = false;      ///< highway=crossing on the OSM node
     bool is_turning_circle = false; ///< highway=turning_circle or highway=turning_loop
 
+    /**
+     * @brief How many incident arms are a CARRIAGEWAY rather than a footway
+     *
+     * Filled by RoadGraph::build() from GraphEdge::type. Footway, Cycleway and
+     * Path do not count; everything else does.
+     *
+     * It exists because degree alone cannot tell an intersection from a place
+     * where two pavements meet. In a city extract, pedestrian ways outnumber
+     * roads: every mapped crossing meets the pavement it starts from, so each one
+     * is a degree-3 node made entirely of 2 metre footways. Solved as a road
+     * junction -- which is what happened, because nothing in the junction path
+     * ever looked at a road class -- each of those trimmed both pavements back
+     * and wrapped a kerb ring round the gap, chopping continuous pavement into
+     * floating slabs with kerbs across them.
+     */
+    uint8_t carriageway_arms = 0;
+
     /// Number of incident arms
     [[nodiscard]] size_t degree() const { return arms.size(); }
 
-    /// Degree 3 or more: a real junction that needs trimming and a fillet
+    /// Degree 3 or more. TOPOLOGY only -- for whether this needs a junction
+    /// SOLVED, with trims and a fillet ring, see is_road_junction().
     [[nodiscard]] bool is_junction() const { return arms.size() >= 3; }
+
+    /**
+     * @brief Does this node need a junction solved: trims, a polygon, a kerb ring?
+     *
+     * Degree 3 or more AND at least two carriageway arms. Two, not one: a single
+     * carriageway arm ending at a node where footways meet is a road terminating
+     * next to a path, not an intersection of roads, and giving it a fillet ring
+     * bulges the kerb into the pavement.
+     *
+     * A node that fails this test is left alone entirely. Its ways run through
+     * unbroken, which for two pavements meeting is exactly right -- pedestrians
+     * do not need a mitred kerb where a crossing joins the footpath.
+     */
+    [[nodiscard]] bool is_road_junction() const {
+        return arms.size() >= 3 && carriageway_arms >= 2;
+    }
 
     /// Degree 1: a dead end that needs a cap, bulb, or turning circle
     [[nodiscard]] bool is_dead_end() const { return arms.size() == 1; }

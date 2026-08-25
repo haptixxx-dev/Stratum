@@ -398,6 +398,16 @@ bool JunctionBuilder::solve_trims(RoadGraph& graph,
             const size_t degree = node.degree();
 
             if (degree >= 3) {
+                // Degree is topology; being an INTERSECTION is not. A node whose
+                // arms are all footways -- a crossing meeting the pavement it
+                // leaves from, a path forking in a park -- gets no trim, no
+                // polygon and no kerb ring, and its ways run through unbroken.
+                // Solving it as a road junction is what chopped continuous
+                // pavement into floating slabs with kerbs across them.
+                if (!node.is_road_junction()) {
+                    continue;
+                }
+
                 slot.participates = true;
                 slot.emit = true;
 
