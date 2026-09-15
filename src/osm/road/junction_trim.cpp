@@ -558,12 +558,17 @@ void fill_widths(const std::vector<RoadProfile>& profiles, ArmRef& ref) {
     // allowed to stand further apart than two narrow ones, which is the same
     // scaling stub_threshold() uses and needs no tuning per city.
     // ------------------------------------------------------------------------
+    std::vector<double> member_radius;
+    member_radius.reserve(cluster.size());
+    for (GraphNodeId member : cluster) {
+        member_radius.push_back(junction_radius(graph, profiles, member));
+    }
+
     for (size_t i = 0; i < cluster.size(); ++i) {
         for (size_t j = i + 1; j < cluster.size(); ++j) {
             const double gap = glm::length(graph.node(cluster[i]).position -
                                            graph.node(cluster[j]).position);
-            const double reach = junction_radius(graph, profiles, cluster[i]) +
-                                 junction_radius(graph, profiles, cluster[j]);
+            const double reach = member_radius[i] + member_radius[j];
             if (!(gap < std::max(radius, reach))) {
                 return { node };     // not one junction after all
             }
