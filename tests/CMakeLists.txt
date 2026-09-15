@@ -79,6 +79,9 @@ set(STRATUM_TEST_SOURCES
     procgen/test_terrain_carve.cpp
     osm/test_quadtree_roads.cpp
 
+    # roof:shape=* reaching geometry for all five roof families (E1).
+    osm/test_roof_shapes.cpp
+
     # Engine-agnostic geometry processing.
     geometry/test_ambient_occlusion.cpp
 )
@@ -112,6 +115,7 @@ set(STRATUM_TEST_SUITES
     RoadStyle
     TerrainCarve
     QuadTreeRoads
+    RoofShapes
     RoadDump
     RoadTerrainDump
     JunctionDump
