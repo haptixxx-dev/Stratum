@@ -22,6 +22,37 @@ option(STRATUM_BUILD_DOCS "Build documentation with Doxygen" OFF)
 option(STRATUM_USE_LLD "Link with LLD instead of the default linker" OFF)
 
 # ═══════════════════════════════════════════════════════════════════
+# MSVC
+# ═══════════════════════════════════════════════════════════════════
+# Set before add_subdirectory(external) so the vendored trees inherit it too.
+#
+# NOMINMAX is the load-bearing one. <windows.h> defines min and max as
+# function-like macros, and the moment anything pulls it in transitively, every
+# std::numeric_limits<T>::max() in the tree stops parsing:
+#
+#     osmium/osm/location.hpp(188): error C2589: '(': illegal token on right
+#                                   side of '::'
+#
+# libosmium uses that idiom throughout, so the first Windows build of this
+# project died in a wall of syntax errors inside headers that are perfectly
+# valid C++. The errors point at the library; the cause is the macro.
+#
+# WIN32_LEAN_AND_MEAN keeps the rest of the Win32 surface out of the way, and
+# _USE_MATH_DEFINES is what makes M_PI exist at all under MSVC.
+if(MSVC)
+    add_compile_definitions(
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        _USE_MATH_DEFINES
+        _CRT_SECURE_NO_WARNINGS
+    )
+    # Without /EHsc MSVC warns on every standard header; without /utf-8 it reads
+    # the source as the system codepage, and this tree has UTF-8 box drawing and
+    # accented names in comments.
+    add_compile_options(/EHsc /utf-8)
+endif()
+
+# ═══════════════════════════════════════════════════════════════════
 # GLOBAL SETTINGS
 # ═══════════════════════════════════════════════════════════════════
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
