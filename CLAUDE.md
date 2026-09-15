@@ -60,9 +60,9 @@ because they are absent.
 ### Two-library split
 
 - **stratum_core** (static lib, `CMakeLists.txt:70`) — engine-agnostic. Contains
-  `src/osm`, `src/osm/road`, `src/geometry`, `src/procgen` only. Links `glm`,
-  `osmium`, `Clipper2`, `meshoptimizer`. Must NOT depend on SDL, ImGui or
-  rendering code.
+  `src/osm`, `src/osm/road`, `src/geometry`, `src/procgen`, `src/scene` only.
+  Links `glm`, `osmium`, `Clipper2`, `meshoptimizer`, `draco`. Must NOT depend on
+  SDL, ImGui or rendering code.
 - **stratum_editor_lib** (static lib, `CMakeLists.txt:172`) — the SDL3 + ImGui
   editor: rendering, UI panels, camera, gizmos. Depends on stratum_core.
 - **stratum** (executable) — just `main.cpp`, links stratum_editor_lib.
@@ -70,7 +70,8 @@ because they are absent.
 > **Trap:** `src/core` is NOT part of `stratum_core`. Its two classes
 > (`Application`, `Window`) compile into `stratum_editor_lib` and include SDL
 > and renderer headers. Engine-agnostic code belongs in `src/osm`,
-> `src/geometry` or `src/procgen`.
+> `src/geometry`, `src/procgen` or `src/scene`. The one whose name says
+> "core" is the one that is not.
 
 ### Source layout (`src/`)
 
@@ -84,6 +85,11 @@ because they are absent.
 - `osm/road/` — road network topology and geometry, solved network-wide.
 - `geometry/` — shared geometry utilities, including the ambient-occlusion baker.
 - `procgen/` — noise, heightmap terrain, terrain mesh building, tile management.
+- `scene/` — the scene model. Currently the undo/redo command stack (A4); layers,
+  attributes and selection land here as M2 continues. **Every mutation of the
+  scene goes through `CommandStack::execute()`.** A mutation that skips it is a
+  hole in the history, and the symptom shows up as an undo several steps later
+  restoring state that was never current.
 
 ### Key data flows
 

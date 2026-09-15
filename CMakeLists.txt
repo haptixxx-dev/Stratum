@@ -168,6 +168,11 @@ add_library(stratum_core STATIC
     # knows about OSM, terrain or SDL.
     src/geometry/ambient_occlusion.cpp
 
+    # The scene model: layers, attributes, selection, and the undo history every
+    # edit goes through. Engine-agnostic by the same rule as the rest of
+    # stratum_core -- no SDL, no ImGui, no renderer.
+    src/scene/command.cpp
+
     # Procedural Generation
     src/procgen/noise.cpp
     src/procgen/terrain_generator.cpp
