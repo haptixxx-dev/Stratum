@@ -93,11 +93,15 @@ set(STRATUM_TEST_SOURCES
 
     # Engine-agnostic geometry processing.
     geometry/test_ambient_occlusion.cpp
+
+    # The scene model.
+    scene/test_command_stack.cpp
 )
 
 # Suite names registered with ctest so each can be run and reported separately.
 set(STRATUM_TEST_SUITES
     AmbientOcclusion
+    CommandStack
     WaySemantics
     RoadGraph
     Centerline
