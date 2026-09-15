@@ -46,11 +46,28 @@ if(MSVC)
         _USE_MATH_DEFINES
         _CRT_SECURE_NO_WARNINGS
     )
-    # Without /EHsc MSVC warns on every standard header; without /utf-8 it reads
-    # the source as the system codepage, and this tree has UTF-8 box drawing and
-    # accented names in comments.
-    add_compile_options(/EHsc /utf-8)
 endif()
+
+# Applied per-target rather than globally, and that is not a style choice.
+#
+# /utf-8 is shorthand for /source-charset:utf-8 /execution-charset:utf-8, and
+# MSVC REFUSES a command line carrying both it and an explicit /source-charset:
+#
+#     cl : Command line error D8016 : '/utf-8' and '/source-charset:utf-8'
+#          command-line options are incompatible
+#
+# assimp sets /source-charset:utf-8 on its own targets, so a global /utf-8 makes
+# every assimp translation unit fail to launch the compiler at all. Stratum's
+# own sources still need it -- this tree has box drawing and accented names in
+# comments, and without it MSVC reads them as the system codepage.
+#
+# NOMINMAX and friends above stay global on purpose: the vendored trees need
+# those, and none of them conflicts.
+function(stratum_msvc_options target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /utf-8 /EHsc)
+    endif()
+endfunction()
 
 # ═══════════════════════════════════════════════════════════════════
 # GLOBAL SETTINGS
@@ -179,6 +196,7 @@ target_include_directories(stratum_core PUBLIC
 # translation unit that builds or consumes a projection matrix must agree --
 # a mismatch is an ODR violation with no diagnostic.
 target_compile_definitions(stratum_core PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE)
+stratum_msvc_options(stratum_core)
 
 target_link_libraries(stratum_core PUBLIC
     # Math
@@ -237,6 +255,8 @@ target_include_directories(stratum_editor_lib PUBLIC
     ${EXTERNAL_DIR}
 )
 
+stratum_msvc_options(stratum_editor_lib)
+
 target_link_libraries(stratum_editor_lib PUBLIC
     stratum_core
 
@@ -279,6 +299,7 @@ endif()
 # STRATUM EXECUTABLE
 # ═══════════════════════════════════════════════════════════════════
 add_executable(stratum src/main.cpp)
+stratum_msvc_options(stratum)
 target_link_libraries(stratum PRIVATE stratum_editor_lib)
 
 # ═══════════════════════════════════════════════════════════════════

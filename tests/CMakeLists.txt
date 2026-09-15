@@ -174,6 +174,7 @@ list(APPEND STRATUM_TEST_SOURCES road/test_junction_merge.cpp)
 list(APPEND STRATUM_TEST_SUITES JunctionMerge)
 
 add_executable(stratum_tests ${STRATUM_TEST_SOURCES})
+stratum_msvc_options(stratum_tests)
 
 # The TerrainCarve suite runs carve_terrain() from several std::threads at once
 # to prove the documented "safe for DIFFERENT heightmaps sharing one const
@@ -313,6 +314,7 @@ if(TARGET stratum_editor_lib AND EXISTS ${CMAKE_SOURCE_DIR}/src/renderer/gpu_buf
     list(APPEND STRATUM_GPU_DEVICE_SUITES Sky)
 
     add_executable(stratum_gpu_tests ${STRATUM_GPU_TEST_SOURCES})
+    stratum_msvc_options(stratum_gpu_tests)
 
     target_link_libraries(stratum_gpu_tests PRIVATE stratum_editor_lib Threads::Threads)
 
