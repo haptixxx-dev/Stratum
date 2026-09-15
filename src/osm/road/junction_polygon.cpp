@@ -153,6 +153,30 @@ constexpr double kQuarterTurn = 1.57079632679489661923;
  */
 constexpr double kCornerChordSlack = 1.0;
 
+/**
+ * @brief Is @p p inside the closed ring @p ring?
+ *
+ * The standard crossing-number test, with the ring closed implicitly as this file
+ * stores it. A point exactly on an edge may come back either way, which is what
+ * the callers want: a mouth resting on the boundary is not the failure this is
+ * looking for.
+ */
+[[nodiscard]] bool ring_contains(const std::vector<glm::dvec2>& ring, const glm::dvec2& p) {
+    if (ring.size() < 3) return false;
+
+    bool in = false;
+    for (size_t i = 0, j = ring.size() - 1; i < ring.size(); j = i++) {
+        const glm::dvec2& a = ring[i];
+        const glm::dvec2& b = ring[j];
+        if ((a.y > p.y) == (b.y > p.y)) continue;
+
+        const double denom = b.y - a.y;
+        if (denom == 0.0) continue;
+        if (p.x < (b.x - a.x) * (p.y - a.y) / denom + a.x) in = !in;
+    }
+    return in;
+}
+
 /// Subtracted before the segment-count ceil() so an exact quarter turn cannot round up
 constexpr double kSegmentBias = 1e-9;
 
@@ -932,6 +956,18 @@ JunctionPolygon build_junction_polygon(const std::vector<ArmRef>& arms,
     // onto the node, which is degenerate but not mis-wound.
     out.inverted = !out.self_intersecting && ring_double_area(out.ring) < 0.0;
 
+    // The ring has to contain the ground its arms meet on. Only asked of a ring
+    // that is already simple and correctly wound, because a crossing or inverted
+    // ring has no inside for the question to be about.
+    if (!out.self_intersecting && !out.inverted) {
+        for (const ArmRef& arm : arms) {
+            if (!ring_contains(out.ring, arm.origin)) {
+                out.excludes_origin = true;
+                break;
+            }
+        }
+    }
+
     if (out.self_intersecting) {
         spdlog::warn("build_junction_polygon: junction ring with {} arms and {} vertices "
                      "crosses itself; the fill falls back to its convex hull and the terrain "
@@ -941,6 +977,11 @@ JunctionPolygon build_junction_polygon(const std::vector<ArmRef>& arms,
         spdlog::warn("build_junction_polygon: junction ring with {} arms and {} vertices is "
                      "clockwise; the fill falls back to its convex hull and the terrain carve "
                      "must not use it as a winding test",
+                     arm_count, out.ring.size());
+    } else if (out.excludes_origin) {
+        spdlog::warn("build_junction_polygon: junction ring with {} arms and {} vertices does "
+                     "not contain the point one of its arms leaves from; the fill falls back to "
+                     "its convex hull and the terrain carve must not use it as a winding test",
                      arm_count, out.ring.size());
     }
 

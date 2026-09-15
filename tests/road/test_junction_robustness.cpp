@@ -1128,3 +1128,90 @@ TEST(JunctionRobustness, a_dual_carriageway_crossing_still_merges_as_one) {
     CHECK_EQ(emitting, size_t{1});
     CHECK_EQ(arms_on_primary, size_t{8});
 }
+
+/**
+ * @brief A ring that excludes the point its own arms leave from is refused
+ *
+ * A junction polygon is the ground where the arms MEET, so a ring that does not
+ * contain the point they leave from is not that ground. The fill sits off to one
+ * side of the roads it is supposed to join, and -- the reason this matters more
+ * than it looks -- the terrain carve uses the ring as a winding test, so the
+ * ground under the meeting point is flattened by nothing.
+ *
+ * `self_intersecting` cannot see it, because the ring really is simple, and
+ * `inverted` cannot either, because it is wound correctly. Without its own flag
+ * the polygon was handed on as a usable outline.
+ *
+ * ### Where it comes from
+ *
+ * The trims. TrimConfig::max_trim_fraction cuts a demand back on a short edge, so
+ * the mouths come to rest closer in than the junction's own shape asks for, and
+ * with most of the arms clamped the ring can pass on the wrong side of the node.
+ * A Lucan extract had nine, one of them with two arms trimmed to 0.25 m and
+ * 0.00 m -- both mouths standing on the node itself. A different one had no
+ * clamped arm at all: a 14 m carriageway trimmed 3.8 m meeting two 3.5 m roads
+ * trimmed 9.7 and 9.2 m pulls the ring up and away, and the node finishes 0.29 m
+ * outside its own fill. No trim repairs either; the edges really are shorter than
+ * the junction is wide.
+ *
+ * The arms are built here rather than solved, for the reason
+ * a_corner_point_a_kilometre_away_is_not_a_corner gives: the flag is a pure
+ * function of the arms and their cut cross-sections, and stating the shape
+ * directly says what is being tested. This is an ordinary symmetric three-way
+ * whose cut faces have been moved bodily 8 m north of the point its arms leave
+ * from -- simple, counter-clockwise, and nowhere near its own node.
+ */
+TEST(JunctionRobustness, a_ring_that_excludes_its_own_node_is_refused) {
+    const glm::dvec2 away(0.0, 8.0);   // how far the faces sit from the origin
+    const double reach = 5.0;          // trim
+    const double half = 2.0;           // carriageway half-width
+
+    Solved s;
+    s.label = "a fill beside its own junction";
+    s.node = glm::dvec2(0.0);
+
+    for (const double degrees : { -120.0, 0.0, 120.0 }) {
+        const double bearing = degrees * 3.14159265358979 / 180.0;
+        const glm::dvec2 dir(std::cos(bearing), std::sin(bearing));
+        const glm::dvec2 left_normal(-dir.y, dir.x);
+        const glm::dvec2 centre = away + dir * reach;
+
+        ArmRef arm;
+        arm.edge = static_cast<EdgeId>(s.arms.size());
+        arm.at_start = true;
+        arm.bearing = bearing;
+        arm.origin = s.node;            // every arm leaves the origin
+        arm.carriageway_half = half;
+        arm.half_width = half;
+        arm.trim = reach;
+        s.arms.push_back(arm);
+
+        ArmEnd end;
+        end.direction = dir;
+        end.carriage_left = centre + left_normal * half;
+        end.carriage_right = centre - left_normal * half;
+        end.left = end.carriage_left;
+        end.right = end.carriage_right;
+        end.center = centre;
+        end.arclength = reach;
+        end.valid = true;
+        s.ends.push_back(end);
+    }
+
+    s.poly = build_junction_polygon(s.arms, s.ends, FilletConfig{});
+    s.solved = true;
+    CHECK_TRUE(s.poly.valid);
+    if (!s.poly.valid) return;
+
+    // Simple and correctly wound, which is exactly why neither of the other two
+    // flags reports it.
+    CHECK_TRUE(jt::ring_is_simple(s.poly.ring));
+    CHECK_FALSE(s.poly.self_intersecting);
+    CHECK_FALSE(s.poly.inverted);
+    CHECK_TRUE(jt::signed_area(s.poly.ring) > 0.0);
+
+    // The node really is outside, and the polygon says so.
+    CHECK_FALSE(jt::point_in_ring(s.poly.ring, s.node));
+    CHECK_TRUE(s.poly.excludes_origin);
+    CHECK_TRUE(s.poly.needs_hull_fallback());
+}

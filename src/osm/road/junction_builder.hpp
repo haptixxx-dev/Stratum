@@ -448,7 +448,18 @@ public:
         size_t merged_into_neighbour = 0;
 
         /// Junction polygons whose ring crossed itself and were filled as a convex hull
-        size_t self_intersecting = 0;  ///< Rings that needed the hull fallback: crossing OR clockwise
+        /**
+         * @brief Rings that needed the hull fallback
+         *
+         * Every reason JunctionPolygon::needs_hull_fallback() gives, not only the
+         * one this field is named after: a ring that crosses itself, one wound
+         * clockwise, and one that does not contain the point its own arms leave
+         * from. The name is kept because it is what an operator greps for and
+         * what the log line says; the count has always been "rings the fill could
+         * not use", and a fill thrown over a hull is the same artefact whichever
+         * of the three produced it.
+         */
+        size_t self_intersecting = 0;
 
         /**
          * @brief Edges where TrimConfig::max_trim_fraction bound the demanded trim
