@@ -104,9 +104,15 @@ and watch lot identity survive. Golden tests on block and lot counts.
 
 ## M4 — v0.6.0 · Rule engine
 
-Answer **Q1** before starting. Recommendation on the evidence: a CGA-like text
-DSL first, with a node graph layered over it later — which is exactly what Esri
-converged on, since the Visual CGA Editor compiles to CGA rule files.
+**Q1 and Q3 are both decided: a purpose-built text language, and no `.cga`
+import.** The language is ours to design, which is freedom and risk in equal
+measure.
+
+Use section 8 of `cityengine_feature_inventory.md` as a coverage checklist while
+designing — it is the most complete public account of what a shape grammar must
+express, and anything on it that Stratum cannot say is a gap worth noticing
+early. Measure against the capabilities, not the syntax. Where CGA is awkward,
+that is an opportunity rather than a specification.
 
 | ID | Work |
 |---|---|
@@ -206,15 +212,45 @@ Carried from the inventory, unchanged: ArcGIS and geodatabase integration, i3s
 and Scene Layer Packages, web-scene publishing, CityEngine VR, 3VR export, and
 Esri ecosystem lock-in generally. These are GIS deliverables, not game assets.
 
-## Open questions
+## Decisions
 
-Tracked as GitHub issues, restated here because they gate milestones:
+All four open questions were answered on 2026-09-15. They are closed on the
+tracker as #12 to #15; the consequences are recorded here because they change
+what several milestones contain.
 
-- **Q1 — rule language.** Gates M4. Recommendation: text DSL first, node graph
-  over it later.
-- **Q2 — does `stratum_core` stay SDL-free and GPU-free?** Facade texturing and
-  atlasing want image work in core. Gates M5 and M6.
-- **Q3 — is CityEngine `.cga` rule import a goal?** Large adoption lever, large
-  constraint on Q1. Gates M4.
-- **Q4 — FBX or glTF only?** FBX pulls assimp into an export path that is
-  currently clean, testable and headless. Gates M8.
+**Q1 (#12) — the rule language is a purpose-built text language.** Rules are
+files: diffable, reviewable, greppable, deterministic, and fast at city scale. A
+node graph can be layered over it later without redoing the engine, which is
+what Esri did — the Visual CGA Editor compiles to CGA rule files over the same
+language.
+
+**Q3 (#14) — Stratum will NOT read CityEngine `.cga` files.** The language is
+ours to design.
+
+Importing `.cga` means conforming to `.cga`, and conforming makes CGA's limits
+our ceiling: every extension has to be expressible alongside CGA semantics
+rather than instead of them, and the awkward parts become permanent. The point
+of building this is to go past CityEngine, not to reimplement it faithfully.
+
+What that costs, stated plainly: a studio with existing CityEngine rule packs
+cannot bring them over, and that was the strongest single adoption argument we
+had.
+
+Section 8 of `cityengine_feature_inventory.md` is therefore a **coverage
+checklist**, not a conformance target. Its ~90 operations and ~130 functions are
+the best available account of what a shape grammar has to be able to express,
+and Stratum's language should be measured against that capability list — without
+copying its syntax, and without inheriting its mistakes.
+
+**Q2 (#13) — `stratum_core` may read and write images.** A CPU-only image
+library goes into core so that D8 (texturing operations) and F3 (atlas packing)
+work headlessly. Without it a scripted overnight run produces untextured
+buildings, which undercuts J3 and J4 — the two things CityEngine structurally
+cannot offer. The SDL, ImGui and renderer exclusions are unchanged; this is a
+narrow exception for pixel data.
+
+**Q4 (#15) — FBX ships alongside glTF.** Parity requires it and most game
+artists still expect it. The exporter must keep the FBX writer behind an
+interface so the glTF and OBJ paths stay independently testable, and the suite
+must keep running with no FBX library present. glTF stays primary: FBX cannot
+carry PBR material data, as Esri's own documentation concedes.

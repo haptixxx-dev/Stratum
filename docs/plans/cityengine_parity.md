@@ -202,26 +202,23 @@ Parity is a multi-year scope for one developer. Order matters more than the list
 7. **Pipeline (H1–H3, H7, H9, J1–J3).**
 8. **Long tail (I, G4, G5, D9, H4–H6, J4).**
 
-## Open questions
+## Decisions
 
-- **Q1 — What is the rule language?** Three options: (a) implement a CGA-like
-  DSL, best parity and best determinism, largest cost; (b) embed Python via the
-  existing pybind11 dependency, cheapest to reach, worst performance at city
-  scale and hard to make deterministic; (c) a node graph, best UX for game
-  artists, worst for version control and for porting CE rules. This decision
-  gates all of Track D and cannot be deferred past step 3.
-  **Note:** (a) and (c) are not exclusive. Esri ships both — the Visual CGA
-  Editor is a node graph that compiles to CGA rule files over the same language.
-  Text DSL first, node graph over it later, is the converged answer.
-- **Q2 — Does `stratum_core` stay SDL-free and GPU-free?** Facade texturing
-  (D8) and atlasing (F3) want image work in core. Either add a CPU-only image
-  library to core or keep texturing editor-side and accept that headless export
-  cannot texture.
-- **Q3 — Is CE rule-file import a goal?** Reading `.cga` would be a large
-  adoption lever and a large constraint on Q1.
-- **Q4 — FBX or not?** Parity says yes. Game pipelines increasingly say glTF is
-  enough. FBX pulls assimp (or the FBX SDK) into an export path that is
-  currently clean, testable and headless.
+Answered 2026-09-15; closed on the tracker as #12 to #15. Full reasoning is in
+`docs/plans/milestones.md`.
+
+- **Q1 — rule language: a purpose-built text language.** Node graph later, over
+  the same language, as Esri did.
+- **Q3 — no, do not read CityEngine `.cga`.** Conforming to CGA would make its
+  limits our ceiling. Section 8 of the inventory is a coverage checklist —
+  measure the language against those capabilities, not against that syntax. The
+  cost is that existing CityEngine rule packs cannot be brought over.
+- **Q2 — yes, `stratum_core` may read and write images.** A CPU-only image
+  library in core, so D8 and F3 work headlessly. SDL, ImGui and renderer stay
+  excluded.
+- **Q4 — yes, FBX ships alongside glTF.** Behind an interface, so the glTF and
+  OBJ paths stay independently testable and the suite runs without the FBX
+  library present.
 
 ## Non-goals
 
