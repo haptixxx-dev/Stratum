@@ -778,6 +778,25 @@ struct DracoPrimitiveMesh {
             continue;
         }
 
+        // Dropped HERE so the caller can count what it is about to encode.
+        //
+        // Draco's edgebreaker skips any face whose three indices are not all
+        // distinct, and reports num_encoded_faces() net of them. The writer takes
+        // that number as the index accessor count, so the .gltf stays internally
+        // consistent while holding fewer triangles than the range it was built
+        // from -- and ExportStats keeps reporting the input count, which is how
+        // the conservation invariant this file documents quietly stopped being
+        // true of what is on disk. mesh_optimize.cpp tolerates triangles that
+        // are "already degenerate on the way in", so this is reachable geometry,
+        // not a hypothetical.
+        //
+        // A degenerate triangle has no area and no surface, so dropping it costs
+        // nothing. Dropping it where the count is still visible costs nothing
+        // either, and it lets the encode be checked against a known number.
+        if (corner[0] == corner[1] || corner[1] == corner[2] || corner[0] == corner[2]) {
+            continue;
+        }
+
         for (const uint32_t src : corner) {
             const auto [it, inserted] =
                 remap.emplace(src, static_cast<uint32_t>(out.source.size()));
@@ -840,6 +859,8 @@ struct DracoPrimitiveMesh {
         for (size_t v = 0; v < point_count; ++v) {
             const Vertex& vertex = mesh.vertices[compact.source[v]];
             float value[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            // Filled below, then scrubbed before it reaches the quantiser. See
+            // the note after the switch.
             switch (spec.type) {
                 case draco::GeometryAttribute::POSITION:
                     value[0] = vertex.position.x;
@@ -872,6 +893,34 @@ struct DracoPrimitiveMesh {
                     value[3] = vertex.tangent.w < 0.0f ? -1.0f : 1.0f;
                     break;
             }
+            // A single NaN or Inf anywhere in a chunk used to delete the whole
+            // chunk file.
+            //
+            // AttributeQuantizationTransform::ComputeParameters refuses any
+            // non-finite value, SequentialQuantizationAttributeEncoder::Init then
+            // fails, and the MESH_SEQUENTIAL fallback quantises the same
+            // attributes and fails identically -- so the fallback does not cover
+            // this class at all. The chunk contributed no .gltf, no .bin and no
+            // entry in written_files, while ExportStats still counted its
+            // triangles.
+            //
+            // Nothing upstream catches it either: accumulate_mesh() rejects a
+            // triangle only when its CENTROID is non-finite, so a NaN in uv,
+            // colour or tangent passes through untouched.
+            //
+            // Scrub per component. One bad vertex should cost one vertex.
+            for (int c = 0; c < spec.components; ++c) {
+                if (!std::isfinite(value[c])) {
+                    value[c] = 0.0f;
+                }
+            }
+            // A zero normal is not a normal. Nothing else has a meaningful
+            // identity to fall back on, but this one does.
+            if (spec.type == draco::GeometryAttribute::NORMAL
+                && value[0] == 0.0f && value[1] == 0.0f && value[2] == 0.0f) {
+                value[1] = 1.0f;
+            }
+
             attribute->SetAttributeValue(
                 draco::AttributeValueIndex(static_cast<uint32_t>(v)), value);
         }
@@ -1012,6 +1061,19 @@ struct DracoPrimitiveMesh {
         if (!encode_draco_mesh(draco_mesh, cfg.draco, encoded, encoded_points, encoded_faces)) {
             return false;
         }
+        // compact_range() already dropped the faces the edgebreaker would have
+        // skipped, so the encoder has no licence to return fewer than it was
+        // given. If it does, the index accessor written below describes a
+        // different triangle set from the one this chunk was built from, and
+        // that divergence is invisible in the file itself -- the .gltf stays
+        // internally consistent either way. Say so loudly rather than ship it.
+        const size_t offered_faces = compact.indices.size() / 3u;
+        if (encoded_faces != offered_faces) {
+            spdlog::warn("export: draco encoded {} of {} triangles for {}. The written "
+                         "primitive describes fewer triangles than the range it came from.",
+                         encoded_faces, offered_faces, object_name);
+        }
+
         if (encoded.size() == 0u || encoded_faces == 0u || encoded_points == 0u) {
             spdlog::error("export: draco produced an empty primitive for {}", object_name);
             return false;
