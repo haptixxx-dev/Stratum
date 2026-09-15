@@ -751,3 +751,69 @@ TEST(RoadExportDraco, the_flag_is_ignored_for_obj) {
     CHECK_TRUE(obj.ok);
     CHECK_TRUE(p7::valid_face_count(obj) > 0u);
 }
+
+// ============================================================================
+// Input the encoder used to lose, or choke on
+// ============================================================================
+//
+// Both of these come out of the review of the original H8 implementation, and
+// both were reachable from geometry the pipeline really produces. Neither was
+// visible in the written file: a .gltf that has silently lost triangles is
+// still a valid .gltf, and a chunk that was never written is just absent.
+
+// mesh_optimize.cpp tolerates triangles that are "already degenerate on the way
+// in", so a collapsed triangle reaches the exporter. Draco's edgebreaker skips
+// any face whose three indices are not all distinct and reports
+// num_encoded_faces() net of them, which the writer then used as the index
+// accessor count -- internally consistent, quietly short. compact_range() now
+// drops them before the encoder sees them, so the count is knowable up front
+// and is checked against what comes back.
+TEST(RoadExportDraco, a_collapsed_triangle_does_not_silently_shrink_the_primitive) {
+    Mesh mesh = p7::make_slab_mesh(4, 8);
+    const size_t before = mesh.indices.size() / 3u;
+
+    // Collapse one triangle in place: same vertex three times. Its area is zero,
+    // so no surface is lost, but the face count changes.
+    mesh.indices[3] = mesh.indices[4] = mesh.indices[5];
+
+    const std::filesystem::path path = write_slab("draco_degenerate", mesh, true);
+    CHECK_FALSE(path.empty());
+
+    // Exactly one triangle fewer than the input, and the file agrees with itself.
+    const size_t decoded = decoded_triangles(path);
+    CHECK_EQ(decoded, before - 1u);
+}
+
+// accumulate_mesh() rejects a triangle only when its CENTROID is non-finite, so
+// a NaN in uv, colour or tangent sails through. Draco's quantiser refuses any
+// non-finite value, the MESH_SEQUENTIAL fallback quantises the same attributes
+// and fails identically, and the whole chunk used to vanish -- no .gltf, no
+// .bin, no entry in written_files, while ExportStats still counted its
+// triangles. One bad vertex should cost one vertex.
+TEST(RoadExportDraco, a_non_finite_attribute_costs_a_vertex_not_the_whole_chunk) {
+    Mesh mesh = p7::make_slab_mesh(4, 8);
+    const size_t before = mesh.indices.size() / 3u;
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    mesh.vertices[0].tangent.x = nan;
+    mesh.vertices[1].uv.y = nan;
+    mesh.vertices[2].color.g = std::numeric_limits<float>::infinity();
+
+    const std::filesystem::path path = write_slab("draco_non_finite", mesh, true);
+
+    CHECK_FALSE(path.empty());
+    CHECK_TRUE(std::filesystem::exists(path));
+    CHECK_EQ(decoded_triangles(path), before);
+}
+
+// The scrub must not fire on geometry that is merely unusual. A zero-length
+// normal is replaced with +Y because nothing else has an identity to fall back
+// on; a legitimate normal must survive untouched, and so must the triangle
+// count around it.
+TEST(RoadExportDraco, ordinary_geometry_is_unaffected_by_the_scrub) {
+    const Mesh mesh = p7::make_slab_mesh(4, 8);
+
+    const std::filesystem::path path = write_slab("draco_clean", mesh, true);
+    CHECK_FALSE(path.empty());
+    CHECK_EQ(decoded_triangles(path), mesh.indices.size() / 3u);
+}

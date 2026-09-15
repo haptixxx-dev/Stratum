@@ -869,6 +869,26 @@ constexpr float kOverlayRoadLift = 0.5f;
 /// up at any camera distance, which is the point of using it over real geometry.
 constexpr float kOverlayLineWidth = 2.0f;
 
+/// How far a building ring is pushed clear of the wall it sits on, in metres.
+///
+/// A lift alone does not save these two rings, because neither of them is
+/// z-fighting the GROUND. build_building_mesh() extrudes the walls from the very
+/// same footprint polygon, so the footprint ring lies exactly IN the wall plane
+/// and the roof ring lies exactly ON the wall's top edge. The Im3d pipeline sets
+/// enable_depth_bias = false and compares with GREATER, and Im3D_Render() runs
+/// after the meshes have written depth, so a line fragment at a depth equal to
+/// the wall's is discarded outright. The visible symptom is that every near-face
+/// edge of a building drops out or flickers while the silhouette survives, the
+/// silhouette being the only part where Im3d's 2 px screen-space expansion
+/// spills past the mesh.
+///
+/// So the rings are moved out of the surface instead: the footprint ring outward
+/// along the ring's own normal, the roof ring straight up off the eaves.
+constexpr float kOverlayWallClearance = 0.08f;
+
+/// Extra lift for the roof ring, in metres, above building.height.
+constexpr float kOverlayRoofClearance = 0.15f;
+
 /// 2D local metres to Y-up world space.
 ///
 /// The Z flip is the whole convention and it is duplicated from
@@ -896,24 +916,78 @@ size_t overlay_ring_span(const std::vector<glm::dvec2>& ring) {
 }
 
 /// One closed outline at a fixed height.
-void draw_overlay_ring(const std::vector<glm::dvec2>& ring, float y, Im3d::Color colour) {
+///
+/// `inflate` pushes each vertex along the ring's outward normal, which is what
+/// keeps a building ring out of the wall plane it would otherwise share. Zero
+/// for anything that is not coplanar with a vertical surface -- an area polygon
+/// has no walls, so inflating it would just misreport its extent.
+void draw_overlay_ring(const std::vector<glm::dvec2>& ring, float y, Im3d::Color colour,
+                       double inflate = 0.0) {
     const size_t n = overlay_ring_span(ring);
     if (n < 3) return;
 
+    // Winding decides which side "outward" is on. The shoelace sign is the only
+    // thing that knows, and an OSM outer ring is not reliably counter-clockwise.
+    double area2 = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const glm::dvec2& a = ring[i];
+        const glm::dvec2& b = ring[(i + 1) % n];
+        area2 += a.x * b.y - b.x * a.y;
+    }
+    const double sign = area2 < 0.0 ? -1.0 : 1.0;
+
     Im3d::BeginLineLoop();
     for (size_t i = 0; i < n; ++i) {
-        Im3d::Vertex(overlay_point(ring[i], y), colour);
+        glm::dvec2 p = ring[i];
+
+        if (inflate != 0.0) {
+            // Bisector of the two edge normals at this vertex. Normalising each
+            // edge first keeps a long edge from dominating a short one, which is
+            // what makes a corner of a thin building bulge.
+            const glm::dvec2& prev = ring[(i + n - 1) % n];
+            const glm::dvec2& next = ring[(i + 1) % n];
+            const glm::dvec2 e0 = p - prev;
+            const glm::dvec2 e1 = next - p;
+
+            glm::dvec2 bisector(0.0);
+            if (glm::length(e0) > 1e-9) {
+                const glm::dvec2 u = glm::normalize(e0);
+                bisector += glm::dvec2(u.y, -u.x);
+            }
+            if (glm::length(e1) > 1e-9) {
+                const glm::dvec2 u = glm::normalize(e1);
+                bisector += glm::dvec2(u.y, -u.x);
+            }
+            if (glm::length(bisector) > 1e-9) {
+                p += glm::normalize(bisector) * inflate * sign;
+            }
+        }
+
+        Im3d::Vertex(overlay_point(p, y), colour);
     }
     Im3d::End();
 }
 
-/// One open polyline at a fixed height.
-void draw_overlay_strip(const std::vector<glm::dvec2>& points, float y, Im3d::Color colour) {
+/// One open polyline, lifted by `y` above the surface `sampler` reports.
+///
+/// The sampler is not optional decoration. Road geometry is DRAPED: whenever
+/// terrain exists, make_road_network_config() hands the solver a height sampler
+/// and RoadElevationSolver lifts every piece onto the surface. Road::polyline is
+/// the raw 2D input and carries no elevation at all, so drawing it at a constant
+/// world Y puts the whole overlay tens of metres under the hills -- and Im3d
+/// depth-tests, so it is not merely wrong, it is invisible. The panel then reads
+/// "Showing 4312" over an empty viewport, which is exactly the "everything is
+/// unclassified" misreading this mode exists to prevent.
+///
+/// A null sampler means no terrain, in which case a flat lift is correct.
+void draw_overlay_strip(const std::vector<glm::dvec2>& points, float y, Im3d::Color colour,
+                        const osm::road::HeightSampler& sampler) {
     if (points.size() < 2) return;
 
     Im3d::BeginLineStrip();
     for (const glm::dvec2& p : points) {
-        Im3d::Vertex(overlay_point(p, y), colour);
+        const float base = sampler ? sampler(p.x, p.y) : 0.0f;
+        Im3d::Vertex(overlay_point(p, base + y), colour);
     }
     Im3d::End();
 }
@@ -1101,6 +1175,13 @@ void Editor::draw_attribute_overlay() {
     std::sort(visible.begin(), visible.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
 
+    // The SAME sampler the road solve was given, built once for the whole pass
+    // rather than per road: make_terrain_height_sampler() constructs a
+    // TerrainGenerator, and doing that a few thousand times a frame would cost
+    // more than the overlay itself. Null when there is no terrain, which the
+    // strip drawer reads as a flat world.
+    const osm::road::HeightSampler overlay_height = make_terrain_height_sampler();
+
     Im3d::PushDrawState();
     Im3d::SetSize(kOverlayLineWidth);
 
@@ -1123,8 +1204,11 @@ void Editor::draw_attribute_overlay() {
                     // free of its own footprint at street level on anything taller
                     // than a house, and the footprint ring alone is invisible from
                     // above once the roof covers it.
-                    draw_overlay_ring(building.footprint, kOverlayGroundLift, colour);
-                    draw_overlay_ring(building.footprint, building.height, colour);
+                    draw_overlay_ring(building.footprint, kOverlayGroundLift, colour,
+                                      kOverlayWallClearance);
+                    draw_overlay_ring(building.footprint,
+                                      building.height + kOverlayRoofClearance, colour,
+                                      kOverlayWallClearance);
                     ++m_attribute_features_drawn;
                 }
                 break;
@@ -1135,7 +1219,8 @@ void Editor::draw_attribute_overlay() {
                     if (m_attribute_features_drawn >= kAttributeOverlayBudget) continue;
 
                     draw_overlay_strip(road.polyline, kOverlayRoadLift,
-                                       overlay_colour(osm::road_type_colour(road.type)));
+                                       overlay_colour(osm::road_type_colour(road.type)),
+                                       overlay_height);
                     ++m_attribute_features_drawn;
                 }
                 break;
