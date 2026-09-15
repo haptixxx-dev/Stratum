@@ -96,12 +96,14 @@ set(STRATUM_TEST_SOURCES
 
     # The scene model.
     scene/test_command_stack.cpp
+    scene/test_layer.cpp
 )
 
 # Suite names registered with ctest so each can be run and reported separately.
 set(STRATUM_TEST_SUITES
     AmbientOcclusion
     CommandStack
+    SceneLayer
     WaySemantics
     RoadGraph
     Centerline
