@@ -406,56 +406,6 @@ constexpr double kHalfPi = 1.57079632679489661923;
  * @return The cluster in ascending GraphNodeId order, always containing @p node.
  *         Just @p node when nothing is near it or the component is too large.
  */
-[[nodiscard]] std::vector<GraphNodeId> coincident_cluster(const RoadGraph& graph,
-                                                          GraphNodeId node,
-                                                          double radius) {
-    std::vector<GraphNodeId> cluster{ node };
-    if (!(radius > 0.0) || !std::isfinite(radius)) return cluster;
-
-    // Breadth-first over the stub edges. `cluster` doubles as the visited set and
-    // as the queue; it is kept sorted so membership is a binary search and the
-    // output order is canonical.
-    for (size_t head = 0; head < cluster.size(); ++head) {
-        const GraphNode& n = graph.node(cluster[head]);
-        for (const Arm& a : n.arms) {
-            if (a.edge == kInvalidId || a.edge >= graph.edges().size()) continue;
-
-            const GraphEdge& e = graph.edge(a.edge);
-            const GraphNodeId far = a.at_start ? e.to : e.from;
-            if (far == kInvalidId || far >= graph.nodes().size()) continue;
-            if (far == cluster[head]) continue;              // a closed loop
-            if (graph.node(far).arms.size() < 3) continue;   // not a junction
-            if (!(e.length() < radius)) continue;            // a real approach
-
-            const auto at = std::lower_bound(cluster.begin(), cluster.end(), far);
-            if (at != cluster.end() && *at == far) continue; // already in
-            if (cluster.size() >= kMaxClusterNodes) {
-                return { node };                             // too tangled to merge
-            }
-            cluster.insert(at, far);
-        }
-    }
-
-    return cluster;
-}
-
-/// True when @p edge holds a cluster together: short, and both ends inside it
-[[nodiscard]] bool is_internal_stub(const RoadGraph& graph,
-                                    const std::vector<GraphNodeId>& cluster,
-                                    EdgeId edge,
-                                    double radius) {
-    if (cluster.size() < 2 || edge == kInvalidId || edge >= graph.edges().size()) return false;
-
-    const GraphEdge& e = graph.edge(edge);
-    if (!(e.length() < radius)) return false;
-
-    const auto holds = [&cluster](GraphNodeId id) {
-        const auto at = std::lower_bound(cluster.begin(), cluster.end(), id);
-        return at != cluster.end() && *at == id;
-    };
-    return holds(e.from) && holds(e.to);
-}
-
 /// Fill an ArmRef's widths from the arm's own profile; the outputs are left alone
 void fill_widths(const std::vector<RoadProfile>& profiles, ArmRef& ref) {
     // An arm with no usable profile still takes its place in the cycle, at zero
@@ -468,6 +418,134 @@ void fill_widths(const std::vector<RoadProfile>& profiles, ArmRef& ref) {
             ref.carriageway_half = carriageway_half_extent(p);
         }
     }
+}
+
+/**
+ * @brief How far a junction at @p node reaches out along its arms, in metres
+ *
+ * The widest carriageway half-width of any arm. It is the right measure because
+ * it is what the trim solve demands: an arm is cut back by roughly the distance
+ * at which the neighbouring arm's near edge clears it, which scales with that
+ * neighbour's half-width.
+ */
+[[nodiscard]] double junction_radius(const RoadGraph& graph,
+                                     const std::vector<RoadProfile>& profiles,
+                                     GraphNodeId node) {
+    if (node == kInvalidId || node >= graph.nodes().size()) return 0.0;
+
+    double widest = 0.0;
+    for (const Arm& a : graph.node(node).arms) {
+        ArmRef ref;
+        ref.edge = a.edge;
+        fill_widths(profiles, ref);
+        widest = std::max(widest, ref.carriageway_half);
+    }
+    return widest;
+}
+
+/**
+ * @brief The length below which @p e is an INTERNAL stub rather than an approach
+ *
+ * WIDTH-SCALED, not a constant, and that is the whole point. The threshold used
+ * to be a flat 1 metre, sized for the duplicate-node defect it was written for:
+ * two mappers tracing one crossroads, a way split twice at what was meant to be
+ * one point. It cannot describe a COMPOUND intersection.
+ *
+ * Where a dual carriageway crosses another, OSM leaves four junction nodes in a
+ * rectangle 10 to 20 metres across. Each solved its own polygon and its own kerb
+ * ring on the same patch of ground, and the edges between them were far too short
+ * to absorb the trims all four demanded -- on a Lucan extract that clamped 7505 of
+ * 24906 edges, which TrimConfig::max_trim_fraction defines as the junction polygon
+ * overlapping that ribbon. Four overlapping polygons is what a big intersection
+ * came out as.
+ *
+ * The sum of the two junctions' radii is the honest criterion: it is exactly the
+ * condition under which their two polygons would overlap anyway, so it merges
+ * precisely the pairs that cannot be kept apart. It also needs no tuning per city.
+ * A dual carriageway junction (radius ~12 m each) absorbs a 20 metre internal
+ * link; two residential junctions a block apart (radius ~4 m each, 80 metres of
+ * street between them) come nowhere near, which is what
+ * JunctionRobustness.junctions_a_block_apart_are_not_merged pins.
+ *
+ * @param floor Lower bound, so the original coincident-node behaviour survives
+ *              where profiles are missing or degenerate and every radius is 0.
+ */
+[[nodiscard]] double stub_threshold(const RoadGraph& graph,
+                                    const std::vector<RoadProfile>& profiles,
+                                    const GraphEdge& e, double floor) {
+    const double reach = junction_radius(graph, profiles, e.from) +
+                         junction_radius(graph, profiles, e.to);
+    return std::max(floor, reach);
+}
+
+[[nodiscard]] std::vector<GraphNodeId> coincident_cluster(const RoadGraph& graph,
+                                                          const std::vector<RoadProfile>& profiles,
+                                                          GraphNodeId node,
+                                                          double radius) {
+    std::vector<GraphNodeId> cluster{ node };
+    if (!(radius > 0.0) || !std::isfinite(radius)) return cluster;
+
+    // Breadth-first over the stub edges, over TWO containers with one job each.
+    //
+    // `pending` is the queue and is only ever appended to, so an index into it
+    // stays pointing at the same node. `cluster` is the visited set and is kept
+    // sorted, so membership is a binary search and the output order is canonical.
+    //
+    // They were a single vector, indexed as a queue and sorted-inserted into as a
+    // set. A node whose id sorted BEFORE the read index shifted the entry under
+    // that index up by one: the walk then read the previous node a second time
+    // and never read the inserted one. The flood therefore only ever ran towards
+    // a higher GraphNodeId, and the component it returned depended on which
+    // member it started from -- the one thing this function promises it does not.
+    std::vector<GraphNodeId> pending{ node };
+
+    for (size_t head = 0; head < pending.size(); ++head) {
+        const GraphNodeId current = pending[head];
+        for (const Arm& a : graph.node(current).arms) {
+            if (a.edge == kInvalidId || a.edge >= graph.edges().size()) continue;
+
+            const GraphEdge& e = graph.edge(a.edge);
+            const GraphNodeId far = a.at_start ? e.to : e.from;
+            if (far == kInvalidId || far >= graph.nodes().size()) continue;
+            if (far == current) continue;                    // a closed loop
+            if (graph.node(far).arms.size() < 3) continue;   // not a junction
+            if (!(e.length() < stub_threshold(graph, profiles, e, radius))) {
+                continue;                                    // a real approach
+            }
+
+            const auto at = std::lower_bound(cluster.begin(), cluster.end(), far);
+            if (at != cluster.end() && *at == far) continue; // already in
+            if (cluster.size() >= kMaxClusterNodes) {
+                return { node };                             // too tangled to merge
+            }
+            cluster.insert(at, far);
+            pending.push_back(far);
+        }
+    }
+
+    return cluster;
+}
+
+/// True when @p edge holds a cluster together: short, and both ends inside it
+[[nodiscard]] bool is_internal_stub(const RoadGraph& graph,
+                                    const std::vector<RoadProfile>& profiles,
+                                    const std::vector<GraphNodeId>& cluster,
+                                    EdgeId edge,
+                                    double radius) {
+    if (cluster.size() < 2 || edge == kInvalidId || edge >= graph.edges().size()) return false;
+
+    const GraphEdge& e = graph.edge(edge);
+    // The SAME threshold the cluster was grown with. An edge admitted as a stub by
+    // one rule and rejected as an approach by another would be dropped from the
+    // merged arm list and still extruded, leaving a ribbon running into the middle
+    // of the junction it was supposed to be swallowed by.
+    if (!(e.length() < stub_threshold(graph, profiles, e, radius))) return false;
+
+    const auto holds = [&cluster](GraphNodeId id) {
+        const auto at = std::lower_bound(cluster.begin(), cluster.end(), id);
+        return at != cluster.end() && *at == id;
+    };
+    return holds(e.from) && holds(e.to);
 }
 
 } // namespace
@@ -499,7 +577,7 @@ std::vector<ArmRef> collect_arms(const RoadGraph& graph,
     // its arms in the order the graph sorted them.
     // ------------------------------------------------------------------------
     if (n.arms.size() >= 3 && coincident_radius > 0.0) {
-        const std::vector<GraphNodeId> cluster = coincident_cluster(graph, node, coincident_radius);
+        const std::vector<GraphNodeId> cluster = coincident_cluster(graph, profiles, node, coincident_radius);
         if (out_cluster != nullptr) *out_cluster = cluster;
         if (cluster.size() > 1) {
             if (cluster.front() != node) {
@@ -515,13 +593,14 @@ std::vector<ArmRef> collect_arms(const RoadGraph& graph,
 
             for (GraphNodeId member : cluster) {
                 for (const Arm& a : graph.node(member).arms) {
-                    if (is_internal_stub(graph, cluster, a.edge, coincident_radius)) {
+                    if (is_internal_stub(graph, profiles, cluster, a.edge, coincident_radius)) {
                         continue;   // the stub that made them one junction
                     }
                     ArmRef ref;
                     ref.edge = a.edge;
                     ref.at_start = a.at_start;
                     ref.bearing = a.bearing;
+                    ref.origin = graph.node(member).position;
                     fill_widths(profiles, ref);
                     out.push_back(ref);
                 }
@@ -608,6 +687,7 @@ std::vector<ArmRef> collect_arms(const RoadGraph& graph,
         ref.edge = a.edge;
         ref.at_start = a.at_start;
         ref.bearing = a.bearing;
+        ref.origin = n.position;
         fill_widths(profiles, ref);
         out.push_back(ref);
     }
@@ -618,6 +698,21 @@ std::vector<ArmRef> collect_arms(const RoadGraph& graph,
 // ============================================================================
 // Solve
 // ============================================================================
+
+double arm_cluster_span(const std::vector<ArmRef>& arms) {
+    if (arms.size() < 2) return 0.0;
+
+    glm::dvec2 centre(0.0);
+    for (const ArmRef& a : arms) centre += a.origin;
+    centre /= static_cast<double>(arms.size());
+
+    double span = 0.0;
+    for (const ArmRef& a : arms) {
+        const double reach = glm::length(a.origin - centre);
+        if (std::isfinite(reach)) span = std::max(span, reach);
+    }
+    return span;
+}
 
 bool solve_arm_trims(const RoadGraph& graph,
                      const std::vector<Centerline>& centerlines,

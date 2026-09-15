@@ -338,12 +338,21 @@ TEST(JunctionRobustness, a_corner_point_a_kilometre_away_is_not_a_corner) {
  * means, but the fill is a polygon a curb ring and a terrain carve can use.
  */
 TEST(JunctionRobustness, over_trimmed_arms_still_produce_a_simple_ring) {
-    // Two T-junctions 3 m apart on one through road, each with its own side road.
-    // The through edge between them is 3 m; both junctions want 9.
+    // Two T-junctions 10 m apart on one through road, each with its own side road.
+    //
+    // The gap was 3 m, and 3 m is now a MERGE rather than an over-trim: two
+    // junctions of 3.5 m carriageway half-width standing 3 m apart are one
+    // compound intersection and collect_arms() swallows the stub between them.
+    // That is the better outcome for that geometry and it is covered by
+    // a_staggered_pair_closer_than_their_own_width_solves_as_one below.
+    //
+    // 10 m keeps THIS path alive: above the 7 m merge threshold (3.5 + 3.5) so
+    // the two stay separate, and still far short of what both ends demand, so the
+    // clamp fires, the cut faces cross, and the bowtie clip is exercised.
     const std::vector<Road> roads = {
-        jt::make_road(1, { 1, 10, 11, 2 }, { { -200.0, 0.0 }, { 0.0, 0.0 }, { 3.0, 0.0 }, { 200.0, 0.0 } }),
+        jt::make_road(1, { 1, 10, 11, 2 }, { { -200.0, 0.0 }, { 0.0, 0.0 }, { 10.0, 0.0 }, { 200.0, 0.0 } }),
         jt::make_road(2, { 3, 10 }, { { 0.0, -200.0 }, { 0.0, 0.0 } }),
-        jt::make_road(3, { 4, 11 }, { { 3.0, 200.0 }, { 3.0, 0.0 } }),
+        jt::make_road(3, { 4, 11 }, { { 10.0, 200.0 }, { 10.0, 0.0 } }),
     };
     const jt::Fixture fixture = jt::make_fixture(
         roads, { jt::lane_profile(2), jt::lane_profile(2), jt::lane_profile(2) });
@@ -790,4 +799,156 @@ TEST(JunctionRobustness, a_clockwise_ring_is_refused_like_a_crossing_one) {
     // If the fixtures stop producing an inverted ring the test has stopped
     // guarding anything, so say so rather than passing silently.
     CHECK_TRUE(saw_inverted);
+}
+
+/**
+ * @brief Two junctions closer together than their own width solve as ONE
+ *
+ * The staggered crossroads, the dual carriageway terminus, the service road
+ * stub -- and above all the ordinary case of one dual carriageway crossing
+ * another, which OSM leaves as four junction nodes in a rectangle 10 to 20 metres
+ * across.
+ *
+ * Each used to solve its own polygon and its own kerb ring on the same patch of
+ * ground, and the edges between them were far too short to absorb the trims all of
+ * them demanded. On a Lucan extract that clamped 7505 of 24906 edges, which
+ * TrimConfig::max_trim_fraction defines as the junction polygon overlapping that
+ * ribbon. The visible result was a big intersection rendered as several
+ * overlapping fills with fragments of kerb between them.
+ *
+ * The merge threshold is the SUM OF THE TWO JUNCTIONS' RADII rather than a
+ * constant, because that is exactly the condition under which their polygons would
+ * overlap: it merges the pairs that cannot be kept apart and needs no tuning per
+ * city. junctions_a_block_apart_are_not_merged is the other half of that contract.
+ */
+TEST(JunctionRobustness, a_staggered_pair_closer_than_their_own_width_solves_as_one) {
+    // The same shape the over-trim test used to carry: two T-junctions 3 m apart,
+    // each 3.5 m of carriageway half-width, so the threshold is 7 m and 3 m is
+    // comfortably inside it.
+    const std::vector<Road> roads = {
+        jt::make_road(1, { 1, 10, 11, 2 }, { { -200.0, 0.0 }, { 0.0, 0.0 }, { 3.0, 0.0 }, { 200.0, 0.0 } }),
+        jt::make_road(2, { 3, 10 }, { { 0.0, -200.0 }, { 0.0, 0.0 } }),
+        jt::make_road(3, { 4, 11 }, { { 3.0, 200.0 }, { 3.0, 0.0 } }),
+    };
+    const jt::Fixture fixture = jt::make_fixture(
+        roads, { jt::lane_profile(2), jt::lane_profile(2), jt::lane_profile(2) });
+
+    // Both nodes are still degree 3: merging is a solving decision, not a change
+    // to the graph.
+    size_t degree_three = 0;
+    for (const auto& node : fixture.graph.nodes()) {
+        if (node.degree() >= 3) ++degree_three;
+    }
+    CHECK_EQ(degree_three, size_t{2});
+
+    // Exactly ONE of them emits arms. The other is a non-primary cluster member
+    // and emits none, which is how collect_arms() reports "already solved as part
+    // of its neighbour".
+    size_t emitting = 0;
+    size_t arms_on_primary = 0;
+    for (size_t n = 0; n < fixture.graph.nodes().size(); ++n) {
+        if (fixture.graph.nodes()[n].degree() < 3) continue;
+
+        std::vector<ArmRef> arms;
+        std::vector<GraphNodeId> cluster;
+        arms = collect_arms(fixture.graph, fixture.profiles, static_cast<GraphNodeId>(n),
+                            stratum::osm::road::kCoincidentRadius, &cluster);
+
+        // Either way, both nodes agree on which of them is the primary.
+        CHECK_EQ(cluster.size(), size_t{2});
+
+        if (!arms.empty()) {
+            ++emitting;
+            arms_on_primary = arms.size();
+        }
+    }
+    CHECK_EQ(emitting, size_t{1});
+
+    // Four arms, not six: the two through-road halves and the two side roads. The
+    // 3 m stub that joined the pair is internal and is dropped, which is the whole
+    // point -- left in, it would be extruded as a ribbon running into the middle of
+    // the junction that swallowed it.
+    CHECK_EQ(arms_on_primary, size_t{4});
+}
+
+/**
+ * @brief A dual carriageway's two mouths overlap without ever crossing
+ *
+ * The shape is taken off a Lucan extract, node 1232, which is what one of these
+ * actually looks like: two junction nodes 2.9 m apart on a short link, each
+ * carrying an eastbound and a westbound arm and one arm of its own. The width
+ * rule merges them -- 1.5 m of carriageway half-width each puts the threshold at
+ * 3.0 m -- so one junction is solved with six arms leaving from two points.
+ *
+ * The bearings are the extract's, not idealised: the two eastbound arms leave at
+ * 7.0 and 5.6 degrees, not both at zero. Exactly parallel mouths are collinear
+ * and the existing crossing clip catches them; 1.4 degrees apart is what real
+ * data contains and what slips through it.
+ *
+ * ### The failure this pins
+ *
+ * The two eastbound mouths leave on the SAME bearing from origins 3 m apart, and
+ * each is 3.5 m wide, so they overlap laterally by half a metre. They do not
+ * CROSS: they are parallel and very nearly collinear, one simply lies along the
+ * other. build_junction_polygon() clips adjacent cut faces that cross, which is
+ * the common over-trimmed corner, and that clip correctly found nothing here.
+ *
+ * With nothing clipped, the ring walked out along the southern mouth's left
+ * corner and back to the northern mouth's right corner, which lies BEHIND it --
+ * a bowtie, so no fill, no kerb ring, and a convex hull thrown over the junction
+ * instead. The same pair on the westbound side does it again at the step that
+ * closes the ring, and that one reached five metres across the junction and back.
+ *
+ * On a Lucan extract these two were the largest remaining cause of a crossing
+ * ring on a merged junction: 33 of the 547 merged junctions came back as a hull
+ * fallback, and 16 do now. The lone junctions are untouched, 7 before and 6
+ * after, which is what says the repair reaches only the shape it was written
+ * for -- it is skipped outright when every arm leaves one node.
+ *
+ * @see JunctionRobustness.junctions_a_block_apart_are_not_merged for the other
+ *      half of the merge contract.
+ */
+TEST(JunctionRobustness, two_parallel_carriageways_merge_into_a_simple_ring) {
+    // Node 10 carries the southern carriageway, node 11 the northern, and the 3 m
+    // link between them is the internal stub the merge swallows.
+    const std::vector<Road> roads = {
+        jt::make_road(1, { 10, 11 }, { { 0.0, -1.45 }, { 0.0, 1.45 } }),
+        jt::make_road(2, { 10, 1 },  { { 0.0, -1.45 }, { 198.51, 22.92 } }),
+        jt::make_road(3, { 10, 2 },  { { 0.0, -1.45 }, { -199.65, -13.31 } }),
+        jt::make_road(4, { 10, 3 },  { { 0.0, -1.45 }, { 1.4, -201.45 } }),
+        jt::make_road(5, { 11, 4 },  { { 0.0, 1.45 }, { 199.05, 20.97 } }),
+        jt::make_road(6, { 11, 5 },  { { 0.0, 1.45 }, { -198.59, -22.23 } }),
+        jt::make_road(7, { 11, 6 },  { { 0.0, 1.45 }, { -3.14, 201.43 } }),
+    };
+    const jt::Fixture fixture = jt::make_fixture(
+        roads, { jt::lane_profile(1, 3.0), jt::lane_profile(1, 3.0), jt::lane_profile(1, 3.0),
+                 jt::lane_profile(1, 2.0), jt::lane_profile(1, 3.0), jt::lane_profile(1, 3.0),
+                 jt::lane_profile(1, 2.0) });
+
+    // The primary is whichever of the two has the lower GraphNodeId, and it is
+    // the one that carries the whole junction.
+    GraphNodeId primary = kInvalidId;
+    size_t emitting = 0;
+    for (size_t n = 0; n < fixture.graph.nodes().size(); ++n) {
+        if (fixture.graph.nodes()[n].degree() < 3) continue;
+        const std::vector<ArmRef> arms =
+            collect_arms(fixture.graph, fixture.profiles, static_cast<GraphNodeId>(n),
+                         stratum::osm::road::kCoincidentRadius);
+        if (arms.empty()) continue;
+        primary = static_cast<GraphNodeId>(n);
+        ++emitting;
+    }
+
+    // Merged, so exactly one of the two solves and it carries six arms: the two
+    // eastbound, the two westbound, the one south and the one north. The 3 m link
+    // is internal and is dropped.
+    CHECK_EQ(emitting, size_t{1});
+    CHECK_TRUE(primary != kInvalidId);
+    if (primary == kInvalidId) return;
+
+    const Solved s = solve("dual carriageway merged into one junction", fixture, primary);
+    CHECK_EQ(s.arms.size(), size_t{6});
+
+    // The whole invariant: a simple, counter-clockwise ring containing its node.
+    check_usable(s);
 }

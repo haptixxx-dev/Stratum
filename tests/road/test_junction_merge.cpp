@@ -122,6 +122,29 @@ ParsedOSMData two_nodes_one_junction() {
     return data;
 }
 
+/**
+ * @brief The same shape, but 3 m apart -- too far for the FLAT radius
+ *
+ * kCoincidentRadius is 1.0 m, so a 3 m stub is not a coincident-node defect and
+ * the flat rule leaves these two alone. They merge only under the width-scaled
+ * rule: both ways are 7 m wide, so each junction's radius is 3.5 m and the pair
+ * is merged when they stand closer than 7 m.
+ *
+ * This is the shape a compound intersection has -- one dual carriageway crossing
+ * another leaves four junction nodes in a rectangle 10 to 20 m across -- at the
+ * smallest size that still needs the width to see it.
+ */
+ParsedOSMData two_nodes_a_carriageway_apart() {
+    ParsedOSMData data;
+    data.roads.push_back(way(1, {1, 2}, {{0.0, 0.0}, {3.0, 0.0}}));
+    data.roads.push_back(way(2, {1, 10}, {{0.0, 0.0}, {0.0, -60.0}}));
+    data.roads.push_back(way(3, {1, 11}, {{0.0, 0.0}, {-60.0, 0.0}}));
+    data.roads.push_back(way(4, {2, 12}, {{3.0, 0.0}, {3.0, 60.0}}));
+    data.roads.push_back(way(5, {2, 13}, {{3.0, 0.0}, {63.0, 0.0}}));
+    data.stats.processed_roads = data.roads.size();
+    return data;
+}
+
 /// The graph node at a given local position, or kInvalidId
 GraphNodeId node_at(const RoadGraph& graph, glm::dvec2 where) {
     for (size_t i = 0; i < graph.nodes().size(); ++i) {
@@ -255,6 +278,71 @@ TEST(JunctionMerge, the_solver_publishes_which_junction_owns_each_node) {
     if (dead_end != kInvalidId) {
         CHECK_EQ(owner[dead_end], kInvalidId);
     }
+}
+
+/**
+ * An absorbed member is counted as a MERGE, never as a degenerate junction.
+ *
+ * ### Why a counter earns a test
+ *
+ * `degenerate` is the number an operator reads to decide whether an import went
+ * wrong, and it is the only signal a node that solved to nothing ever gives --
+ * the geometry it leaves behind is a node with no fill, which is also what a
+ * healthy merge leaves behind. The two are indistinguishable downstream.
+ *
+ * So while the flat 1 m radius merged only the duplicate-node defect, folding the
+ * absorbed members in with the failures cost little. The width-scaled rule merges
+ * every compound intersection in an extract, and on a Lucan extract that took
+ * `degenerate` from 41 to 679 -- a number that says the import is broken, about
+ * an import that had just been fixed.
+ *
+ * The fixture merges ONLY under the width-scaled rule, so this also pins that the
+ * rule is doing the merging: at 3 m apart the flat kCoincidentRadius of 1 m does
+ * not reach, and without the width term both nodes would solve separately and
+ * neither counter would move.
+ */
+TEST(JunctionMerge, an_absorbed_member_is_counted_as_a_merge_not_a_failure) {
+    ParsedOSMData data = two_nodes_a_carriageway_apart();
+    RoadGraph graph;
+    graph.build(data);
+
+    std::vector<Centerline> centerlines;
+    std::vector<RoadProfile> profiles;
+    ResampleConfig rc;
+    rc.smooth = false;
+    for (const GraphEdge& e : graph.edges()) {
+        centerlines.push_back(build_centerline(e.polyline, rc));
+        profiles.push_back(build_profile(e, ProfileConfig{}, nullptr,
+                                         stratum::osm::SideFlags::None));
+    }
+
+    RoadElevationSolver elevation;
+    JunctionBuilder builder;
+    CHECK_TRUE(builder.solve_trims(graph, centerlines, profiles, elevation, JunctionConfig{}));
+    (void)builder.build_geometry(graph, centerlines, profiles);
+
+    const JunctionBuilder::Stats stats = builder.stats();
+
+    // One junction solved, one member absorbed into it, and nothing failed.
+    CHECK_EQ(stats.merged_into_neighbour, size_t{1});
+    CHECK_EQ(stats.degenerate, size_t{0});
+    CHECK_EQ(stats.junctions, size_t{1});
+
+    // And the merge really is the width-scaled rule: the two nodes are 3 m apart,
+    // which is outside the flat radius the coincident-node case uses.
+    const GraphNodeId west = node_at(graph, {0.0, 0.0});
+    const GraphNodeId east = node_at(graph, {3.0, 0.0});
+    CHECK_TRUE(west != kInvalidId);
+    CHECK_TRUE(east != kInvalidId);
+    if (west == kInvalidId || east == kInvalidId) return;
+    CHECK_TRUE(glm::length(graph.nodes()[east].position - graph.nodes()[west].position) >
+               kCoincidentRadius);
+
+    // Both still name the same owner, so the consumers keyed by node resolve.
+    const std::vector<GraphNodeId>& owner = builder.junction_owner();
+    CHECK_EQ(owner.size(), graph.nodes().size());
+    if (owner.size() != graph.nodes().size()) return;
+    CHECK_EQ(owner[west], owner[east]);
 }
 
 // ============================================================================

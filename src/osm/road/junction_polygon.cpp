@@ -737,6 +737,102 @@ JunctionPolygon build_junction_polygon(const std::vector<ArmRef>& arms,
             face_right[k] = clip_right[k];
             face_left[k] = clip_left[k];
         }
+
+        // --------------------------------------------------------------------
+        // The overlap that does NOT cross.
+        //
+        // The pass above repairs two faces that properly cross. Two adjacent
+        // mouths can overlap without ever crossing: where they are nearly
+        // PARALLEL and nearly collinear -- the two carriageways of a dual
+        // carriageway, which leave their two members on the same bearing a few
+        // metres apart -- one face simply lies along the other. segment_crossing()
+        // correctly reports no crossing, nothing is clipped, and the walk from
+        // arm k's left corner to arm k+1's right corner then doubles BACK around
+        // the junction. That reversal is a bowtie exactly as a crossing is, and
+        // it is what the hull fallback was still catching on merged clusters.
+        //
+        // It is detected the way the ring itself is ordered, by angle about the
+        // centre the arms leave from: the walk is counter-clockwise, so each step
+        // must advance. A step that retreats is collapsed onto its midpoint --
+        // the same repair, and the same two-vertices-per-arm invariant, as the
+        // inversion above.
+        //
+        // Only a MERGED cluster can produce it, because it takes two arms leaving
+        // from different points, so the test is skipped when every arm shares one
+        // origin. A lone junction keeps the ring it has always had, reflex corner
+        // included -- that corner spans the back of the node, where a retreat in
+        // angle is the correct shape rather than a fault.
+        // --------------------------------------------------------------------
+        if (arm_cluster_span(arms) > 0.0) {
+            glm::dvec2 centre(0.0);
+            for (const ArmRef& arm : arms) centre += arm.origin;
+            centre /= static_cast<double>(arm_count);
+
+            // Read from a SNAPSHOT and write to the live faces, for the reason
+            // the crossing clip above gives: a pass that reads what it has
+            // already written gives a different ring depending on which arm the
+            // walk started at, and the arm order is an implementation detail of
+            // collect_arms() rather than anything the junction means.
+            const std::vector<glm::dvec2> was_left = face_left;
+            const std::vector<glm::dvec2> was_right = face_right;
+
+            for (size_t k = 0; k < arm_count; ++k) {
+                const size_t next = (k + 1u) % arm_count;
+                const glm::dvec2 a = was_left[k] - centre;
+                const glm::dvec2 b = was_right[next] - centre;
+                if (glm::dot(a, a) <= 0.0 || glm::dot(b, b) <= 0.0) continue;
+
+                // Signed turn from a to b, the short way. A retreat is negative,
+                // and it is bounded: the step that closes the ring at a node
+                // whose arms all leave within one half plane spans MORE than half
+                // a turn, which comes back through atan2 as a large negative
+                // number indistinguishable in sign from this one. That corner is
+                // the reflex corner, it is the real shape of the junction, and
+                // collapsing it would draw the fill around the wrong side of the
+                // node. Two overlapping parallel mouths retreat by a few degrees;
+                // a reflex corner retreats by most of a half turn. A quarter turn
+                // separates them with room to spare.
+                //
+                // The wrap-around step is NOT excluded. On a dual carriageway it
+                // is precisely where the two westbound mouths meet, and skipping
+                // it left a ring that reached five metres across the junction and
+                // back.
+                const double turn = std::atan2(cross2(a, b), glm::dot(a, b));
+                if (!(turn < 0.0) || turn <= -kQuarterTurn) continue;
+
+                const glm::dvec2 mid = (was_left[k] + was_right[next]) * 0.5;
+                face_left[k] = mid;
+                face_right[next] = mid;
+
+                // Marked clipped for the same reason the crossing repair marks
+                // it: the corner is now a POINT, so there is no straight run for
+                // an arc to be tangent over. Left unmarked, append_corner() would
+                // still be handed the two unclipped cut faces and would draw a
+                // fillet between two coincident ring vertices, spiking back
+                // across the junction -- which is the crossing this repair was
+                // added to remove, put back by the step after it.
+                corner_clipped[k] = true;
+            }
+
+            // An arm pulled in at BOTH ends can come out backwards here just as
+            // it can after the crossing clip, so it gets the same repair:
+            // collapsed onto its own midpoint, one point wide but forwards. The
+            // test is against the arm's ORIGINAL cut face, which is the only
+            // direction that still says which way along it is forwards.
+            for (size_t k = 0; k < arm_count; ++k) {
+                const glm::dvec2 face = ends[k].carriage_left - ends[k].carriage_right;
+                const double len_sq = glm::dot(face, face);
+                if (!(len_sq > 0.0)) continue;
+
+                const double t_right = glm::dot(face_right[k] - ends[k].carriage_right, face) / len_sq;
+                const double t_left = glm::dot(face_left[k] - ends[k].carriage_right, face) / len_sq;
+                if (t_right > t_left) {
+                    const glm::dvec2 mid = (face_right[k] + face_left[k]) * 0.5;
+                    face_right[k] = mid;
+                    face_left[k] = mid;
+                }
+            }
+        }
     }
 
     out.ring.reserve(arm_count * (2u + static_cast<size_t>(kMaxArcSegments)));

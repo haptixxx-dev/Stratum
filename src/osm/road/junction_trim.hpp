@@ -116,6 +116,27 @@ struct ArmRef {
     double bearing = 0.0;
 
     /**
+     * @brief Position of the graph node this arm LEAVES, in local metres
+     *
+     * Every arm of an ordinary junction shares one origin -- the node being
+     * solved -- and this field is then the same point for all of them. It is not
+     * redundant for a MERGED cluster: collect_arms() hands the primary the arms
+     * of every member, and those leave from points metres apart.
+     *
+     * That distance is the one thing the rest of the solve cannot recover. The
+     * trim solve and the polygon builder both work from arm directions and widths
+     * alone, which is exactly right for arms radiating from one point and
+     * silently wrong for a compound intersection. Their bounds are sized in
+     * carriageway widths, so on a junction 15 m across they reject its real
+     * corners and close them with chords that cross each other. Carrying the
+     * origin is what lets each of them measure the cluster it is really solving.
+     *
+     * Left at the origin when collect_arms() could not resolve the node, which
+     * every consumer treats as the cluster of one it is indistinguishable from.
+     */
+    glm::dvec2 origin{0.0};
+
+    /**
      * @brief Half the arm's TOTAL profile width, metres
      *
      * `RoadProfile::total_width() * 0.5`. This is a reach, not an offset: a
@@ -452,6 +473,42 @@ constexpr double kCoincidentRadius = 1.0;
                                                GraphNodeId node,
                                                double coincident_radius = kCoincidentRadius,
                                                std::vector<GraphNodeId>* out_cluster = nullptr);
+
+/**
+ * @brief How far @p arms reach from the centre of the cluster they leave, metres
+ *
+ * Zero for the ordinary junction, where every arm leaves the same node and the
+ * spread of their origins is exactly nothing. Half the width of the rectangle for
+ * a compound intersection, where collect_arms() has handed one primary the arms
+ * of several member nodes.
+ *
+ * ### What it is for
+ *
+ * Both of this file's consumers bound themselves in CARRIAGEWAY WIDTHS: the trim
+ * solve reserves a corner run in them, and build_junction_polygon() rejects a
+ * corner point standing further behind a cut face than an arm's trim plus a
+ * width or so. Those are the right units for arms radiating from one point,
+ * where a corner further out than that is the nearly-parallel pathology the
+ * bounds exist to catch -- one such pair once produced a ring running 2.5 km from
+ * its node.
+ *
+ * They are the wrong units the moment a junction has SIZE. The corners of a
+ * compound intersection are separated by the cluster, not by the carriageway, so
+ * a bound that has never heard of the cluster throws the real corners away and
+ * closes them with chords -- and chords drawn across a junction 15 m wide cross
+ * each other. Adding this span to such a bound restores it to what it was written
+ * to mean, "near THIS junction", on a junction that is no longer a point.
+ *
+ * It is deliberately measured from the arm ORIGINS and not from the cut faces.
+ * Cut faces stand a trim distance out from their node on every junction, lone
+ * ones included, so a span measured from them would loosen every bound in the
+ * pipeline instead of only the ones now solving something bigger than a node.
+ *
+ * @param arms Arms of one junction, as returned by collect_arms()
+ * @return The greatest distance from any arm's origin to their mean, or 0.0 for
+ *         fewer than two arms
+ */
+[[nodiscard]] double arm_cluster_span(const std::vector<ArmRef>& arms);
 
 /**
  * @brief Solve the trim distance for every arm of one node

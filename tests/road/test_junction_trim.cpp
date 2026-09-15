@@ -476,9 +476,24 @@ TEST(JunctionTrim, codirectional_arms_fall_back_to_the_width_sum) {
 // ============================================================================
 
 /**
- * A 6 m edge running between two junctions of wide primaries. Both ends demand
- * 7.25 m, which together would consume 14.5 m of a 6 m edge and leave a
- * negative-length ribbon. The clamps must stop that.
+ * A 16 m edge running between two junctions of wide primaries. Both ends demand
+ * 7.25 m, which together would consume 14.5 m of a 16 m edge and leave a ribbon
+ * 1.5 m long. The clamps cut that back to 6.4 m per end and leave 3.2 m.
+ *
+ * ### Why 16 and not 6
+ *
+ * It was 6, and 6 is now a MERGE rather than a clamp: two junctions of 7 m
+ * carriageway half-width sitting 6 m apart are one compound intersection, and
+ * collect_arms() swallows the stub between them. That is the right answer for
+ * that geometry -- it is exactly the dual-carriageway crossing this suite's
+ * sibling test now covers -- but it means 6 m no longer reaches this code path
+ * at all.
+ *
+ * 16 m is chosen to sit in the window where both conditions hold. Above the
+ * 14 m merge threshold (7 + 7), so the two junctions stay separate; below
+ * 7.25 / 0.4 = 18.1 m, so the demand still exceeds max_trim_fraction and the
+ * clamp still fires. Widening the profiles or shortening the edge leaves that
+ * window and stops testing the clamp.
  *
  * The assertion is stated as an either/or, exactly as the contract allows: the
  * combined trim leaves a positive remaining length, OR the arms are reported
@@ -486,7 +501,7 @@ TEST(JunctionTrim, codirectional_arms_fall_back_to_the_width_sum) {
  * unconditionally.
  */
 TEST(JunctionTrim, short_edge_between_wide_junctions_keeps_positive_length) {
-    const double short_length = 6.0;
+    const double short_length = 16.0;
     const double wing = 150.0;
     const std::vector<Road> roads = {
         jt::make_road(1, {100, 101}, {{0.0, 0.0}, {short_length, 0.0}}),
