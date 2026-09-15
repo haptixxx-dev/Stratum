@@ -173,6 +173,7 @@ add_library(stratum_core STATIC
     # stratum_core -- no SDL, no ImGui, no renderer.
     src/scene/command.cpp
     src/scene/layer.cpp
+    src/scene/attributes.cpp
 
     # Procedural Generation
     src/procgen/noise.cpp
