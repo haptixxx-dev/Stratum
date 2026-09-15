@@ -67,6 +67,9 @@ set(STRATUM_TEST_SOURCES
     road/test_mesh_optimize.cpp
     road/test_collision_mesh.cpp
     road/test_road_export.cpp
+
+    # KHR_draco_mesh_compression on the glTF writer.
+    road/test_road_export_draco.cpp
     road/test_p7_integration.cpp
 
     # Tag-to-appearance mapping. Unconditional: road_style.cpp is a pure table and
@@ -81,6 +84,12 @@ set(STRATUM_TEST_SOURCES
 
     # roof:shape=* reaching geometry for all five roof families (E1).
     osm/test_roof_shapes.cpp
+
+    # Attribute-mode colour tables: totality, determinism and separation.
+    osm/test_attribute_palette.cpp
+
+    # Building footprints to closed collision prisms.
+    osm/test_building_collision.cpp
 
     # Engine-agnostic geometry processing.
     geometry/test_ambient_occlusion.cpp
@@ -111,11 +120,14 @@ set(STRATUM_TEST_SUITES
     MeshOptimize
     CollisionMesh
     RoadExport
+    RoadExportDraco
     P7Integration
     RoadStyle
     TerrainCarve
     QuadTreeRoads
     RoofShapes
+    AttributePalette
+    BuildingCollision
     RoadDump
     RoadTerrainDump
     JunctionDump

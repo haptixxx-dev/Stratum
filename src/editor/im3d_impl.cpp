@@ -2,6 +2,7 @@
 // Copyright 2026 Seamus Mullan and the Stratum contributors
 
 #include "editor/im3d_impl.hpp"
+#include "renderer/asset_paths.hpp"
 #include "renderer/gpu_renderer.hpp"
 #include <im3d.h>
 #include <spdlog/spdlog.h>
@@ -216,13 +217,11 @@ bool Im3D_InitGPU(GPURenderer& renderer) {
     Im3D_ShutdownGPU();
     s_gpu.device = renderer.get_device();
 
-    const char* base = SDL_GetBasePath();
-    std::string base_path = base ? base : "";
     const char* names[Im3d::DrawPrimitive_Count] = { "triangles", "lines", "points" };
 
     for (int i = 0; i < Im3d::DrawPrimitive_Count; ++i) {
-        std::string vert_path = base_path + "../../assets/shaders/im3d_" + names[i] + ".vert.spv";
-        std::string frag_path = base_path + "../../assets/shaders/im3d_" + names[i] + ".frag.spv";
+        std::string vert_path = shader_path(std::string("im3d_") + names[i] + ".vert.spv");
+        std::string frag_path = shader_path(std::string("im3d_") + names[i] + ".frag.spv");
 
         // Degrade gracefully if the shaders are missing rather than killing the app.
         if (!std::filesystem::exists(vert_path) || !std::filesystem::exists(frag_path)) {

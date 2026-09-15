@@ -48,13 +48,40 @@
  * and the output is plain `.gltf` + `.bin` rather than `.glb` so a chunk's
  * geometry can be looked at without a JSON parser in the way.
  *
- * draco also links into core and is also not used. Compressing geometry that is
- * still being debugged hides exactly the errors an export exists to reveal.
+ * draco also links into core, and is used only when ExportConfig::draco_compression
+ * asks for it -- off by default, because compressing geometry that is still being
+ * debugged hides exactly the errors an export exists to reveal.
+ *
+ * ### The compressed path does not move a single triangle
+ *
+ * Compression happens strictly downstream of chunking. Chunk assignment, the
+ * per-material index lists and the SubMesh ranges are all built before the format
+ * is consulted, so the conservation invariant above holds bit for bit whether the
+ * flag is set or not. What the flag changes is only how one primitive's bytes are
+ * spelled in the `.bin`.
+ *
+ * The one structural difference: a compressed primitive gets its OWN vertex
+ * accessors instead of sharing one set with its siblings. It has to. A Draco
+ * stream is a self-contained mesh, so each primitive is encoded from just the
+ * vertices its own range references, and its vertex count is therefore its own.
+ * That compaction renumbers vertices WITHIN a primitive and never moves a triangle
+ * between primitives, which is why the tests that count triangles per chunk pass
+ * unchanged.
  */
 
 #include "osm/road/road_export.hpp"
 
 #include "osm/road/road_style.hpp"
+
+// Draco's own headers spell their includes "draco/...", relative to
+// external/draco/src, and its CMake adds that path PRIVATE rather than exporting
+// it. stratum_core names both it and the build directory holding the generated
+// draco/draco_features.h; see the target_include_directories call in
+// CMakeLists.txt.
+#include <draco/attributes/geometry_attribute.h>
+#include <draco/attributes/point_attribute.h>
+#include <draco/compression/encode.h>
+#include <draco/mesh/mesh.h>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -104,6 +131,46 @@ constexpr int kGltfElementArrayBuffer = 34963;
 
 /// glTF primitive mode for a triangle list
 constexpr int kGltfTriangles = 4;
+
+/// Extension name, spelled once so `extensionsUsed` cannot drift from the primitive
+constexpr const char* kDracoExtension = "KHR_draco_mesh_compression";
+
+/// One glTF vertex attribute and the Draco attribute that carries it
+struct DracoSlot {
+    const char* gltf_name;                  ///< Key in the primitive's `attributes`
+    draco::GeometryAttribute::Type type;    ///< Draco's own attribute classification
+    uint8_t components;                     ///< Floats per vertex
+    const char* accessor_type;              ///< glTF accessor `type` for the fallback accessor
+};
+
+/**
+ * @brief The five attributes a compressed primitive carries, in encode order
+ *
+ * THE INDEX INTO THIS TABLE IS THE DRACO UNIQUE ID. The extension's `attributes`
+ * map hands a decoder those ids and the decoder resolves them with
+ * GetAttributeByUniqueId(), so the ids must be set on the attributes explicitly --
+ * Draco leaves every unique id at 0 otherwise, and five attributes sharing one id
+ * resolve to whichever the decoder happens to hit first.
+ *
+ * TANGENT rides on GENERIC because Draco 1.5.7 compiles GeometryAttribute::TANGENT
+ * out unless DRACO_TRANSCODER_SUPPORTED is set, and external/CMakeLists.txt sets
+ * it OFF. That is not a workaround: a named slot would change the bitstream, and
+ * every other glTF Draco encoder ships tangents as GENERIC for the same reason.
+ */
+constexpr DracoSlot kDracoSlots[] = {
+    { "POSITION",   draco::GeometryAttribute::POSITION,  3, "VEC3" },
+    { "NORMAL",     draco::GeometryAttribute::NORMAL,    3, "VEC3" },
+    { "TEXCOORD_0", draco::GeometryAttribute::TEX_COORD, 2, "VEC2" },
+    { "COLOR_0",    draco::GeometryAttribute::COLOR,     4, "VEC4" },
+    { "TANGENT",    draco::GeometryAttribute::GENERIC,   4, "VEC4" },
+};
+
+/// Number of entries in kDracoSlots
+constexpr size_t kDracoSlotCount = sizeof(kDracoSlots) / sizeof(kDracoSlots[0]);
+
+/// Draco rejects a quantisation request outside this range outright
+constexpr int kDracoMinBits = 1;
+constexpr int kDracoMaxBits = 30;
 
 /**
  * @brief Debug base colour per material slot
@@ -541,11 +608,502 @@ public:
         return offset;
     }
 
+    /**
+     * @brief Pad to a four-byte boundary
+     *
+     * The uncompressed writer never needs this: everything it appends is a whole
+     * number of 4-byte floats or indices, which is what glTF demands of a
+     * bufferView an accessor reads through. A Draco stream is an arbitrary byte
+     * count and no accessor reads it, so alignment is not required of it -- but
+     * three bytes of padding is cheaper than a buffer whose views start at odd
+     * offsets, which every tool that maps the `.bin` into typed arrays reads
+     * slowly or refuses outright.
+     */
+    void align4() {
+        while ((m_bytes.size() & 3u) != 0u) {
+            m_bytes.push_back(0u);
+        }
+    }
+
     [[nodiscard]] const std::vector<uint8_t>& bytes() const { return m_bytes; }
 
 private:
     std::vector<uint8_t> m_bytes;
 };
+
+/**
+ * @brief The glTF material for one SubMesh range
+ *
+ * Shared by the plain and the compressed writers so the two cannot drift: only
+ * the geometry encoding differs between them, and a consumer must get the same
+ * material slots either way.
+ */
+[[nodiscard]] nlohmann::json gltf_material_json(MaterialKey key, const ExportConfig& cfg) {
+    const glm::vec3 base = material_base_color(key.material);
+    nlohmann::json material;
+    material["name"] = material_name(key, cfg);
+    material["doubleSided"] = false;
+    material["pbrMetallicRoughness"] = {
+        { "baseColorFactor", { base.r, base.g, base.b, 1.0f } },
+        { "metallicFactor", 0.0 },
+        { "roughnessFactor", 0.9 }
+    };
+    return material;
+}
+
+/**
+ * @brief Assemble the document around one mesh's primitives
+ *
+ * Everything outside the geometry: the asset block, the single scene holding a
+ * single node, and the four parallel arrays. The caller owns `extensionsUsed` and
+ * `extensionsRequired`, because only it knows whether it compressed anything.
+ */
+[[nodiscard]] nlohmann::json make_gltf_document(const std::string& object_name,
+                                                nlohmann::json primitives,
+                                                nlohmann::json materials,
+                                                nlohmann::json accessors,
+                                                nlohmann::json views,
+                                                const fs::path& bin_path,
+                                                size_t buffer_bytes) {
+    nlohmann::json doc;
+    doc["asset"] = { { "version", "2.0" }, { "generator", "Stratum road exporter" } };
+    doc["scene"] = 0;
+    doc["scenes"] = nlohmann::json::array({ nlohmann::json{ { "nodes", { 0 } } } });
+    doc["nodes"] = nlohmann::json::array({
+        nlohmann::json{ { "mesh", 0 }, { "name", object_name } }
+    });
+    doc["meshes"] = nlohmann::json::array({
+        nlohmann::json{ { "name", object_name }, { "primitives", std::move(primitives) } }
+    });
+    doc["materials"] = std::move(materials);
+    doc["accessors"] = std::move(accessors);
+    doc["bufferViews"] = std::move(views);
+    doc["buffers"] = nlohmann::json::array({
+        nlohmann::json{ { "uri", bin_path.filename().string() },
+                        { "byteLength", buffer_bytes } }
+    });
+    return doc;
+}
+
+/**
+ * @brief Write the `.bin` and then the `.gltf`
+ *
+ * The buffer first, so a `.gltf` on disk always has its buffer beside it. A
+ * reader that finds the JSON and no buffer has no way to tell that from a
+ * truncated export.
+ */
+[[nodiscard]] bool write_gltf_pair(const nlohmann::json& doc, const std::vector<uint8_t>& bytes,
+                                   const fs::path& gltf_path, const fs::path& bin_path) {
+    {
+        std::ofstream bin(bin_path, std::ios::binary | std::ios::trunc);
+        if (!bin.is_open()) {
+            spdlog::error("export: cannot open {} for writing", bin_path.string());
+            return false;
+        }
+        bin.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+        if (!bin.good()) {
+            spdlog::error("export: failed while writing {}", bin_path.string());
+            return false;
+        }
+    }
+
+    {
+        std::ofstream json_out(gltf_path, std::ios::binary | std::ios::trunc);
+        if (!json_out.is_open()) {
+            spdlog::error("export: cannot open {} for writing", gltf_path.string());
+            return false;
+        }
+        const std::string text = doc.dump(2);
+        json_out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        if (!json_out.good()) {
+            spdlog::error("export: failed while writing {}", gltf_path.string());
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// KHR_draco_mesh_compression
+// ----------------------------------------------------------------------------
+
+/**
+ * @brief One SubMesh range lifted out as a standalone, densely indexed mesh
+ *
+ * A Draco stream is a whole mesh, not a slice of one, so a primitive can only be
+ * compressed after its range has been cut loose from the chunk it shares vertices
+ * with. `source` maps each local vertex back to the chunk's vertex array;
+ * `indices` is the range's triangles renumbered into it.
+ *
+ * Renumbering is confined to one primitive: a triangle keeps the primitive, and
+ * therefore the chunk and the material, it already had. Nothing here can move a
+ * triangle, which is what keeps the conservation invariant true under compression.
+ */
+struct DracoPrimitiveMesh {
+    std::vector<uint32_t> source;    ///< Local vertex -> index into the chunk mesh
+    std::vector<uint32_t> indices;   ///< Local indices, three per triangle
+};
+
+/**
+ * @brief Cut one SubMesh range loose, keeping only the vertices it references
+ *
+ * @param mesh  Chunk mesh the range belongs to
+ * @param range Range to lift out
+ * @return The compacted range. Empty `indices` when the range held no triangle
+ *         whose three indices were all in bounds.
+ */
+[[nodiscard]] DracoPrimitiveMesh compact_range(const Mesh& mesh, const SubMesh& range) {
+    DracoPrimitiveMesh out;
+
+    const size_t vertex_count = mesh.vertices.size();
+    const size_t first = range.index_offset;
+    const size_t last = std::min<size_t>(mesh.indices.size(),
+                                         static_cast<size_t>(range.index_offset)
+                                         + static_cast<size_t>(range.index_count));
+
+    std::unordered_map<uint32_t, uint32_t> remap;
+    out.indices.reserve(last > first ? last - first : 0u);
+
+    for (size_t i = first; i + 3u <= last; i += 3u) {
+        const uint32_t corner[3] = { mesh.indices[i], mesh.indices[i + 1], mesh.indices[i + 2] };
+
+        // All three checked BEFORE any of them is interned. Interning as we go and
+        // bailing on the third would leave the first two in `source` with nothing
+        // referencing them, and an isolated point is a vertex Draco's edgebreaker
+        // cannot reach from any face.
+        if (corner[0] >= vertex_count || corner[1] >= vertex_count
+            || corner[2] >= vertex_count) {
+            continue;
+        }
+
+        for (const uint32_t src : corner) {
+            const auto [it, inserted] =
+                remap.emplace(src, static_cast<uint32_t>(out.source.size()));
+            if (inserted) {
+                out.source.push_back(src);
+            }
+            out.indices.push_back(it->second);
+        }
+    }
+
+    return out;
+}
+
+/**
+ * @brief Build the Draco mesh for one compacted range
+ *
+ * @param mesh     Chunk mesh the vertices are read from
+ * @param compact  Range lifted out by compact_range()
+ * @param out      Mesh to fill
+ * @return false when an attribute could not be added
+ */
+[[nodiscard]] bool fill_draco_mesh(const Mesh& mesh, const DracoPrimitiveMesh& compact,
+                                   draco::Mesh& out) {
+    const size_t point_count = compact.source.size();
+    const size_t face_count = compact.indices.size() / 3u;
+
+    out.set_num_points(static_cast<uint32_t>(point_count));
+    out.SetNumFaces(face_count);
+    for (size_t f = 0; f < face_count; ++f) {
+        draco::Mesh::Face face;
+        face[0] = draco::PointIndex(compact.indices[f * 3u + 0u]);
+        face[1] = draco::PointIndex(compact.indices[f * 3u + 1u]);
+        face[2] = draco::PointIndex(compact.indices[f * 3u + 2u]);
+        out.SetFace(draco::FaceIndex(static_cast<uint32_t>(f)), face);
+    }
+
+    for (size_t slot = 0; slot < kDracoSlotCount; ++slot) {
+        const DracoSlot& spec = kDracoSlots[slot];
+
+        // nullptr buffer: AddAttribute() allocates storage of its own from this
+        // template, which is how every one of Draco's own decoders does it.
+        draco::GeometryAttribute descriptor;
+        descriptor.Init(spec.type, nullptr, spec.components, draco::DT_FLOAT32, false,
+                        static_cast<int64_t>(sizeof(float)) * spec.components, 0);
+
+        const int att_id = out.AddAttribute(descriptor, true,
+                                            static_cast<uint32_t>(point_count));
+        if (att_id < 0) {
+            return false;
+        }
+
+        draco::PointAttribute* attribute = out.attribute(att_id);
+        if (attribute == nullptr) {
+            return false;
+        }
+        // The id the extension's `attributes` map will publish. Set here rather
+        // than left to default, because Draco defaults every unique id to 0.
+        attribute->set_unique_id(static_cast<uint32_t>(slot));
+
+        for (size_t v = 0; v < point_count; ++v) {
+            const Vertex& vertex = mesh.vertices[compact.source[v]];
+            float value[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            switch (spec.type) {
+                case draco::GeometryAttribute::POSITION:
+                    value[0] = vertex.position.x;
+                    value[1] = vertex.position.y;
+                    value[2] = vertex.position.z;
+                    break;
+                case draco::GeometryAttribute::NORMAL:
+                    value[0] = vertex.normal.x;
+                    value[1] = vertex.normal.y;
+                    value[2] = vertex.normal.z;
+                    break;
+                case draco::GeometryAttribute::TEX_COORD:
+                    value[0] = vertex.uv.x;
+                    value[1] = vertex.uv.y;
+                    break;
+                case draco::GeometryAttribute::COLOR:
+                    value[0] = vertex.color.r;
+                    value[1] = vertex.color.g;
+                    value[2] = vertex.color.b;
+                    value[3] = vertex.color.a;
+                    break;
+                default:
+                    // GENERIC, which is TANGENT. The w is the bitangent sign and is
+                    // snapped to +-1 exactly as the uncompressed writer snaps it:
+                    // quantisation of a value that is only ever two values is a way
+                    // to land on neither.
+                    value[0] = vertex.tangent.x;
+                    value[1] = vertex.tangent.y;
+                    value[2] = vertex.tangent.z;
+                    value[3] = vertex.tangent.w < 0.0f ? -1.0f : 1.0f;
+                    break;
+            }
+            attribute->SetAttributeValue(
+                draco::AttributeValueIndex(static_cast<uint32_t>(v)), value);
+        }
+    }
+
+    return true;
+}
+
+/**
+ * @brief Compress one Draco mesh, falling back to sequential encoding
+ *
+ * Edgebreaker is what makes the connectivity small, and it is also what refuses
+ * input it cannot build a corner table for. Road geometry is full of such input:
+ * a junction fan stitched to four approach corridors, a sidewalk that meets
+ * itself around a corner, a bridge deck sharing an edge with three parapets.
+ * Failing the whole chunk over one non-manifold edge would make the option
+ * unusable on exactly the networks it exists for, so a refusal retries with the
+ * sequential encoder, which compresses less and accepts anything.
+ *
+ * @param source  Mesh to encode
+ * @param cfg     Quantisation and speed
+ * @param encoded Buffer to fill
+ * @param points  Vertices the encoder actually emitted
+ * @param faces   Triangles the encoder actually emitted
+ * @return false when both encoders refused the mesh
+ */
+[[nodiscard]] bool encode_draco_mesh(const draco::Mesh& source, const DracoConfig& cfg,
+                                     draco::EncoderBuffer& encoded, size_t& points,
+                                     size_t& faces) {
+    const auto bits = [](int value) {
+        return std::clamp(value, kDracoMinBits, kDracoMaxBits);
+    };
+    const int speed = std::clamp(cfg.speed, 0, 10);
+
+    const auto configure = [&](draco::Encoder& encoder) {
+        // Without this, num_encoded_points() and num_encoded_faces() are both a
+        // flat 0 whatever the encoder did -- Draco only counts when asked, and the
+        // counts are what the fallback accessors have to report. A zero there is
+        // not a small error: it writes a primitive that declares no vertices.
+        encoder.SetTrackEncodedProperties(true);
+        encoder.SetSpeedOptions(speed, speed);
+        encoder.SetAttributeQuantization(draco::GeometryAttribute::POSITION,
+                                         bits(cfg.position_bits));
+        encoder.SetAttributeQuantization(draco::GeometryAttribute::NORMAL,
+                                         bits(cfg.normal_bits));
+        encoder.SetAttributeQuantization(draco::GeometryAttribute::TEX_COORD,
+                                         bits(cfg.uv_bits));
+        encoder.SetAttributeQuantization(draco::GeometryAttribute::COLOR,
+                                         bits(cfg.color_bits));
+        encoder.SetAttributeQuantization(draco::GeometryAttribute::GENERIC,
+                                         bits(cfg.generic_bits));
+    };
+
+    {
+        draco::Encoder encoder;
+        configure(encoder);
+        const draco::Status status = encoder.EncodeMeshToBuffer(source, &encoded);
+        if (status.ok()) {
+            points = encoder.num_encoded_points();
+            faces = encoder.num_encoded_faces();
+            return true;
+        }
+        spdlog::warn("export: draco edgebreaker refused a primitive ({}); "
+                     "retrying with sequential encoding", status.error_msg());
+    }
+
+    // EncodeMeshToBuffer APPENDS -- it writes a header and keeps going -- so the
+    // failed attempt's partial output has to be dropped before the retry, or the
+    // stream starts with a truncated one.
+    encoded.Clear();
+
+    draco::Encoder encoder;
+    configure(encoder);
+    encoder.SetEncodingMethod(draco::MESH_SEQUENTIAL_ENCODING);
+    const draco::Status status = encoder.EncodeMeshToBuffer(source, &encoded);
+    if (!status.ok()) {
+        spdlog::error("export: draco could not encode a primitive: {}", status.error_msg());
+        return false;
+    }
+    points = encoder.num_encoded_points();
+    faces = encoder.num_encoded_faces();
+    return true;
+}
+
+/**
+ * @brief Write one mesh as `.gltf` plus a `.bin` of Draco streams
+ *
+ * One compressed bufferView per primitive, and no uncompressed geometry in the
+ * buffer at all.
+ *
+ * ### The accessors that stay
+ *
+ * The primitive still declares `attributes` and `indices`, and the accessors they
+ * name still carry `count`, `componentType`, `type` and, for POSITION, `min` and
+ * `max`. What they do not carry is a `bufferView`, and that is deliberate rather
+ * than an omission: glTF defines an accessor without one as reading all zeroes,
+ * and the extension is built on top of that definition. A loader that understands
+ * KHR_draco_mesh_compression takes the counts from here and the data from the
+ * compressed view, so the two must agree; one that does not understand it sees an
+ * accessor that honestly describes nothing, rather than one pointing at bytes that
+ * were never written.
+ *
+ * `count` therefore comes from the ENCODER, not from the input. Draco may split a
+ * vertex it could not encode as one, and an accessor claiming the pre-encode count
+ * would then be short by exactly the vertices that were hardest to get right.
+ */
+[[nodiscard]] bool write_gltf_draco_file(const Mesh& mesh, const fs::path& gltf_path,
+                                         const fs::path& bin_path,
+                                         const std::string& object_name,
+                                         const ExportConfig& cfg) {
+    BinaryBuffer buffer;
+    nlohmann::json views = nlohmann::json::array();
+    nlohmann::json accessors = nlohmann::json::array();
+    nlohmann::json materials = nlohmann::json::array();
+    nlohmann::json primitives = nlohmann::json::array();
+
+    for (const SubMesh& range : mesh.effective_submeshes()) {
+        // The same two guards, in the same order, as the uncompressed writer. They
+        // have to agree: a range one writer keeps and the other drops is a chunk
+        // whose triangle count depends on whether compression was asked for.
+        if (range.index_count < 3u) continue;
+        if (static_cast<size_t>(range.index_offset) + range.index_count > mesh.indices.size()) {
+            continue;
+        }
+
+        const DracoPrimitiveMesh compact = compact_range(mesh, range);
+        if (compact.indices.size() < 3u) continue;
+
+        draco::Mesh draco_mesh;
+        if (!fill_draco_mesh(mesh, compact, draco_mesh)) {
+            spdlog::error("export: could not build a draco mesh for {}", object_name);
+            return false;
+        }
+
+        draco::EncoderBuffer encoded;
+        size_t encoded_points = 0;
+        size_t encoded_faces = 0;
+        if (!encode_draco_mesh(draco_mesh, cfg.draco, encoded, encoded_points, encoded_faces)) {
+            return false;
+        }
+        if (encoded.size() == 0u || encoded_faces == 0u || encoded_points == 0u) {
+            spdlog::error("export: draco produced an empty primitive for {}", object_name);
+            return false;
+        }
+
+        // POSITION min/max is computed from the SOURCE vertices. Quantisation can
+        // only move a position within the box it was measured over, so the box
+        // still bounds the decoded mesh, and it is the only bound available before
+        // anyone decodes the stream.
+        glm::vec3 min_pos(std::numeric_limits<float>::max());
+        glm::vec3 max_pos(std::numeric_limits<float>::lowest());
+        for (const uint32_t source : compact.source) {
+            min_pos = glm::min(min_pos, mesh.vertices[source].position);
+            max_pos = glm::max(max_pos, mesh.vertices[source].position);
+        }
+
+        buffer.align4();
+        const size_t offset = buffer.append(encoded.data(), encoded.size());
+
+        // No `target`: a Draco view is neither an ARRAY_BUFFER nor an
+        // ELEMENT_ARRAY_BUFFER, and naming one tells a loader to hand the
+        // compressed bytes straight to the GPU.
+        nlohmann::json view;
+        view["buffer"] = 0;
+        view["byteOffset"] = offset;
+        view["byteLength"] = encoded.size();
+        views.push_back(view);
+        const int view_draco = static_cast<int>(views.size()) - 1;
+
+        nlohmann::json attributes = nlohmann::json::object();
+        nlohmann::json draco_attributes = nlohmann::json::object();
+
+        for (size_t slot = 0; slot < kDracoSlotCount; ++slot) {
+            const DracoSlot& spec = kDracoSlots[slot];
+
+            nlohmann::json accessor;
+            accessor["componentType"] = kGltfFloat;
+            accessor["count"] = encoded_points;
+            accessor["type"] = spec.accessor_type;
+            if (spec.type == draco::GeometryAttribute::POSITION) {
+                accessor["min"] = { min_pos.x, min_pos.y, min_pos.z };
+                accessor["max"] = { max_pos.x, max_pos.y, max_pos.z };
+            }
+            accessors.push_back(accessor);
+
+            attributes[spec.gltf_name] = static_cast<int>(accessors.size()) - 1;
+            draco_attributes[spec.gltf_name] = static_cast<uint32_t>(slot);
+        }
+
+        nlohmann::json index_accessor;
+        index_accessor["componentType"] = kGltfUnsignedInt;
+        index_accessor["count"] = encoded_faces * 3u;
+        index_accessor["type"] = "SCALAR";
+        accessors.push_back(index_accessor);
+        const int acc_index = static_cast<int>(accessors.size()) - 1;
+
+        materials.push_back(
+            gltf_material_json(MaterialKey{ range.material, range.variant }, cfg));
+
+        nlohmann::json extension = nlohmann::json::object();
+        extension["bufferView"] = view_draco;
+        extension["attributes"] = draco_attributes;
+
+        nlohmann::json extensions = nlohmann::json::object();
+        extensions[kDracoExtension] = extension;
+
+        nlohmann::json primitive;
+        primitive["attributes"] = attributes;
+        primitive["indices"] = acc_index;
+        primitive["material"] = static_cast<int>(materials.size()) - 1;
+        primitive["mode"] = kGltfTriangles;
+        primitive["extensions"] = extensions;
+        primitives.push_back(primitive);
+    }
+
+    if (primitives.empty()) {
+        return false;
+    }
+
+    nlohmann::json doc = make_gltf_document(object_name, std::move(primitives),
+                                            std::move(materials), std::move(accessors),
+                                            std::move(views), bin_path,
+                                            buffer.bytes().size());
+
+    // REQUIRED as well as used. Every accessor above is bufferView-less, so a
+    // loader that skips the extension decodes an empty chunk rather than a
+    // degraded one, and silently loading nothing is the worse failure.
+    doc["extensionsUsed"] = nlohmann::json::array({ kDracoExtension });
+    doc["extensionsRequired"] = nlohmann::json::array({ kDracoExtension });
+
+    return write_gltf_pair(doc, buffer.bytes(), gltf_path, bin_path);
+}
 
 /**
  * @brief Write one mesh as `.gltf` plus its `.bin`
@@ -557,12 +1115,21 @@ private:
  *
  * glTF 2.0 requires Y up, so ExportConfig::y_up is ignored here; the caller
  * warns.
+ *
+ * ExportConfig::draco_compression hands the whole mesh to write_gltf_draco_file()
+ * instead. The two share their materials and their document scaffolding and
+ * nothing else: the compressed writer cannot share vertex accessors across
+ * primitives, so there is no common geometry path to factor out.
  */
 [[nodiscard]] bool write_gltf_file(const Mesh& mesh, const fs::path& gltf_path,
                                    const fs::path& bin_path, const std::string& object_name,
                                    const ExportConfig& cfg) {
     if (mesh.vertices.empty() || mesh.indices.size() < 3u) {
         return false;
+    }
+
+    if (cfg.draco_compression) {
+        return write_gltf_draco_file(mesh, gltf_path, bin_path, object_name, cfg);
     }
 
     const size_t vertex_count = mesh.vertices.size();
@@ -669,16 +1236,8 @@ private:
                                            static_cast<size_t>(range.index_offset)
                                            * sizeof(uint32_t));
 
-        const glm::vec3 base = material_base_color(range.material);
-        nlohmann::json material;
-        material["name"] = material_name(MaterialKey{ range.material, range.variant }, cfg);
-        material["doubleSided"] = false;
-        material["pbrMetallicRoughness"] = {
-            { "baseColorFactor", { base.r, base.g, base.b, 1.0f } },
-            { "metallicFactor", 0.0 },
-            { "roughnessFactor", 0.9 }
-        };
-        materials.push_back(material);
+        materials.push_back(
+            gltf_material_json(MaterialKey{ range.material, range.variant }, cfg));
 
         nlohmann::json primitive;
         primitive["attributes"] = {
@@ -698,53 +1257,12 @@ private:
         return false;
     }
 
-    nlohmann::json doc;
-    doc["asset"] = { { "version", "2.0" }, { "generator", "Stratum road exporter" } };
-    doc["scene"] = 0;
-    doc["scenes"] = nlohmann::json::array({ nlohmann::json{ { "nodes", { 0 } } } });
-    doc["nodes"] = nlohmann::json::array({
-        nlohmann::json{ { "mesh", 0 }, { "name", object_name } }
-    });
-    doc["meshes"] = nlohmann::json::array({
-        nlohmann::json{ { "name", object_name }, { "primitives", primitives } }
-    });
-    doc["materials"] = materials;
-    doc["accessors"] = accessors;
-    doc["bufferViews"] = views;
-    doc["buffers"] = nlohmann::json::array({
-        nlohmann::json{ { "uri", bin_path.filename().string() },
-                        { "byteLength", buffer.bytes().size() } }
-    });
+    const nlohmann::json doc = make_gltf_document(object_name, std::move(primitives),
+                                                  std::move(materials), std::move(accessors),
+                                                  std::move(views), bin_path,
+                                                  buffer.bytes().size());
 
-    {
-        std::ofstream bin(bin_path, std::ios::binary | std::ios::trunc);
-        if (!bin.is_open()) {
-            spdlog::error("export: cannot open {} for writing", bin_path.string());
-            return false;
-        }
-        bin.write(reinterpret_cast<const char*>(buffer.bytes().data()),
-                  static_cast<std::streamsize>(buffer.bytes().size()));
-        if (!bin.good()) {
-            spdlog::error("export: failed while writing {}", bin_path.string());
-            return false;
-        }
-    }
-
-    {
-        std::ofstream json_out(gltf_path, std::ios::binary | std::ios::trunc);
-        if (!json_out.is_open()) {
-            spdlog::error("export: cannot open {} for writing", gltf_path.string());
-            return false;
-        }
-        const std::string text = doc.dump(2);
-        json_out.write(text.data(), static_cast<std::streamsize>(text.size()));
-        if (!json_out.good()) {
-            spdlog::error("export: failed while writing {}", gltf_path.string());
-            return false;
-        }
-    }
-
-    return true;
+    return write_gltf_pair(doc, buffer.bytes(), gltf_path, bin_path);
 }
 
 // ============================================================================
@@ -825,6 +1343,11 @@ ExportStats export_road_network(const std::vector<RoadPiece>& pieces,
     if (effective.format == ExportFormat::Gltf && !effective.y_up) {
         spdlog::warn("export_road_network: glTF 2.0 requires Y up; ignoring y_up = false");
         effective.y_up = true;
+    }
+    if (effective.format != ExportFormat::Gltf && effective.draco_compression) {
+        spdlog::warn("export_road_network: KHR_draco_mesh_compression is a glTF extension; "
+                     "ignoring draco_compression for OBJ");
+        effective.draco_compression = false;
     }
     const float chunk_size = effective.chunk_size > 0.0f ? effective.chunk_size : 0.0f;
     const bool chunked = chunk_size > 0.0f;
@@ -984,6 +1507,11 @@ bool export_mesh(const Mesh& mesh, const fs::path& out_path, const ExportConfig&
     if (effective.format == ExportFormat::Gltf && !effective.y_up) {
         spdlog::warn("export_mesh: glTF 2.0 requires Y up; ignoring y_up = false");
         effective.y_up = true;
+    }
+    if (effective.format != ExportFormat::Gltf && effective.draco_compression) {
+        spdlog::warn("export_mesh: KHR_draco_mesh_compression is a glTF extension; "
+                     "ignoring draco_compression for OBJ");
+        effective.draco_compression = false;
     }
 
     try {

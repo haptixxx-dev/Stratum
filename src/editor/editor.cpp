@@ -550,6 +550,12 @@ void Editor::draw_viewport() {
         }
     }
 
+    // Colour-by-attribute outlines. After the node grid so that with both on the
+    // attribute colours win the overlap, and inside the same Im3d frame as
+    // everything else here -- Im3D_Render() at the end of render_3d() draws the
+    // lot in one pass.
+    draw_attribute_overlay();
+
 
 
 
@@ -834,6 +840,339 @@ void Editor::draw_chunk_lod_stats() {
     }
 }
 
+// ============================================================================
+// Colour-by-attribute viewport mode
+//
+// Everything below is wiring. Not one colour is decided here: every one comes
+// from osm/attribute_palette.hpp, which is in stratum_core precisely so that the
+// question "does Retail collide with Apartments" is answerable by a test rather
+// than by squinting at a screenshot.
+// ============================================================================
+
+namespace {
+
+/// Lift for a ground-level outline, in metres.
+///
+/// Areas are already built 0.01 to 0.03 above the ground to keep them out of a
+/// z-fight with the terrain; the overlay has to clear THOSE as well, or the mode
+/// disappears into the very geometry it is describing.
+constexpr float kOverlayGroundLift = 0.25f;
+
+/// Lift for a road centreline, in metres.
+///
+/// Higher than the ground lift because a road centreline is drawn over the road
+/// SURFACE, which the corridor extruder gives a crown and a kerb reveal of its
+/// own.
+constexpr float kOverlayRoadLift = 0.5f;
+
+/// Overlay line width in pixels. Im3d sizes lines in screen space, so this holds
+/// up at any camera distance, which is the point of using it over real geometry.
+constexpr float kOverlayLineWidth = 2.0f;
+
+/// 2D local metres to Y-up world space.
+///
+/// The Z flip is the whole convention and it is duplicated from
+/// osm/mesh_builder.cpp's to_world() rather than shared, because sharing it would
+/// mean exporting a renderer-facing helper out of stratum_core for the sake of
+/// three characters. Getting it wrong mirrors the entire city about the origin,
+/// which is at least unmissable.
+Im3d::Vec3 overlay_point(const glm::dvec2& p, float y) {
+    return Im3d::Vec3(static_cast<float>(p.x), y, static_cast<float>(-p.y));
+}
+
+Im3d::Color overlay_colour(const glm::vec4& c) {
+    // Im3d::Color's float overload takes components in 0..1. The int overload
+    // takes packed 0xRRGGBBAA and silently produces near-black from 0..255
+    // components; see the note on the node grid above.
+    return Im3d::Color(c.r, c.g, c.b, c.a);
+}
+
+/// Vertex count of a ring, ignoring the closing duplicate an OSM way carries.
+size_t overlay_ring_span(const std::vector<glm::dvec2>& ring) {
+    if (ring.size() > 2 && ring.front() == ring.back()) {
+        return ring.size() - 1;
+    }
+    return ring.size();
+}
+
+/// One closed outline at a fixed height.
+void draw_overlay_ring(const std::vector<glm::dvec2>& ring, float y, Im3d::Color colour) {
+    const size_t n = overlay_ring_span(ring);
+    if (n < 3) return;
+
+    Im3d::BeginLineLoop();
+    for (size_t i = 0; i < n; ++i) {
+        Im3d::Vertex(overlay_point(ring[i], y), colour);
+    }
+    Im3d::End();
+}
+
+/// One open polyline at a fixed height.
+void draw_overlay_strip(const std::vector<glm::dvec2>& points, float y, Im3d::Color colour) {
+    if (points.size() < 2) return;
+
+    Im3d::BeginLineStrip();
+    for (const glm::dvec2& p : points) {
+        Im3d::Vertex(overlay_point(p, y), colour);
+    }
+    Im3d::End();
+}
+
+/// The twelve edges of a leaf's bounds.
+void draw_overlay_box(const glm::vec3& mn, const glm::vec3& mx, Im3d::Color colour) {
+    const glm::vec3 corners[8] = {
+        {mn.x, mn.y, mn.z}, {mx.x, mn.y, mn.z}, {mx.x, mn.y, mx.z}, {mn.x, mn.y, mx.z},
+        {mn.x, mx.y, mn.z}, {mx.x, mx.y, mn.z}, {mx.x, mx.y, mx.z}, {mn.x, mx.y, mx.z},
+    };
+    static constexpr int kEdges[12][2] = {
+        {0, 1}, {1, 2}, {2, 3}, {3, 0},
+        {4, 5}, {5, 6}, {6, 7}, {7, 4},
+        {0, 4}, {1, 5}, {2, 6}, {3, 7},
+    };
+
+    Im3d::BeginLines();
+    for (const auto& edge : kEdges) {
+        const glm::vec3& a = corners[edge[0]];
+        const glm::vec3& b = corners[edge[1]];
+        Im3d::Vertex(Im3d::Vec3(a.x, a.y, a.z), colour);
+        Im3d::Vertex(Im3d::Vec3(b.x, b.y, b.z), colour);
+    }
+    Im3d::End();
+}
+
+} // namespace
+
+void Editor::draw_attribute_mode_selector() {
+    using osm::AttributeMode;
+
+    ImGui::SetNextItemWidth(160.0f);
+    if (ImGui::BeginCombo("Colour By", osm::attribute_mode_name(m_attribute_mode))) {
+        for (size_t i = 0; i < osm::kAttributeModeCount; ++i) {
+            const auto mode = static_cast<AttributeMode>(i);
+            const bool selected = (mode == m_attribute_mode);
+            if (ImGui::Selectable(osm::attribute_mode_name(mode), selected)) {
+                m_attribute_mode = mode;
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SetItemTooltip(
+        "Paint the scene by classification instead of by material.\n"
+        "Magenta always means Unknown: nothing classified that feature.\n"
+        "Tile / Chunk recolours the solid surfaces; the other modes\n"
+        "draw outlines, because a leaf's buildings share one merged mesh.");
+
+    if (m_attribute_mode == AttributeMode::None) {
+        return;
+    }
+
+    ImGui::SameLine();
+    ImGui::Checkbox("Legend", &m_attribute_show_legend);
+
+    // Say plainly when the budget clipped the overlay. Silence here would read as
+    // "the rest of the city has no buildings".
+    if (m_attribute_features_drawn < m_attribute_features_seen) {
+        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.0f, 1.0f), "Showing %zu of %zu (budget)",
+                           m_attribute_features_drawn, m_attribute_features_seen);
+    } else {
+        ImGui::Text("Showing %zu", m_attribute_features_drawn);
+    }
+
+    if (!m_attribute_show_legend) {
+        return;
+    }
+
+    const auto swatch = [](const char* label, const glm::vec4& colour) {
+        ImGui::ColorButton(label, ImVec4(colour.r, colour.g, colour.b, colour.a),
+                           ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
+                           ImVec2(14.0f, 14.0f));
+        ImGui::SameLine();
+        ImGui::TextUnformatted(label);
+    };
+
+    switch (m_attribute_mode) {
+        case AttributeMode::Building:
+            for (size_t i = 0; i < osm::kBuildingTypeCount; ++i) {
+                const auto type = static_cast<osm::BuildingType>(i);
+                swatch(osm::building_type_name(type), osm::building_type_colour(type));
+            }
+            break;
+
+        case AttributeMode::Road:
+            for (size_t i = 0; i < osm::kRoadTypeCount; ++i) {
+                const auto type = static_cast<osm::RoadType>(i);
+                swatch(osm::road_type_name(type), osm::road_type_colour(type));
+            }
+            break;
+
+        case AttributeMode::Area:
+            for (size_t i = 0; i < osm::kAreaTypeCount; ++i) {
+                const auto type = static_cast<osm::AreaType>(i);
+                swatch(osm::area_type_name(type), osm::area_type_colour(type));
+            }
+            break;
+
+        case AttributeMode::Tile:
+            // No names to legend: the colours mean "a different tile from the one
+            // next to it" and nothing else. Showing the cycle is still worth it,
+            // because it tells the eye which twelve colours to read as boundaries.
+            for (size_t i = 0; i < osm::kTileColourCount; ++i) {
+                const glm::vec4 colour = osm::tile_colour(i);
+                // PushID per swatch: every one of the twelve carries the same
+                // label, and ImGui derives a widget's identity from its label.
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::ColorButton("##tile_swatch", ImVec4(colour.r, colour.g, colour.b, colour.a),
+                                   ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
+                                   ImVec2(14.0f, 14.0f));
+                ImGui::PopID();
+                if (i + 1 < osm::kTileColourCount) ImGui::SameLine();
+            }
+            break;
+
+        case AttributeMode::None:
+        case AttributeMode::Count:
+            break;
+    }
+}
+
+glm::vec4 Editor::attribute_leaf_tint(const osm::QuadTreeNode& node) const {
+    if (m_attribute_mode != osm::AttributeMode::Tile) {
+        return glm::vec4(1.0f);
+    }
+
+    // A leaf's own rectangle is its tile, so dividing its centre by its own edge
+    // length gives integer grid coordinates. That is what tile_colour_index()'s
+    // no-two-neighbours-alike guarantee is stated over. Leaves at different depths
+    // sit on different grids and can land on the same colour across a depth
+    // change, which does not hide the seam: a depth change is a size change, and
+    // the size is already visible.
+    const double edge = node.half_size * 2.0;
+    if (edge <= 0.0) {
+        return glm::vec4(1.0f);
+    }
+
+    const auto tile_x = static_cast<int64_t>(std::floor(node.center.x / edge));
+    const auto tile_z = static_cast<int64_t>(std::floor(node.center.y / edge));
+    return osm::tile_colour(osm::tile_colour_index(tile_x, tile_z));
+}
+
+glm::vec4 Editor::attribute_chunk_tint(const procgen::TerrainChunkCoord& coord) const {
+    if (m_attribute_mode != osm::AttributeMode::Tile) {
+        return glm::vec4(1.0f);
+    }
+    return osm::tile_colour(osm::tile_colour_index(coord.x, coord.z));
+}
+
+void Editor::draw_attribute_overlay() {
+    using osm::AttributeMode;
+
+    m_attribute_features_drawn = 0;
+    m_attribute_features_seen = 0;
+
+    if (m_attribute_mode == AttributeMode::None || m_quadtree.leaf_count() == 0) {
+        return;
+    }
+
+    const Frustum frustum = m_camera.get_frustum();
+    const glm::vec3 cam_pos = m_camera.get_position();
+    const float radius_sq = m_view_radius * m_view_radius;
+
+    // Gathered and sorted front to back before anything is emitted, so that when
+    // the budget runs out it runs out on the far side of the scene. Sorting a few
+    // hundred leaf pointers costs nothing next to the Im3d upload it protects.
+    std::vector<std::pair<float, osm::QuadTreeNode*>> visible;
+    for (auto* leaf : m_quadtree.get_all_leaves()) {
+        if (!leaf || !leaf->has_valid_bounds()) continue;
+        if (m_use_tile_culling && !frustum.intersects_aabb(leaf->bounds_min, leaf->bounds_max)) {
+            continue;
+        }
+
+        const glm::vec3 centre = (leaf->bounds_min + leaf->bounds_max) * 0.5f;
+        const glm::vec3 to_cam = centre - cam_pos;
+        const float dist_sq = glm::dot(to_cam, to_cam);
+        if (m_use_distance_culling && dist_sq > radius_sq) continue;
+
+        visible.emplace_back(dist_sq, leaf);
+    }
+
+    std::sort(visible.begin(), visible.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    Im3d::PushDrawState();
+    Im3d::SetSize(kOverlayLineWidth);
+
+    for (const auto& entry : visible) {
+        const osm::QuadTreeNode& leaf = *entry.second;
+
+        // The budget is checked per FEATURE rather than per leaf: a single dense
+        // leaf can hold thousands, and stopping at a leaf boundary would drop a
+        // whole city block at once.
+        switch (m_attribute_mode) {
+            case AttributeMode::Building:
+                for (const osm::Building& building : leaf.buildings) {
+                    ++m_attribute_features_seen;
+                    if (m_attribute_features_drawn >= kAttributeOverlayBudget) continue;
+
+                    const Im3d::Color colour =
+                        overlay_colour(osm::building_type_colour(building.type));
+
+                    // Both rings, not just the roof. The roof ring alone floats
+                    // free of its own footprint at street level on anything taller
+                    // than a house, and the footprint ring alone is invisible from
+                    // above once the roof covers it.
+                    draw_overlay_ring(building.footprint, kOverlayGroundLift, colour);
+                    draw_overlay_ring(building.footprint, building.height, colour);
+                    ++m_attribute_features_drawn;
+                }
+                break;
+
+            case AttributeMode::Road:
+                for (const osm::Road& road : leaf.roads) {
+                    ++m_attribute_features_seen;
+                    if (m_attribute_features_drawn >= kAttributeOverlayBudget) continue;
+
+                    draw_overlay_strip(road.polyline, kOverlayRoadLift,
+                                       overlay_colour(osm::road_type_colour(road.type)));
+                    ++m_attribute_features_drawn;
+                }
+                break;
+
+            case AttributeMode::Area:
+                for (const osm::Area& area : leaf.areas) {
+                    ++m_attribute_features_seen;
+                    if (m_attribute_features_drawn >= kAttributeOverlayBudget) continue;
+
+                    draw_overlay_ring(area.polygon, kOverlayGroundLift,
+                                      overlay_colour(osm::area_type_colour(area.type)));
+                    ++m_attribute_features_drawn;
+                }
+                break;
+
+            case AttributeMode::Tile:
+                // render_3d() has already tinted the solid geometry. All that is
+                // left to add is where one tile stops and the next starts, which
+                // the tint cannot show on its own where two neighbours are both
+                // empty of geometry.
+                ++m_attribute_features_seen;
+                if (m_attribute_features_drawn < kAttributeOverlayBudget) {
+                    draw_overlay_box(leaf.bounds_min, leaf.bounds_max,
+                                     overlay_colour(attribute_leaf_tint(leaf)));
+                    ++m_attribute_features_drawn;
+                }
+                break;
+
+            case AttributeMode::None:
+            case AttributeMode::Count:
+                break;
+        }
+    }
+
+    Im3d::PopDrawState();
+}
+
 void Editor::draw_osm_panel() {
     ImGui::Begin("OSM");
 
@@ -848,6 +1187,8 @@ void Editor::draw_osm_panel() {
     ImGui::SameLine();
     ImGui::Checkbox("##show_buildings", &m_render_buildings);
     ImGui::SameLine(); ImGui::Text("Bldgs");
+
+    draw_attribute_mode_selector();
 
     // Culling controls
     ImGui::Checkbox("Frustum Culling", &m_use_tile_culling);
@@ -3500,19 +3841,28 @@ void Editor::render_3d(GPURenderer& renderer) {
             // no submeshes at all. Road meshes from the new road network DO carry
             // tagged ranges, and those always win over the default; passing Asphalt
             // here only affects the legacy flat road ribbons.
+            //
+            // The tint is white in every mode but Tile, so this is a no-op
+            // multiply unless the user asked for it. Tile is the only attribute
+            // whose value is constant across a whole leaf, which is the only shape
+            // a per-draw tint can express -- the classification modes cannot use
+            // this path at all, because every building in the leaf shares one
+            // merged mesh and one draw call. They go through draw_attribute_overlay().
+            const glm::vec4 tint = attribute_leaf_tint(*node);
+
             if (m_render_areas) {
                 for (uint32_t id : node->area_gpu_ids)
-                    renderer.draw_mesh(id, model, glm::vec4(1.0f), MaterialKey{MaterialId::Grass, 0});
+                    renderer.draw_mesh(id, model, tint, MaterialKey{MaterialId::Grass, 0});
             }
             if (m_render_roads) {
                 for (uint32_t id : node->road_gpu_ids)
-                    renderer.draw_mesh(id, model, glm::vec4(1.0f), MaterialKey{MaterialId::Asphalt, 0});
+                    renderer.draw_mesh(id, model, tint, MaterialKey{MaterialId::Asphalt, 0});
             }
             if (m_render_buildings) {
                 // Buildings are not a road surface. Concrete is the closest of the
                 // eleven slots and is at least not the untagged grey.
                 for (uint32_t id : node->building_gpu_ids)
-                    renderer.draw_mesh(id, model, glm::vec4(1.0f), MaterialKey{MaterialId::Concrete, 0});
+                    renderer.draw_mesh(id, model, tint, MaterialKey{MaterialId::Concrete, 0});
             }
         }
     );
@@ -3580,9 +3930,14 @@ void Editor::render_3d(GPURenderer& renderer) {
                         (!chunk->water_mesh.is_valid() || chunk->water_gpu_id != 0);
                 }
                 
+                // Terrain chunks are a second tile system, with their own grid and
+                // their own streaming bugs, so the Tile mode covers them too. White
+                // in every other mode.
+                const glm::vec4 chunk_tint = attribute_chunk_tint(coord);
+
                 // Draw terrain
                 if (chunk->terrain_gpu_id != 0) {
-                    renderer.draw_mesh(chunk->terrain_gpu_id, model, glm::vec4(1.0f),
+                    renderer.draw_mesh(chunk->terrain_gpu_id, model, chunk_tint,
                                        MaterialKey{MaterialId::Grass, 0});
                 }
 
@@ -3590,7 +3945,7 @@ void Editor::render_3d(GPURenderer& renderer) {
                 // material set -- so water keeps the untagged default rather than
                 // borrowing a surface that would make it look like wet tarmac.
                 if (m_render_water && chunk->water_gpu_id != 0) {
-                    renderer.draw_mesh(chunk->water_gpu_id, model, glm::vec4(1.0f));
+                    renderer.draw_mesh(chunk->water_gpu_id, model, chunk_tint);
                 }
             }
         }

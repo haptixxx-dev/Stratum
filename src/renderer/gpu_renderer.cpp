@@ -7,6 +7,7 @@
  */
 
 #include "renderer/gpu_renderer.hpp"
+#include "renderer/asset_paths.hpp"
 #include "renderer/mesh.hpp"
 #include <spdlog/spdlog.h>
 #include <cmath>
@@ -403,11 +404,8 @@ bool GPURenderer::load_shaders() {
 }
 
 bool GPURenderer::load_simple_shaders() {
-    const char* base = SDL_GetBasePath();
-    std::string base_path = base ? base : "";
-
-    std::string vert_path = base_path + "../../assets/shaders/mesh.vert.spv";
-    std::string frag_path = base_path + "../../assets/shaders/mesh.frag.spv";
+    std::string vert_path = shader_path("mesh.vert.spv");
+    std::string frag_path = shader_path("mesh.frag.spv");
 
     // Simple shader: 1 vertex uniform buffer, 0 fragment uniforms, 0 SSBOs
     m_vertex_shader = load_shader(vert_path.c_str(), SDL_GPU_SHADERSTAGE_VERTEX, 1, 0);
@@ -427,11 +425,8 @@ bool GPURenderer::load_simple_shaders() {
 }
 
 bool GPURenderer::load_pbr_shaders() {
-    const char* base = SDL_GetBasePath();
-    std::string base_path = base ? base : "";
-
-    std::string vert_path = base_path + "../../assets/shaders/mesh_pbr.vert.spv";
-    std::string frag_path = base_path + "../../assets/shaders/mesh_pbr.frag.spv";
+    std::string vert_path = shader_path("mesh_pbr.vert.spv");
+    std::string frag_path = shader_path("mesh_pbr.frag.spv");
 
     // Check if PBR shaders exist
     if (!std::filesystem::exists(vert_path) || !std::filesystem::exists(frag_path)) {
@@ -474,11 +469,8 @@ bool GPURenderer::load_pbr_shaders() {
 }
 
 bool GPURenderer::load_sky_shaders() {
-    const char* base = SDL_GetBasePath();
-    std::string base_path = base ? base : "";
-
-    std::string vert_path = base_path + "../../assets/shaders/sky.vert.spv";
-    std::string frag_path = base_path + "../../assets/shaders/sky.frag.spv";
+    std::string vert_path = shader_path("sky.vert.spv");
+    std::string frag_path = shader_path("sky.frag.spv");
 
     if (!std::filesystem::exists(vert_path) || !std::filesystem::exists(frag_path)) {
         spdlog::warn("Sky shaders not found at {}", vert_path);
@@ -510,11 +502,8 @@ bool GPURenderer::load_sky_shaders() {
 }
 
 bool GPURenderer::load_shadow_shaders() {
-    const char* base = SDL_GetBasePath();
-    std::string base_path = base ? base : "";
-
-    std::string vert_path = base_path + "../../assets/shaders/shadow.vert.spv";
-    std::string frag_path = base_path + "../../assets/shaders/shadow.frag.spv";
+    std::string vert_path = shader_path("shadow.vert.spv");
+    std::string frag_path = shader_path("shadow.frag.spv");
 
     if (!std::filesystem::exists(vert_path) || !std::filesystem::exists(frag_path)) {
         spdlog::warn("Shadow shaders not found at {}", vert_path);

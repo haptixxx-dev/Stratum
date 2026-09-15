@@ -104,6 +104,8 @@ add_library(stratum_core STATIC
     src/osm/coordinates.cpp
     src/osm/mesh_builder.cpp
     src/osm/quadtree.cpp
+    src/osm/attribute_palette.cpp
+    src/osm/building_collision.cpp
 
     # OSM road network
     src/osm/road/way_semantics.cpp
@@ -160,6 +162,15 @@ add_library(stratum_core STATIC
 target_include_directories(stratum_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${EXTERNAL_DIR}
+
+    # draco, for the KHR_draco_mesh_compression path in road_export.cpp.
+    # Linking draco::draco does not carry these: draco/src holds the headers
+    # that #include "draco/..." resolve against, and draco_features.h is
+    # GENERATED into the build tree, so ${CMAKE_BINARY_DIR} is needed too.
+    # Omit either one and the failure is a missing-header error inside draco's
+    # own headers rather than at our include line.
+    ${EXTERNAL_DIR}/draco/src
+    ${CMAKE_BINARY_DIR}
 )
 
 # Vulkan clips depth to [0,1]; GLM defaults to OpenGL's [-1,1]. Without this,
@@ -206,6 +217,7 @@ add_library(stratum_editor_lib STATIC
     src/core/window.cpp
 
     # Renderer
+    src/renderer/asset_paths.cpp
     src/renderer/gpu_renderer.cpp
     src/renderer/gpu_buffer_pool.cpp
     src/renderer/texture.cpp
