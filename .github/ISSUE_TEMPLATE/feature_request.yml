@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose new work, or pick up a feature from the parity plan
+labels: ["enhancement"]
+body:
+  - type: input
+    id: feature_id
+    attributes:
+      label: Feature ID
+      description: >
+        If this is from docs/plans/cityengine_parity.md, give the ID (A1, C7,
+        D3 …). Leave blank for anything new.
+      placeholder: "C1"
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should be built, and roughly where in src/ it lands.
+    validations:
+      required: true
+  - type: textarea
+    id: prior_art
+    attributes:
+      label: How CityEngine does it
+      description: >
+        Optional, but useful. docs/plans/cityengine_feature_inventory.md has
+        the catalogue.
+  - type: textarea
+    id: tests
+    attributes:
+      label: How it gets tested
+      description: Geometry work needs golden tests. Say which.
