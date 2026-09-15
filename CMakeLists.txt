@@ -174,6 +174,8 @@ add_library(stratum_core STATIC
     src/scene/command.cpp
     src/scene/layer.cpp
     src/scene/attributes.cpp
+    src/scene/selection.cpp
+    src/scene/georeference.cpp
 
     # Procedural Generation
     src/procgen/noise.cpp

@@ -98,6 +98,8 @@ set(STRATUM_TEST_SOURCES
     scene/test_command_stack.cpp
     scene/test_layer.cpp
     scene/test_attributes.cpp
+    scene/test_selection.cpp
+    scene/test_georeference.cpp
 )
 
 # Suite names registered with ctest so each can be run and reported separately.
@@ -106,6 +108,8 @@ set(STRATUM_TEST_SUITES
     CommandStack
     SceneLayer
     Attributes
+    Selection
+    Georeference
     WaySemantics
     RoadGraph
     Centerline
