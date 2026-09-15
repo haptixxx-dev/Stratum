@@ -430,8 +430,36 @@ public:
          */
         size_t degenerate = 0;
 
+        /**
+         * @brief Nodes solved as part of a NEIGHBOUR, not failures
+         *
+         * A node closer to another junction than their two radii together is one
+         * compound intersection with it: collect_arms() gives its arms to the
+         * primary and returns none for it. Counted separately because it used to
+         * land in @ref degenerate, and the width-scaled merge took that number
+         * from 41 to 512 on a Lucan extract -- a statistic that reports success
+         * as failure is worse than no statistic.
+         *
+         * With the two split apart, that extract reports 512 here and 0 in
+         * @ref degenerate. The 41 nodes that failed to solve before the merge
+         * were themselves nodes standing too close together, so merging them is
+         * what fixed them; they did not survive as failures alongside it.
+         */
+        size_t merged_into_neighbour = 0;
+
         /// Junction polygons whose ring crossed itself and were filled as a convex hull
-        size_t self_intersecting = 0;  ///< Rings that needed the hull fallback: crossing OR clockwise
+        /**
+         * @brief Rings that needed the hull fallback
+         *
+         * Every reason JunctionPolygon::needs_hull_fallback() gives, not only the
+         * one this field is named after: a ring that crosses itself, one wound
+         * clockwise, and one that does not contain the point its own arms leave
+         * from. The name is kept because it is what an operator greps for and
+         * what the log line says; the count has always been "rings the fill could
+         * not use", and a fill thrown over a hull is the same artefact whichever
+         * of the three produced it.
+         */
+        size_t self_intersecting = 0;
 
         /**
          * @brief Edges where TrimConfig::max_trim_fraction bound the demanded trim

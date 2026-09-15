@@ -240,6 +240,10 @@ struct JunctionNodeSolve {
     std::vector<glm::dvec2> footprint;  ///< Carve boundary
     float height = 0.0f;            ///< World Y of the carriageway surface at this node
 
+    /// This node's ground is already covered by a neighbour that absorbed it. Not
+    /// a failure; see JunctionBuilder::Stats::merged_into_neighbour.
+    bool merged_into_neighbour = false;
+
     /**
      * @brief Trims the taper wedge in `mesh` was actually built over
      *
@@ -398,6 +402,16 @@ bool JunctionBuilder::solve_trims(RoadGraph& graph,
             const size_t degree = node.degree();
 
             if (degree >= 3) {
+                // Degree is topology; being an INTERSECTION is not. A node whose
+                // arms are all footways -- a crossing meeting the pavement it
+                // leaves from, a path forking in a park -- gets no trim, no
+                // polygon and no kerb ring, and its ways run through unbroken.
+                // Solving it as a road junction is what chopped continuous
+                // pavement into floating slabs with kerbs across them.
+                if (!node.is_road_junction()) {
+                    continue;
+                }
+
                 slot.participates = true;
                 slot.emit = true;
 
@@ -411,6 +425,17 @@ bool JunctionBuilder::solve_trims(RoadGraph& graph,
                                          kCoincidentRadius, &cluster);
                 m_junction_owner[n] =
                     cluster.empty() ? static_cast<GraphNodeId>(n) : cluster.front();
+
+                // A node whose neighbour already solved the ground they share is
+                // not a failure, and must not be reported as one. collect_arms()
+                // reports it by returning NO arms while naming a different primary
+                // -- see its "Near-coincident junctions" section. Left folded in
+                // with the genuinely unsolvable, the width-scaled merge took
+                // `degenerate` from 41 to 512 on a Lucan extract, and all 512 of
+                // those are merges: split out here, `degenerate` reads 0.
+                slot.merged_into_neighbour =
+                    slot.arms.empty() && cluster.size() > 1 &&
+                    cluster.front() != static_cast<GraphNodeId>(n);
 
                 const bool solved = solve_arm_trims(graph, centerlines,
                                                     static_cast<GraphNodeId>(n), slot.arms,
@@ -844,7 +869,11 @@ std::vector<Junction> JunctionBuilder::build_geometry(
                 }
                 break;
             case JunctionKind::Degenerate:
-                ++m_stats.degenerate;
+                if (slot.merged_into_neighbour) {
+                    ++m_stats.merged_into_neighbour;
+                } else {
+                    ++m_stats.degenerate;
+                }
                 break;
             case JunctionKind::Taper:
                 ++m_stats.tapers;
@@ -864,11 +893,11 @@ std::vector<Junction> JunctionBuilder::build_geometry(
         std::chrono::duration<double, std::milli>(finished - m_solve->started).count();
 
     spdlog::info("JunctionBuilder: Solved {} junctions, {} roundabouts, {} tapers, {} dead ends "
-                 "({} degenerate, {} self-intersecting, {} over-trimmed edges, "
-                 "{} with a dropped kerb) in {:.1f} ms",
+                 "({} merged into a neighbour, {} degenerate, {} self-intersecting, "
+                 "{} over-trimmed edges, {} with a dropped kerb) in {:.1f} ms",
                  m_stats.junctions, m_stats.roundabouts, m_stats.tapers, m_stats.dead_ends,
-                 m_stats.degenerate, m_stats.self_intersecting, m_stats.over_trimmed_edges,
-                 m_dropped_kerb_junctions, m_stats.build_ms);
+                 m_stats.merged_into_neighbour, m_stats.degenerate, m_stats.self_intersecting,
+                 m_stats.over_trimmed_edges, m_dropped_kerb_junctions, m_stats.build_ms);
 
     return out;
 }

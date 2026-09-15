@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  footway_junction.osm - a degree-3 node whose arms are ALL pedestrian.
+
+  This is the single commonest node shape in a city extract and it is not an
+  intersection. Way 20000 is a pavement running east-west. Node 2002 is INTERIOR
+  to it, and way 20010 - a footway=crossing - leaves that node heading south to
+  the carriageway. Three arms meet there: two pavement, one crossing. Every one
+  of them is a 2 metre footway.
+
+  Nothing in the junction path used to look at a road class, so this solved as a
+  road junction: both halves of the pavement trimmed back from node 2002 and a
+  kerb ring wrapped round the gap. On a real extract that is one chopped pavement
+  per mapped crossing, which is thousands.
+
+  Way 20020 is a carriageway well to the south, sharing NO node with any of the
+  above. It is here so the fixture still exercises the ordinary path and a test
+  can show the filter is selective rather than having disabled junctions outright.
+
+  Expected:
+    - node 2002 is degree 3 and carries 0 carriageway arms
+    - it is NOT solved: no junction piece, and neither pavement edge is trimmed
+    - the pavement's geometry is continuous through it
+-->
+<osm version="0.6" generator="stratum-test-fixture">
+  <bounds minlat="53.32900" minlon="-6.28110" maxlat="53.33010" maxlon="-6.27890"/>
+
+  <!-- Way 20000: the pavement, running west to east. 2002 is interior. -->
+  <node id="2001" version="1" lat="53.33000" lon="-6.28100"/>
+  <node id="2002" version="1" lat="53.33000" lon="-6.28000"/>
+  <node id="2003" version="1" lat="53.33000" lon="-6.27900"/>
+
+  <!-- Way 20010: the crossing, leaving 2002 southward. -->
+  <node id="2011" version="1" lat="53.32970" lon="-6.28000"/>
+
+  <!-- Way 20020: an unrelated carriageway, sharing nothing. -->
+  <node id="2021" version="1" lat="53.32910" lon="-6.28100"/>
+  <node id="2022" version="1" lat="53.32910" lon="-6.27900"/>
+
+  <way id="20000" version="1">
+    <nd ref="2001"/>
+    <nd ref="2002"/>
+    <nd ref="2003"/>
+    <tag k="highway" v="footway"/>
+    <tag k="footway" v="sidewalk"/>
+  </way>
+
+  <way id="20010" version="1">
+    <nd ref="2002"/>
+    <nd ref="2011"/>
+    <tag k="highway" v="footway"/>
+    <tag k="footway" v="crossing"/>
+    <tag k="crossing" v="marked"/>
+  </way>
+
+  <way id="20020" version="1">
+    <nd ref="2021"/>
+    <nd ref="2022"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Rathdown Avenue"/>
+  </way>
+</osm>

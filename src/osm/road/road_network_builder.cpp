@@ -122,6 +122,7 @@
  */
 
 #include "osm/road/road_network_builder.hpp"
+#include "osm/road/way_semantics.hpp"
 
 #include <TaskScheduler.h>
 #include <spdlog/spdlog.h>
@@ -1286,12 +1287,48 @@ RoadNetwork RoadNetworkBuilder::build(const ParsedOSMData& data, const RoadNetwo
     // ── Stage 4: corridors, from the TRIMMED centerline ──────────────────────
     std::vector<EdgeSlot> slots(edge_count);
 
+    // Which edges get a swept surface at all, decided from each way's OWN TAGS.
+    //
+    // The pipeline used to classify a way from `highway=*` alone, so every
+    // `highway=footway` became a 2 metre MaterialId::Sidewalk ribbon. That is
+    // right for a pavement and wrong for the other things OSM spells that way --
+    // above all `footway=crossing`, a pedestrian route ACROSS a carriageway, which
+    // came out as a slab of paving laid over the asphalt at every junction that
+    // had one mapped.
+    //
+    // Resolved once, here, rather than inside the threaded loop below: it is a
+    // hash lookup per edge and the answer cannot change during the sweep.
+    std::vector<uint8_t> extrude_edge(edge_count, 1u);
+    size_t surfaceless_edges = 0;
+    for (size_t i = 0; i < edge_count; ++i) {
+        const GraphEdge& edge = m_graph.edge(static_cast<EdgeId>(i));
+        const WaySemantics semantics = classify_way(edge.type, way_tags(data, edge.source_way));
+        if (!semantics.extrude_surface) {
+            extrude_edge[i] = 0u;
+            ++surfaceless_edges;
+        }
+    }
+    if (surfaceless_edges > 0) {
+        spdlog::info("RoadNetworkBuilder: {} of {} edges carry no surface of their own "
+                     "(crossings, links and areas); they keep their centreline and their "
+                     "place in the graph, and simply grow no ribbon",
+                     surfaceless_edges, edge_count);
+    }
+
     run_edge_ranges(edge_count, [&](size_t begin, size_t end) {
         for (size_t i = begin; i < end; ++i) {
             EdgeSlot& slot = slots[i];
 
             if (is_consumed(i)) {
                 slot.consumed = true;
+                continue;
+            }
+
+            // No surface of its own -- see extrude_edge above. Left as an empty
+            // slot rather than marked consumed: `consumed` means a roundabout
+            // annulus already supplied this edge's ribbon, which is a different
+            // claim, and one the statistics downstream report separately.
+            if (extrude_edge[i] == 0u) {
                 continue;
             }
 

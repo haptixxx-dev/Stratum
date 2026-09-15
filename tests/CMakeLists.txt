@@ -73,6 +73,9 @@ set(STRATUM_TEST_SOURCES
     # has no dependency on the reduction work guarded below.
     road/test_road_style.cpp
 
+    # What a way IS, read from its whole tag set rather than from highway=* alone.
+    road/test_way_semantics.cpp
+
     procgen/test_terrain_carve.cpp
     osm/test_quadtree_roads.cpp
 
@@ -83,6 +86,7 @@ set(STRATUM_TEST_SOURCES
 # Suite names registered with ctest so each can be run and reported separately.
 set(STRATUM_TEST_SUITES
     AmbientOcclusion
+    WaySemantics
     RoadGraph
     Centerline
     RoadProfile

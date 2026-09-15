@@ -275,14 +275,45 @@ struct JunctionPolygon {
     bool inverted = false;
 
     /**
+     * @brief The ring excludes a point one of its own arms leaves from
+     *
+     * A junction polygon is the ground where the arms MEET. A ring that does not
+     * contain the point an arm starts at is not that ground: the fill sits off to
+     * one side of the roads it is supposed to join, and the terrain under the
+     * meeting point is flattened by nothing.
+     *
+     * It happens where the trims were clamped. TrimConfig::max_trim_fraction cuts
+     * a demand back on a short edge, so the mouths come to rest closer in than the
+     * junction's own shape asks for; with most of the arms clamped, the ring drawn
+     * through them can pass on the WRONG SIDE of the node. On a Lucan extract nine
+     * of them had every arm but one clamped, and one had two arms trimmed to 0.25 m
+     * and 0.00 m -- both mouths standing on the node itself.
+     *
+     * No trim can repair that: the edges really are shorter than the junction is
+     * wide. What can be repaired is the silence. Left unflagged the ring is used
+     * as the carve's winding test, which is what punches a hole in the terrain
+     * under a junction.
+     *
+     * Tested against ArmRef::origin rather than against a node id, so it costs the
+     * builder nothing and it states the right thing for a MERGED cluster, where
+     * the ring must cover every member the arms came from and not just the
+     * primary. It is a tight test: 7,061 of 7,071 simple rings on that extract
+     * satisfy it, and the ten that do not are the ten that are wrong.
+     */
+    bool excludes_origin = false;
+
+    /**
      * @brief True when the ring may not be used as a simple CCW outline
      *
      * The one predicate every consumer of a JunctionPolygon should ask. A ring
      * that crosses itself has no meaningful interior; a ring wound clockwise
-     * bounds the complement of what it appears to. Neither can be filled by
+     * bounds the complement of what it appears to; a ring that excludes the point
+     * its arms leave from is not the junction's ground. None can be filled by
      * earcut, offset outward, or used as a winding test.
      */
-    [[nodiscard]] bool needs_hull_fallback() const { return self_intersecting || inverted; }
+    [[nodiscard]] bool needs_hull_fallback() const {
+        return self_intersecting || inverted || excludes_origin;
+    }
 };
 
 // ============================================================================
