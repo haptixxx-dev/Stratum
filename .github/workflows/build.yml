@@ -110,6 +110,16 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install ninja -y
 
+      # libosmium needs zlib, bzip2 and expat, and external/CMakeLists.txt asks
+      # for all three with find_package(... REQUIRED). Linux installs them from
+      # apt and macOS has them in the SDK; the Windows runners ship none of
+      # them, so configure got past the compiler check only to die on
+      # "Could NOT find ZLIB". vcpkg is preinstalled on the runner image.
+      - name: Install zlib, bzip2 and expat (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: vcpkg install zlib:x64-windows bzip2:x64-windows expat:x64-windows
+
       # Ninja + cl needs the MSVC environment on PATH. Without this the
       # configure step fails with "CMAKE_CXX_COMPILER: cl is not a full path
       # and was not found in the PATH", which is what broke every Windows
@@ -133,7 +143,8 @@ jobs:
           key: build-${{ matrix.os }}
           variant: ${{ runner.os == 'Windows' && 'sccache' || 'ccache' }}
 
-      - name: Configure CMake
+      - name: Configure CMake (Linux and macOS)
+        if: runner.os != 'Windows'
         shell: bash
         run: >
           cmake -B "${{ steps.strings.outputs.build-output-dir }}"
@@ -141,6 +152,21 @@ jobs:
           -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
           -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DSTRATUM_ENABLE_TRACY=ON
+          -DSTRATUM_ENABLE_PYTHON=ON
+          -S "${{ github.workspace }}"
+
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >
+          cmake -B "${{ steps.strings.outputs.build-output-dir }}"
+          -G Ninja
+          -DCMAKE_CXX_COMPILER=cl
+          -DCMAKE_C_COMPILER=cl
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows
           -DSTRATUM_ENABLE_TRACY=ON
           -DSTRATUM_ENABLE_PYTHON=ON
           -S "${{ github.workspace }}"
