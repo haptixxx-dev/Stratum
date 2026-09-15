@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file road_network_builder.cpp
  * @brief Whole-network road geometry, built once against the graph

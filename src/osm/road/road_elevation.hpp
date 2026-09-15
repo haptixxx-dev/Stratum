@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file road_elevation.hpp
  * @brief Graph-aware vertical solve: roads follow the terrain without following its noise

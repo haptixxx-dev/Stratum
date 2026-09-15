@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file road_export.cpp
  * @brief Implementation of the chunked, material-preserving network exporter

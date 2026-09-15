@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_gpu_buffer_pool.cpp
  * @brief The suballocator: reuse, coalescing, alignment, and the stat that says it broke

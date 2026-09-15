@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file crossings.hpp
  * @brief Pedestrian crossings: zebra stripes and the dropped kerbs they need

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_junction_merge.cpp
  * @brief What a near-coincident junction cluster owes the consumers keyed by node

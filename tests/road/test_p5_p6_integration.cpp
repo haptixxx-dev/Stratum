@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_p5_p6_integration.cpp
  * @brief The whole pipeline with P5 and P6 on, over every fixture, and off again

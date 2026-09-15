@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_terrain_carve.cpp
  * @brief Terrain carve tests: footprint, falloff, height interpolation, overlap, concurrency

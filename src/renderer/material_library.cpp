@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file material_library.cpp
  * @brief MaterialKey -> MaterialDef resolution, the built-in table, and set I/O

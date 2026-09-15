@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file collision_mesh.hpp
  * @brief The road as a physics engine wants it: a surface, not a model

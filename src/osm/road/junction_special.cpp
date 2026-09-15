@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file junction_special.cpp
  * @brief Roundabout rings, degree-2 profile tapers, and dead-end caps

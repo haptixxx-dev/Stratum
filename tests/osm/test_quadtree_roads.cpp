@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_quadtree_roads.cpp
  * @brief QuadTree::assign_road_pieces() under the piece counts P5 and P6 produce

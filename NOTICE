@@ -1,0 +1,32 @@
+Stratum
+Copyright 2026 Seamus Mullan and the Stratum contributors
+
+This product includes software developed as part of the Stratum project
+(https://github.com/haptixxx-dev/Stratum).
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy of
+the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations under
+the License.
+
+--------------------------------------------------------------------------
+
+Stratum vendors its dependencies as git submodules under external/. Those
+dependencies are licensed by their respective authors under their own terms,
+which are reproduced in each submodule and summarised in
+THIRD_PARTY_LICENSES.md. Stratum's Apache-2.0 licence applies to Stratum's own
+source, not to the vendored dependencies.
+
+Stratum reads and processes OpenStreetMap data. OpenStreetMap data itself is
+licensed by the OpenStreetMap Foundation under the Open Database License
+(ODbL) 1.0. Maps and models produced from OSM data are derivative works of
+that data and carry the ODbL's attribution and share-alike obligations. That
+obligation attaches to the data you import and export, not to Stratum's code.
+See https://www.openstreetmap.org/copyright.

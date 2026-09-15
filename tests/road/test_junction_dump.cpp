@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_junction_dump.cpp
  * @brief Writes the P4 junction geometry to OBJ and reports what the solver decided

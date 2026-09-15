@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_road_network_elevated.cpp
  * @brief End-to-end RoadNetworkBuilder tests with a terrain sampler attached

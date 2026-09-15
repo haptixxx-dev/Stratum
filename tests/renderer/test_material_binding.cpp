@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_material_binding.cpp
  * @brief The three renderer decisions that are a crash or a wrong sign rather than a wrong pixel

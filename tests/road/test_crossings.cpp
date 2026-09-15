@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_crossings.cpp
  * @brief Pedestrian crossings: locating them, clipping the zebra, dropping the kerb

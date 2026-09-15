@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file procedural_texture.cpp
  * @brief Implementation of the generated surface textures and the markings atlas

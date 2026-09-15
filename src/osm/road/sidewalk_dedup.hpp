@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file sidewalk_dedup.hpp
  * @brief Stop a doubly-mapped sidewalk from being built twice

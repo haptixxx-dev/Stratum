@@ -3,6 +3,9 @@
 **Build 3D worlds layer by layer**
 (yes its corny i know)
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Build](https://github.com/haptixxx-dev/Stratum/actions/workflows/build.yml/badge.svg)](https://github.com/haptixxx-dev/Stratum/actions/workflows/build.yml)
+
 Stratum is a desktop application for converting OpenStreetMap data into optimized, textured 3D maps for use in video games.
 
 It (will) support kitbashing, LOD generation, MaterialX materials, and exports to industry-standard formats.
@@ -254,7 +257,9 @@ The documentation includes:
 
 ## Dependencies
 
-There's a couple xd
+There's a couple xd. The authoritative list, with verified SPDX identifiers and
+the lz4 / glm / stb dual-licensing caveats, is in
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
 | Category | Library | License |
 | -------- | ------- | ------- |
@@ -339,7 +344,35 @@ This is about as serious as The Onion is.
 
 ## License
 
-All Rights Reserved
+Stratum is licensed under the **Apache License, Version 2.0**. See [`LICENSE`](LICENSE)
+and [`NOTICE`](NOTICE).
+
+    Copyright 2026 Seamus Mullan and the Stratum contributors
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+Vendored dependencies keep their own licences. None is copyleft. The full
+inventory, with per-dependency notes, is in
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
+
+### A note on OpenStreetMap data
+
+Stratum's licence covers Stratum. It does not cover the data you feed it.
+OpenStreetMap data is licensed under the [ODbL 1.0](https://www.openstreetmap.org/copyright)
+by the OpenStreetMap Foundation, and 3D models generated from OSM input are
+derivative works of that data, so they carry the ODbL's attribution and
+share-alike obligations. If you ship a city built from OSM, that obligation is
+yours to meet.
 
 ---
 
