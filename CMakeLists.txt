@@ -172,6 +172,7 @@ add_library(stratum_core STATIC
     # edit goes through. Engine-agnostic by the same rule as the rest of
     # stratum_core -- no SDL, no ImGui, no renderer.
     src/scene/command.cpp
+    src/scene/layer.cpp
 
     # Procedural Generation
     src/procgen/noise.cpp
