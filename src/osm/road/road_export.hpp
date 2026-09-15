@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file road_export.hpp
  * @brief Writing the finished network to disk: clip once, assign once, one file per chunk
@@ -32,8 +35,10 @@
  * which stratum_core already links. It deliberately does NOT go through assimp:
  * assimp is linked into stratum_editor_lib, not stratum_core, and export must stay
  * core so it is testable with no GPU and no window. draco is linked into core and
- * is NOT used here; mesh compression is a later concern and an uncompressed glTF
- * is what you want while the geometry is still being debugged.
+ * drives ExportConfig::draco_compression, which is OFF by default: an uncompressed
+ * glTF is what you want while the geometry is still being debugged, because
+ * quantised positions hide exactly the millimetre errors an export exists to
+ * reveal.
  *
  * Everything in this file lives in stratum_core: no SDL, no ImGui, no rendering
  * API.
@@ -76,8 +81,65 @@ enum class ExportFormat : uint8_t {
      * Positions, normals, UV0, COLOR_0 and TANGENT are written; indices are
      * unsigned int. Not `.glb`, because a separate `.bin` lets a chunk's geometry
      * be inspected without a JSON parser.
+     *
+     * ExportConfig::draco_compression replaces the raw attribute and index bytes
+     * with one KHR_draco_mesh_compression stream per primitive. It is off by
+     * default.
      */
     Gltf
+};
+
+/**
+ * @brief Quantisation and speed knobs for KHR_draco_mesh_compression
+ *
+ * Draco compresses by QUANTISING: every attribute is snapped to a lattice whose
+ * step is the attribute's own extent divided by `2^bits`. The extent is the
+ * encoded primitive's, not the world's, so the same bit count buys different
+ * precision in different chunks and the defaults below are chosen against the
+ * largest extent the exporter produces -- one ExportConfig::chunk_size cell.
+ *
+ * @note Ignored unless ExportConfig::draco_compression is true.
+ */
+struct DracoConfig {
+    /**
+     * @brief Position bits, and the only one worth tuning
+     *
+     * 16 rather than the 11-14 most glTF exporters default to, because a chunk is
+     * 500 m across and a kerb is 120 mm high. 14 bits over 500 m is a 30 mm step,
+     * which is a quarter of the kerb: the kerb face collapses into a staircase and
+     * the sidewalk it separates starts z-fighting the carriageway. 16 bits is a
+     * 7.6 mm step over the same cell, below anything the road profile models.
+     */
+    int position_bits = 16;
+
+    /// Normal bits. 10 is the usual octahedral-grade default and is ample for flat road decks.
+    int normal_bits = 10;
+
+    /// UV bits. Road UVs are in metres and run to the length of a piece, so 12 is the floor.
+    int uv_bits = 12;
+
+    /// COLOR_0 bits. The channel is a debug tint here, so 8 matches the precision it came from.
+    int color_bits = 8;
+
+    /**
+     * @brief Bits for attributes Draco has no named slot for
+     *
+     * TANGENT only. Draco 1.5.7 compiles its TANGENT enumerator out unless
+     * DRACO_TRANSCODER_SUPPORTED is set, which external/CMakeLists.txt turns OFF,
+     * so tangents travel as a GENERIC attribute -- which is what every other glTF
+     * Draco encoder does anyway. The extension names it TANGENT regardless,
+     * because a decoder resolves attributes by unique id and never by type.
+     */
+    int generic_bits = 12;
+
+    /**
+     * @brief Encode and decode speed, 0 slowest and smallest, 10 fastest and largest
+     *
+     * 5 is Draco's own middle. Kept below 10 deliberately: at 10 Draco drops to
+     * sequential encoding, which does not compress connectivity at all, and a road
+     * chunk is mostly connectivity.
+     */
+    int speed = 5;
 };
 
 /**
@@ -153,6 +215,42 @@ struct ExportConfig {
      *       ignored for glTF and a warning is logged.
      */
     bool y_up = true;
+
+    /**
+     * @brief Compress each glTF primitive with KHR_draco_mesh_compression
+     *
+     * OFF by default, and meant to stay off until the geometry it is compressing
+     * is trusted. Draco quantises, so it is lossy by construction: a position
+     * error introduced here is indistinguishable from one the road builder made,
+     * and an uncompressed export is the only version of a chunk you can diff
+     * against the mesh in memory.
+     *
+     * ### What turning it on changes
+     *
+     * Each primitive is encoded on its own -- its own Draco mesh, holding only the
+     * vertices its SubMesh range references -- and lands in its own bufferView.
+     * The `.bin` then holds compressed streams and nothing else; the uncompressed
+     * attribute and index bytes are not written at all.
+     *
+     * The uncompressed ACCESSORS are still written, with the right `count`,
+     * `componentType`, `type` and POSITION `min`/`max`, and with no `bufferView`.
+     * That is what the extension requires and it is the half that is usually got
+     * wrong: an accessor that keeps pointing at a bufferView tells a loader the
+     * raw data is there when it is not, and dropping the accessors entirely leaves
+     * the primitive with no declared vertex count at all.
+     *
+     * The extension name is added to `extensionsUsed` AND to `extensionsRequired`.
+     * Required, not merely used, because a glTF whose accessors carry no
+     * bufferView decodes to nothing in a loader that skips the extension, and
+     * failing to load is better than loading an empty chunk.
+     *
+     * @note glTF only. ExportFormat::Obj has nowhere to put a compressed stream,
+     *       so setting this with OBJ is ignored and a warning is logged.
+     */
+    bool draco_compression = false;
+
+    /// Quantisation and speed for @ref draco_compression. Ignored when it is false.
+    DracoConfig draco;
 
     /**
      * @brief Prefix for every emitted material name

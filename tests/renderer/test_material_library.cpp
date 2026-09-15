@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_material_library.cpp
  * @brief The MaterialKey -> MaterialDef lookup, its fallback chain, and its JSON set files

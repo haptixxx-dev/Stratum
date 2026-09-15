@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 #pragma once
 
 #include <imgui.h>
@@ -8,6 +11,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "osm/attribute_palette.hpp"
 #include "osm/parser.hpp"
 #include "osm/mesh_builder.hpp"
 #include "osm/quadtree.hpp"
@@ -104,6 +108,64 @@ private:
     void draw_render_settings();
     void draw_memory_panel();
 
+    // ------------------------------------------------------------------------
+    // Colour-by-attribute viewport mode
+    //
+    // Three thin pieces around one pure table. Which attribute is selected, the
+    // ImGui that selects it, and an Im3d pass that paints it -- the enum-to-colour
+    // mapping itself is osm/attribute_palette.hpp and lives in stratum_core so it
+    // can be tested without a window. Nothing here decides a colour.
+    // ------------------------------------------------------------------------
+
+    /// Mode combo, legend, and the overlay's per-frame cost. Drawn inside the OSM panel.
+    void draw_attribute_mode_selector();
+
+    /**
+     * @brief Paint this frame's classified features in their attribute colours
+     *
+     * An Im3d overlay rather than a recolour of the uploaded meshes, and that is a
+     * deliberate limitation rather than a shortcut: a quadtree leaf holds ONE
+     * merged building mesh and ONE merged area mesh (see
+     * QuadTree::build_node_meshes_internal), so there is no per-feature draw call
+     * to tint and no per-feature vertex range to rewrite. Per-feature colour would
+     * mean re-uploading every leaf's vertex buffer on every mode change.
+     *
+     * The outlines come from the leaf's CPU-side Building, Road and Area records,
+     * which is also the only place the classification still exists -- the merged
+     * mesh does not carry it.
+     *
+     * Does nothing in AttributeMode::None. In AttributeMode::Tile the SOLID
+     * geometry is already tinted by render_3d(), so this draws only the leaf
+     * boundary that the tint is showing.
+     */
+    void draw_attribute_overlay();
+
+    /**
+     * @brief Colour tint render_3d() passes for one leaf's geometry
+     *
+     * White -- that is, no tint -- in every mode but Tile. Tile is the one mode
+     * whose colour is constant across a whole leaf, which is exactly what a
+     * per-draw tint can express, so it is the one mode that recolours the real
+     * surfaces rather than drawing an overlay.
+     *
+     * @param node Leaf being drawn
+     * @return Multiplied into the material's base colour by draw_mesh()
+     */
+    [[nodiscard]] glm::vec4 attribute_leaf_tint(const osm::QuadTreeNode& node) const;
+
+    /**
+     * @brief The same tint for a procedural terrain chunk
+     *
+     * Terrain chunks are a separate tile system from the quadtree with their own
+     * integer coordinates, and streaming bugs land in both, so the mode covers
+     * both. The two use the same cycle and will sometimes agree on a colour where
+     * they overlap; the grids are different sizes, so the seams still read.
+     *
+     * @param coord Chunk coordinate
+     * @return Multiplied into the material's base colour by draw_mesh()
+     */
+    [[nodiscard]] glm::vec4 attribute_chunk_tint(const procgen::TerrainChunkCoord& coord) const;
+
     /**
      * @brief The material library editor
      *
@@ -173,6 +235,31 @@ private:
     bool m_render_roads = true;
     bool m_render_buildings = true;
     bool m_show_tile_grid = false;
+
+    /// Which attribute the viewport paints by. None is normal shading.
+    osm::AttributeMode m_attribute_mode = osm::AttributeMode::None;
+
+    /// Show the swatch-and-name key for the selected mode.
+    bool m_attribute_show_legend = true;
+
+    // What last frame's overlay actually drew, and what it wanted to draw. They
+    // differ when the budget below clamped it, and the panel says so -- an
+    // overlay that silently stops halfway across a city reads as "these buildings
+    // are unclassified", which is the one wrong conclusion this mode must never
+    // invite.
+    size_t m_attribute_features_drawn = 0;
+    size_t m_attribute_features_seen = 0;
+
+    /**
+     * @brief Features the attribute overlay will outline in one frame
+     *
+     * Im3d buffers every vertex on the CPU and uploads the lot once per frame, so
+     * an unbounded overlay over a city-sized import is a multi-megabyte upload and
+     * a visible stall. Leaves are visited front to back, so the budget spends
+     * itself on what is nearest, which is what a user is looking at.
+     */
+    static constexpr size_t kAttributeOverlayBudget = 20000;
+
     // Re-submit the batched OSM geometry through Im3d as debug triangles. Off by
     // default: render_3d() already draws the same quadtree geometry as GPU meshes,
     // so enabling this double-draws the whole scene.

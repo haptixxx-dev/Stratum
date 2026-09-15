@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file lod_chunk.hpp
  * @brief LOD built from MERGED per-chunk geometry rather than per piece

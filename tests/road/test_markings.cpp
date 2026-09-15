@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_markings.cpp
  * @brief Painted lane markings: phase, plane, class rules, arrows, and the atlas

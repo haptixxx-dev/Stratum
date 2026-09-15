@@ -22,6 +22,54 @@ option(STRATUM_BUILD_DOCS "Build documentation with Doxygen" OFF)
 option(STRATUM_USE_LLD "Link with LLD instead of the default linker" OFF)
 
 # ═══════════════════════════════════════════════════════════════════
+# MSVC
+# ═══════════════════════════════════════════════════════════════════
+# Set before add_subdirectory(external) so the vendored trees inherit it too.
+#
+# NOMINMAX is the load-bearing one. <windows.h> defines min and max as
+# function-like macros, and the moment anything pulls it in transitively, every
+# std::numeric_limits<T>::max() in the tree stops parsing:
+#
+#     osmium/osm/location.hpp(188): error C2589: '(': illegal token on right
+#                                   side of '::'
+#
+# libosmium uses that idiom throughout, so the first Windows build of this
+# project died in a wall of syntax errors inside headers that are perfectly
+# valid C++. The errors point at the library; the cause is the macro.
+#
+# WIN32_LEAN_AND_MEAN keeps the rest of the Win32 surface out of the way, and
+# _USE_MATH_DEFINES is what makes M_PI exist at all under MSVC.
+if(MSVC)
+    add_compile_definitions(
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        _USE_MATH_DEFINES
+        _CRT_SECURE_NO_WARNINGS
+    )
+endif()
+
+# Applied per-target rather than globally, and that is not a style choice.
+#
+# /utf-8 is shorthand for /source-charset:utf-8 /execution-charset:utf-8, and
+# MSVC REFUSES a command line carrying both it and an explicit /source-charset:
+#
+#     cl : Command line error D8016 : '/utf-8' and '/source-charset:utf-8'
+#          command-line options are incompatible
+#
+# assimp sets /source-charset:utf-8 on its own targets, so a global /utf-8 makes
+# every assimp translation unit fail to launch the compiler at all. Stratum's
+# own sources still need it -- this tree has box drawing and accented names in
+# comments, and without it MSVC reads them as the system codepage.
+#
+# NOMINMAX and friends above stay global on purpose: the vendored trees need
+# those, and none of them conflicts.
+function(stratum_msvc_options target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /utf-8 /EHsc)
+    endif()
+endfunction()
+
+# ═══════════════════════════════════════════════════════════════════
 # GLOBAL SETTINGS
 # ═══════════════════════════════════════════════════════════════════
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -73,6 +121,8 @@ add_library(stratum_core STATIC
     src/osm/coordinates.cpp
     src/osm/mesh_builder.cpp
     src/osm/quadtree.cpp
+    src/osm/attribute_palette.cpp
+    src/osm/building_collision.cpp
 
     # OSM road network
     src/osm/road/way_semantics.cpp
@@ -129,6 +179,15 @@ add_library(stratum_core STATIC
 target_include_directories(stratum_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${EXTERNAL_DIR}
+
+    # draco, for the KHR_draco_mesh_compression path in road_export.cpp.
+    # Linking draco::draco does not carry these: draco/src holds the headers
+    # that #include "draco/..." resolve against, and draco_features.h is
+    # GENERATED into the build tree, so ${CMAKE_BINARY_DIR} is needed too.
+    # Omit either one and the failure is a missing-header error inside draco's
+    # own headers rather than at our include line.
+    ${EXTERNAL_DIR}/draco/src
+    ${CMAKE_BINARY_DIR}
 )
 
 # Vulkan clips depth to [0,1]; GLM defaults to OpenGL's [-1,1]. Without this,
@@ -137,6 +196,7 @@ target_include_directories(stratum_core PUBLIC
 # translation unit that builds or consumes a projection matrix must agree --
 # a mismatch is an ODR violation with no diagnostic.
 target_compile_definitions(stratum_core PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE)
+stratum_msvc_options(stratum_core)
 
 target_link_libraries(stratum_core PUBLIC
     # Math
@@ -175,6 +235,7 @@ add_library(stratum_editor_lib STATIC
     src/core/window.cpp
 
     # Renderer
+    src/renderer/asset_paths.cpp
     src/renderer/gpu_renderer.cpp
     src/renderer/gpu_buffer_pool.cpp
     src/renderer/texture.cpp
@@ -193,6 +254,8 @@ target_include_directories(stratum_editor_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${EXTERNAL_DIR}
 )
+
+stratum_msvc_options(stratum_editor_lib)
 
 target_link_libraries(stratum_editor_lib PUBLIC
     stratum_core
@@ -236,6 +299,7 @@ endif()
 # STRATUM EXECUTABLE
 # ═══════════════════════════════════════════════════════════════════
 add_executable(stratum src/main.cpp)
+stratum_msvc_options(stratum)
 target_link_libraries(stratum PRIVATE stratum_editor_lib)
 
 # ═══════════════════════════════════════════════════════════════════

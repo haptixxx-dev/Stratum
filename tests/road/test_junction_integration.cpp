@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_junction_integration.cpp
  * @brief Whole-network P4 tests: ribbons must stop at the junctions they meet

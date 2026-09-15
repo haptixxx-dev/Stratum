@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_pbr_shader.cpp
  * @brief One pixel through the real PBR pipeline, for the two defects only a draw can show

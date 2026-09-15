@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file material_library.hpp
  * @brief Resolves a MaterialKey to textures and PBR parameters, and the shader contract

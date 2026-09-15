@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_crossing_kerb_fixes.cpp
  * @brief Regressions for the crossing and kerb defects found in the P5 review

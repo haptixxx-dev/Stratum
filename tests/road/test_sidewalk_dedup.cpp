@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_sidewalk_dedup.cpp
  * @brief The doubly-mapped sidewalk, and the footways that are not one

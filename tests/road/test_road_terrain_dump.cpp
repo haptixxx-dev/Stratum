@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_road_terrain_dump.cpp
  * @brief P3 visual dump and stats: roads on rolling terrain, and the terrain they carve

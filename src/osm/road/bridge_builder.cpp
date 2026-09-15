@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file bridge_builder.cpp
  * @brief Implementation of the deck slab, parapets and piers of a bridge edge

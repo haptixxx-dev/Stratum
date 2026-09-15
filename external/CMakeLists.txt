@@ -110,10 +110,34 @@ target_include_directories(osmium INTERFACE
 # ───────────────────────────────────────────────────────────────────
 add_library(earcut INTERFACE)
 target_include_directories(earcut INTERFACE ${EXTERNAL_DIR}/earcut/include)
-# libosmium needs zlib, bzip2, expat for full functionality
+# libosmium needs zlib, bzip2, expat for full functionality:
+#   - zlib   for .osm.gz and for the PBF blob deflate
+#   - bzip2  for .osm.bz2
+#   - expat  for the XML reader that .osm goes through
+#
+# These are the only system dependencies Stratum has; everything else is a
+# vendored submodule. Arch: zlib bzip2 expat. Debian/Ubuntu: zlib1g-dev
+# libbz2-dev libexpat1-dev. The Windows CI job installs them from vcpkg,
+# because the runner image ships none of the three.
 find_package(ZLIB REQUIRED)
 find_package(BZip2 REQUIRED)
 find_package(EXPAT REQUIRED)
+
+# CMake's own find modules export ZLIB::ZLIB, BZip2::BZip2 and EXPAT::EXPAT.
+# A package found in CONFIG mode instead -- which is what happens under the
+# vcpkg toolchain -- exports the library's own lower-case namespaced target and
+# not the find-module spelling, so the link line below would fail to resolve.
+# Alias rather than branch on the platform: whichever spelling exists, the one
+# used below is the one that ends up defined.
+foreach(dep ZLIB:zlib BZip2:bzip2 EXPAT:expat)
+    string(REPLACE ":" ";" dep_pair "${dep}")
+    list(GET dep_pair 0 dep_module)
+    list(GET dep_pair 1 dep_config)
+    if(NOT TARGET ${dep_module}::${dep_module} AND TARGET ${dep_config}::${dep_config})
+        add_library(${dep_module}::${dep_module} ALIAS ${dep_config}::${dep_config})
+    endif()
+endforeach()
+
 target_link_libraries(osmium INTERFACE ZLIB::ZLIB BZip2::BZip2 EXPAT::EXPAT)
 
 # ───────────────────────────────────────────────────────────────────

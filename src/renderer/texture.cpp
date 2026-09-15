@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file texture.cpp
  * @brief GPU texture loading, CPU mip generation, batched upload, and the fallback set

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_variant_agreement.cpp
  * @brief The renderer's variant numbers must equal the geometry side's

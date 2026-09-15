@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 #include "geometry/ambient_occlusion.hpp"
 
 #include <glm/glm.hpp>

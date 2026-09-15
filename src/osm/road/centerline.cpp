@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file centerline.cpp
  * @brief Implementation of centerline cleanup, smoothing, resampling, and the miter

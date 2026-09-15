@@ -67,6 +67,9 @@ set(STRATUM_TEST_SOURCES
     road/test_mesh_optimize.cpp
     road/test_collision_mesh.cpp
     road/test_road_export.cpp
+
+    # KHR_draco_mesh_compression on the glTF writer.
+    road/test_road_export_draco.cpp
     road/test_p7_integration.cpp
 
     # Tag-to-appearance mapping. Unconditional: road_style.cpp is a pure table and
@@ -78,6 +81,15 @@ set(STRATUM_TEST_SOURCES
 
     procgen/test_terrain_carve.cpp
     osm/test_quadtree_roads.cpp
+
+    # roof:shape=* reaching geometry for all five roof families (E1).
+    osm/test_roof_shapes.cpp
+
+    # Attribute-mode colour tables: totality, determinism and separation.
+    osm/test_attribute_palette.cpp
+
+    # Building footprints to closed collision prisms.
+    osm/test_building_collision.cpp
 
     # Engine-agnostic geometry processing.
     geometry/test_ambient_occlusion.cpp
@@ -108,10 +120,14 @@ set(STRATUM_TEST_SUITES
     MeshOptimize
     CollisionMesh
     RoadExport
+    RoadExportDraco
     P7Integration
     RoadStyle
     TerrainCarve
     QuadTreeRoads
+    RoofShapes
+    AttributePalette
+    BuildingCollision
     RoadDump
     RoadTerrainDump
     JunctionDump
@@ -158,6 +174,7 @@ list(APPEND STRATUM_TEST_SOURCES road/test_junction_merge.cpp)
 list(APPEND STRATUM_TEST_SUITES JunctionMerge)
 
 add_executable(stratum_tests ${STRATUM_TEST_SOURCES})
+stratum_msvc_options(stratum_tests)
 
 # The TerrainCarve suite runs carve_terrain() from several std::threads at once
 # to prove the documented "safe for DIFFERENT heightmaps sharing one const
@@ -297,6 +314,7 @@ if(TARGET stratum_editor_lib AND EXISTS ${CMAKE_SOURCE_DIR}/src/renderer/gpu_buf
     list(APPEND STRATUM_GPU_DEVICE_SUITES Sky)
 
     add_executable(stratum_gpu_tests ${STRATUM_GPU_TEST_SOURCES})
+    stratum_msvc_options(stratum_gpu_tests)
 
     target_link_libraries(stratum_gpu_tests PRIVATE stratum_editor_lib Threads::Threads)
 

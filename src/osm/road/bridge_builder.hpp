@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file bridge_builder.hpp
  * @brief Deck, parapets and piers for a bridge edge

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file ambient_occlusion.hpp
  * @brief Bake per-vertex ambient occlusion into a Mesh

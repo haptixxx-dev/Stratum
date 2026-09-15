@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_junction_curb.cpp
  * @brief Sidewalk and curb ring tests for the P4 junction solver

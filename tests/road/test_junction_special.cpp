@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_junction_special.cpp
  * @brief Roundabout, profile-taper and dead-end tests for the P4 junction solver

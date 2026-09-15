@@ -1,4 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 #include "osm/mesh_builder.hpp"
+#include <glm/gtc/constants.hpp>
 #include <mapbox/earcut.hpp>
 #include <unordered_map>
 #include <algorithm>
@@ -142,6 +146,284 @@ static glm::vec4 parse_color(const std::string& color_str, const glm::vec4& fall
     return fallback;
 }
 
+// ============================================================================
+// Roof generation
+// ============================================================================
+//
+// Five roof families, all driven by RoofType, which the parser fills from
+// roof:shape=* (see OSMParser::classify_roof). Each emits only the roof; the
+// walls are already extruded to `height` by the caller.
+//
+// Sloped roofs take their normals from the emitted triangle rather than from an
+// analytic plane. A skillion's plane normal is easy; a dome ring's is not, and
+// one rule for all of them is less to get wrong.
+
+namespace {
+
+/// Roof rise as a fraction of the span it covers.
+constexpr float kRoofPitchRatio = 0.3f;
+
+/// Latitude bands in a dome. Six is enough to read as curved at city scale.
+constexpr int kDomeRings = 6;
+
+/// 2D local metres to Y-up world space. The Z flip is the whole convention.
+inline glm::vec3 to_world(const glm::dvec2& p, float y) {
+    return {static_cast<float>(p.x), y, static_cast<float>(-p.y)};
+}
+
+/// Vertex count of a ring, ignoring an explicit closing duplicate.
+///
+/// OSM ways are closed by repeating the first node. Walking `size()` edges then
+/// emits one degenerate edge, so every loop here walks this instead.
+size_t ring_span(const std::vector<glm::dvec2>& ring) {
+    if (ring.size() > 2 && ring.front() == ring.back()) {
+        return ring.size() - 1;
+    }
+    return ring.size();
+}
+
+/// Emit one triangle with a geometric normal, forced to face upward.
+void emit_tri(Mesh& mesh, const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
+              const glm::vec4& colour) {
+    glm::vec3 n = glm::cross(b - a, c - a);
+    const float len = glm::length(n);
+    if (len < 1e-9f) {
+        return;  // degenerate; contributes no surface
+    }
+    n /= len;
+    if (n.y < 0.0f) {
+        n = -n;
+    }
+
+    const auto base = static_cast<uint32_t>(mesh.vertices.size());
+    mesh.vertices.push_back({a, n, glm::vec2(0.0f, 0.0f), colour});
+    mesh.vertices.push_back({b, n, glm::vec2(1.0f, 0.0f), colour});
+    mesh.vertices.push_back({c, n, glm::vec2(0.5f, 1.0f), colour});
+    mesh.indices.push_back(base + 0);
+    mesh.indices.push_back(base + 1);
+    mesh.indices.push_back(base + 2);
+}
+
+/// Emit a quad as two triangles. Collapses to one when an edge is degenerate,
+/// which is what a gable end or a hip corner reduces to.
+void emit_quad(Mesh& mesh, const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
+               const glm::vec3& d, const glm::vec4& colour) {
+    emit_tri(mesh, a, b, c, colour);
+    emit_tri(mesh, a, c, d, colour);
+}
+
+/// Flat roof: the footprint triangulated in place, holes preserved.
+void emit_flat_roof(Mesh& mesh, const std::vector<glm::dvec2>& footprint,
+                    const std::vector<std::vector<glm::dvec2>>& holes, float height,
+                    const glm::vec4& colour) {
+    std::vector<std::vector<glm::dvec2>> polygon;
+    polygon.push_back(footprint);
+    for (const auto& hole : holes) {
+        polygon.push_back(hole);
+    }
+
+    const std::vector<uint32_t> tri = mapbox::earcut<uint32_t>(polygon);
+    const glm::vec3 up(0.0f, 1.0f, 0.0f);
+    const auto base = static_cast<uint32_t>(mesh.vertices.size());
+
+    for (const auto& ring : polygon) {
+        for (const auto& pt : ring) {
+            mesh.vertices.push_back({to_world(pt, height), up, glm::vec2(0.0f, 0.0f), colour});
+        }
+    }
+    for (size_t i = 0; i + 2 < tri.size(); i += 3) {
+        mesh.indices.push_back(base + tri[i]);
+        mesh.indices.push_back(base + tri[i + 1]);
+        mesh.indices.push_back(base + tri[i + 2]);
+    }
+}
+
+/// Gabled and hipped roofs: every footprint edge rises to a ridge segment.
+///
+/// The two shapes differ only in ridge length. A gable's ridge spans the full
+/// footprint, so the end edges project onto a single ridge endpoint and close
+/// as a vertical triangle -- the gable end. A hip's ridge is inset by half the
+/// building's width at each end, so those same triangles tilt and become hips.
+///
+/// Projecting each edge endpoint onto the ridge independently is what makes one
+/// routine cover both. The previous implementation connected every edge to the
+/// whole ridge, which gave the end edges of a gabled roof a quad spanning the
+/// entire ridge line -- two large overlapping faces on every gabled building.
+void emit_ridge_roof(Mesh& mesh, const std::vector<glm::dvec2>& footprint, float height,
+                     const glm::vec4& colour, bool hipped) {
+    glm::dvec2 axis, centre;
+    double length = 0.0, width = 0.0;
+    compute_principal_axis(footprint, axis, centre, length, width);
+
+    if (length < 1e-6 || width < 1e-6) {
+        emit_flat_roof(mesh, footprint, {}, height, colour);
+        return;
+    }
+
+    // A hip cannot eat more ridge than there is; a square plan hips down to a
+    // single point, which is a pyramid, and that is the correct answer.
+    const double half = hipped ? std::max(0.0, (length - width) * 0.5) : length * 0.5;
+    const glm::dvec2 ridge_a = centre - axis * half;
+    const glm::dvec2 ridge_b = centre + axis * half;
+    const auto ridge_y = static_cast<float>(height + width * 0.5 * kRoofPitchRatio);
+
+    const double ridge_len = half * 2.0;
+    auto project = [&](const glm::dvec2& pt) {
+        if (ridge_len < 1e-9) {
+            return ridge_a;
+        }
+        const double t = glm::clamp(glm::dot(pt - ridge_a, axis) / ridge_len, 0.0, 1.0);
+        return ridge_a + axis * (ridge_len * t);
+    };
+
+    const size_t n = ring_span(footprint);
+    for (size_t i = 0; i < n; ++i) {
+        const glm::dvec2& a = footprint[i];
+        const glm::dvec2& b = footprint[(i + 1) % n];
+        emit_quad(mesh, to_world(a, height), to_world(b, height), to_world(project(b), ridge_y),
+                  to_world(project(a), ridge_y), colour);
+    }
+}
+
+/// Pyramidal roof: every edge rises to one apex over the centroid.
+///
+/// The apex height follows the inradius, not the bounding box, so a long thin
+/// building gets a shallow pyramid instead of a spike.
+void emit_apex_roof(Mesh& mesh, const std::vector<glm::dvec2>& footprint, float height,
+                    const glm::vec4& colour) {
+    const glm::dvec2 centre = compute_centroid(footprint);
+    const size_t n = ring_span(footprint);
+
+    double inradius = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < n; ++i) {
+        const glm::dvec2 edge = footprint[(i + 1) % n] - footprint[i];
+        const double edge_len2 = glm::dot(edge, edge);
+        if (edge_len2 < 1e-9) {
+            continue;
+        }
+        const double t = glm::clamp(glm::dot(centre - footprint[i], edge) / edge_len2, 0.0, 1.0);
+        inradius = std::min(inradius, glm::length(centre - (footprint[i] + edge * t)));
+    }
+    if (inradius == std::numeric_limits<double>::max()) {
+        emit_flat_roof(mesh, footprint, {}, height, colour);
+        return;
+    }
+
+    const glm::vec3 apex = to_world(centre, static_cast<float>(height + inradius * kRoofPitchRatio));
+    for (size_t i = 0; i < n; ++i) {
+        emit_tri(mesh, to_world(footprint[i], height), to_world(footprint[(i + 1) % n], height),
+                 apex, colour);
+    }
+}
+
+/// Skillion roof: one flat plane tilted across the short axis.
+///
+/// The footprint is triangulated once and each vertex lifted by its position
+/// along the slope, which keeps holes working. The wall tops stay level, so the
+/// wedge between the level eave and the tilted plane is filled with a vertical
+/// strip -- without it the building is open along three sides.
+void emit_skillion_roof(Mesh& mesh, const std::vector<glm::dvec2>& footprint,
+                        const std::vector<std::vector<glm::dvec2>>& holes, float height,
+                        const glm::vec4& colour) {
+    glm::dvec2 axis, centre;
+    double length = 0.0, width = 0.0;
+    compute_principal_axis(footprint, axis, centre, length, width);
+
+    if (width < 1e-6) {
+        emit_flat_roof(mesh, footprint, holes, height, colour);
+        return;
+    }
+
+    const glm::dvec2 slope(-axis.y, axis.x);
+    double low = std::numeric_limits<double>::max();
+    for (const auto& pt : footprint) {
+        low = std::min(low, glm::dot(pt - centre, slope));
+    }
+    const auto rise = static_cast<float>(width * kRoofPitchRatio);
+
+    // Height of the tilted plane above the wall top at a given plan position.
+    auto lift = [&](const glm::dvec2& pt) {
+        const double t = glm::clamp((glm::dot(pt - centre, slope) - low) / width, 0.0, 1.0);
+        return height + rise * static_cast<float>(t);
+    };
+
+    std::vector<std::vector<glm::dvec2>> polygon;
+    polygon.push_back(footprint);
+    for (const auto& hole : holes) {
+        polygon.push_back(hole);
+    }
+
+    const std::vector<uint32_t> tri = mapbox::earcut<uint32_t>(polygon);
+    std::vector<glm::dvec2> flat;
+    for (const auto& ring : polygon) {
+        flat.insert(flat.end(), ring.begin(), ring.end());
+    }
+    for (size_t i = 0; i + 2 < tri.size(); i += 3) {
+        emit_tri(mesh, to_world(flat[tri[i]], lift(flat[tri[i]])),
+                 to_world(flat[tri[i + 1]], lift(flat[tri[i + 1]])),
+                 to_world(flat[tri[i + 2]], lift(flat[tri[i + 2]])), colour);
+    }
+
+    // Vertical infill between the level wall top and the tilted eave. Degenerate
+    // along the low edge, where the plane already meets the wall.
+    const size_t n = ring_span(footprint);
+    for (size_t i = 0; i < n; ++i) {
+        const glm::dvec2& a = footprint[i];
+        const glm::dvec2& b = footprint[(i + 1) % n];
+        emit_quad(mesh, to_world(a, height), to_world(b, height), to_world(b, lift(b)),
+                  to_world(a, lift(a)), colour);
+    }
+}
+
+/// Dome: the footprint shrunk toward its centroid over a quarter-sine profile.
+///
+/// A true dome over an arbitrary polygon is not well defined, so each latitude
+/// band is the footprint itself scaled about the centroid. A circular footprint
+/// gives a real hemisphere; anything else gives a plausible swept version of
+/// its own outline, which is what a mapper tagging roof:shape=dome means.
+void emit_dome_roof(Mesh& mesh, const std::vector<glm::dvec2>& footprint, float height,
+                    const glm::vec4& colour) {
+    const glm::dvec2 centre = compute_centroid(footprint);
+    const size_t n = ring_span(footprint);
+    if (n < 3) {
+        emit_flat_roof(mesh, footprint, {}, height, colour);
+        return;
+    }
+
+    double inradius = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < n; ++i) {
+        const glm::dvec2 edge = footprint[(i + 1) % n] - footprint[i];
+        const double edge_len2 = glm::dot(edge, edge);
+        if (edge_len2 < 1e-9) {
+            continue;
+        }
+        const double t = glm::clamp(glm::dot(centre - footprint[i], edge) / edge_len2, 0.0, 1.0);
+        inradius = std::min(inradius, glm::length(centre - (footprint[i] + edge * t)));
+    }
+    if (inradius == std::numeric_limits<double>::max()) {
+        emit_flat_roof(mesh, footprint, {}, height, colour);
+        return;
+    }
+
+    const auto dome_height = static_cast<float>(inradius);
+    const auto ring_at = [&](int k, size_t i) {
+        const double s = static_cast<double>(k) / kDomeRings;
+        const double scale = std::cos(s * glm::pi<double>() * 0.5);
+        const auto y = height + dome_height * static_cast<float>(std::sin(s * glm::pi<double>() * 0.5));
+        return to_world(centre + (footprint[i] - centre) * scale, y);
+    };
+
+    for (int k = 0; k < kDomeRings; ++k) {
+        for (size_t i = 0; i < n; ++i) {
+            const size_t j = (i + 1) % n;
+            emit_quad(mesh, ring_at(k, i), ring_at(k, j), ring_at(k + 1, j), ring_at(k + 1, i),
+                      colour);
+        }
+    }
+}
+
+}  // namespace
+
 Mesh MeshBuilder::build_building_mesh(const Building& building) {
     Mesh mesh;
 
@@ -250,146 +532,53 @@ Mesh MeshBuilder::build_building_mesh(const Building& building) {
     }
 
     // === Generate roof based on roof type ===
-    const float roof_pitch_ratio = 0.3f; // Roof height = width * ratio
+    //
+    // Gabled, hipped, pyramidal and dome need a simple closed outline to sweep,
+    // so a footprint with courtyards falls back to flat. Skillion does not: it
+    // lifts a triangulation, and earcut already handles the holes.
+    const bool simple_outline = building.holes.empty();
 
-    if (building.roof_type == RoofType::Gabled && building.holes.empty()) {
-        // Gabled roof: ridge along longest axis
-        glm::dvec2 axis, center;
-        double length, width;
-        compute_principal_axis(building.footprint, axis, center, length, width);
-
-        float ridge_height = static_cast<float>(width * 0.5 * roof_pitch_ratio);
-        glm::dvec2 perp(-axis.y, axis.x);
-
-        // Ridge endpoints (at center, along axis)
-        glm::dvec2 ridge_start_2d = center - axis * (length * 0.5);
-        glm::dvec2 ridge_end_2d = center + axis * (length * 0.5);
-
-        glm::vec3 ridge_start(static_cast<float>(ridge_start_2d.x), height + ridge_height,
-                              static_cast<float>(-ridge_start_2d.y));
-        glm::vec3 ridge_end(static_cast<float>(ridge_end_2d.x), height + ridge_height,
-                            static_cast<float>(-ridge_end_2d.y));
-
-        // For each edge, create a sloped roof triangle fan to ridge
-        for (size_t i = 0; i < n; ++i) {
-            size_t next = (i + 1) % n;
-            if (i == n - 1 && building.footprint[0] == building.footprint[n-1]) continue;
-
-            glm::vec3 p0(static_cast<float>(building.footprint[i].x), height,
-                         static_cast<float>(-building.footprint[i].y));
-            glm::vec3 p1(static_cast<float>(building.footprint[next].x), height,
-                         static_cast<float>(-building.footprint[next].y));
-
-            // Determine which side of ridge this edge is on
-            glm::dvec2 edge_mid = (building.footprint[i] + building.footprint[next]) * 0.5;
-            double side = glm::dot(edge_mid - center, perp);
-
-            // Create roof quad from edge to ridge
-            uint32_t base_idx = static_cast<uint32_t>(mesh.vertices.size());
-
-            // Calculate normal for this roof face
-            glm::vec3 edge_vec = p1 - p0;
-            glm::vec3 to_ridge = (side > 0) ? (ridge_start - p0) : (ridge_end - p0);
-            glm::vec3 face_normal = glm::normalize(glm::cross(edge_vec, to_ridge));
-            if (face_normal.y < 0) face_normal = -face_normal; // Ensure upward-facing
-
-            mesh.vertices.push_back({p0, face_normal, glm::vec2(0.0f, 0.0f), roof_color});
-            mesh.vertices.push_back({p1, face_normal, glm::vec2(1.0f, 0.0f), roof_color});
-            mesh.vertices.push_back({ridge_end, face_normal, glm::vec2(1.0f, 1.0f), roof_color});
-            mesh.vertices.push_back({ridge_start, face_normal, glm::vec2(0.0f, 1.0f), roof_color});
-
-            // Two triangles for roof quad
-            mesh.indices.push_back(base_idx + 0);
-            mesh.indices.push_back(base_idx + 1);
-            mesh.indices.push_back(base_idx + 2);
-
-            mesh.indices.push_back(base_idx + 0);
-            mesh.indices.push_back(base_idx + 2);
-            mesh.indices.push_back(base_idx + 3);
-        }
-    } else if ((building.roof_type == RoofType::Hipped || building.roof_type == RoofType::Pyramidal)
-               && building.holes.empty()) {
-        // Hipped/Pyramidal roof: all edges slope to center apex
-        glm::dvec2 center_2d = compute_centroid(building.footprint);
-
-        // Find the minimum distance from center to any edge for apex height
-        double min_dist = std::numeric_limits<double>::max();
-        for (size_t i = 0; i < n; ++i) {
-            size_t next = (i + 1) % n;
-            if (i == n - 1 && building.footprint[0] == building.footprint[n-1]) continue;
-
-            glm::dvec2 edge = building.footprint[next] - building.footprint[i];
-            glm::dvec2 to_center = center_2d - building.footprint[i];
-            double edge_len = glm::length(edge);
-            if (edge_len > 0.001) {
-                double t = glm::clamp(glm::dot(to_center, edge) / (edge_len * edge_len), 0.0, 1.0);
-                glm::dvec2 closest = building.footprint[i] + edge * t;
-                double dist = glm::length(center_2d - closest);
-                min_dist = std::min(min_dist, dist);
+    switch (building.roof_type) {
+        case RoofType::Gabled:
+            if (simple_outline) {
+                emit_ridge_roof(mesh, building.footprint, height, roof_color, /*hipped=*/false);
+            } else {
+                emit_flat_roof(mesh, building.footprint, building.holes, height, roof_color);
             }
-        }
+            break;
 
-        float apex_height = static_cast<float>(min_dist * roof_pitch_ratio);
-        glm::vec3 apex(static_cast<float>(center_2d.x), height + apex_height,
-                       static_cast<float>(-center_2d.y));
-
-        // Create triangular roof faces from each edge to apex
-        for (size_t i = 0; i < n; ++i) {
-            size_t next = (i + 1) % n;
-            if (i == n - 1 && building.footprint[0] == building.footprint[n-1]) continue;
-
-            glm::vec3 p0(static_cast<float>(building.footprint[i].x), height,
-                         static_cast<float>(-building.footprint[i].y));
-            glm::vec3 p1(static_cast<float>(building.footprint[next].x), height,
-                         static_cast<float>(-building.footprint[next].y));
-
-            // Calculate face normal
-            glm::vec3 edge_vec = p1 - p0;
-            glm::vec3 to_apex = apex - p0;
-            glm::vec3 face_normal = glm::normalize(glm::cross(edge_vec, to_apex));
-            if (face_normal.y < 0) face_normal = -face_normal;
-
-            uint32_t base_idx = static_cast<uint32_t>(mesh.vertices.size());
-
-            mesh.vertices.push_back({p0, face_normal, glm::vec2(0.0f, 0.0f), roof_color});
-            mesh.vertices.push_back({p1, face_normal, glm::vec2(1.0f, 0.0f), roof_color});
-            mesh.vertices.push_back({apex, face_normal, glm::vec2(0.5f, 1.0f), roof_color});
-
-            mesh.indices.push_back(base_idx + 0);
-            mesh.indices.push_back(base_idx + 1);
-            mesh.indices.push_back(base_idx + 2);
-        }
-    } else {
-        // Flat roof (default): use earcut triangulation
-        std::vector<std::vector<glm::dvec2>> polygon;
-        polygon.push_back(building.footprint);
-
-        for (const auto& hole : building.holes) {
-            polygon.push_back(hole);
-        }
-
-        std::vector<uint32_t> roof_indices = mapbox::earcut<uint32_t>(polygon);
-
-        glm::vec3 roof_normal(0.0f, 1.0f, 0.0f);
-        uint32_t roof_base_idx = static_cast<uint32_t>(mesh.vertices.size());
-
-        std::vector<glm::dvec2> all_points;
-        for (const auto& ring : polygon) {
-            for (const auto& pt : ring) {
-                all_points.push_back(pt);
+        case RoofType::Hipped:
+            if (simple_outline) {
+                emit_ridge_roof(mesh, building.footprint, height, roof_color, /*hipped=*/true);
+            } else {
+                emit_flat_roof(mesh, building.footprint, building.holes, height, roof_color);
             }
-        }
+            break;
 
-        for (const auto& pt : all_points) {
-            glm::vec3 pos(static_cast<float>(pt.x), height, static_cast<float>(-pt.y));
-            mesh.vertices.push_back({pos, roof_normal, glm::vec2(0.0f, 0.0f), roof_color});
-        }
+        case RoofType::Pyramidal:
+            if (simple_outline) {
+                emit_apex_roof(mesh, building.footprint, height, roof_color);
+            } else {
+                emit_flat_roof(mesh, building.footprint, building.holes, height, roof_color);
+            }
+            break;
 
-        for (size_t i = 0; i < roof_indices.size(); i += 3) {
-            mesh.indices.push_back(roof_base_idx + roof_indices[i]);
-            mesh.indices.push_back(roof_base_idx + roof_indices[i + 1]);
-            mesh.indices.push_back(roof_base_idx + roof_indices[i + 2]);
-        }
+        case RoofType::Skillion:
+            emit_skillion_roof(mesh, building.footprint, building.holes, height, roof_color);
+            break;
+
+        case RoofType::Dome:
+            if (simple_outline) {
+                emit_dome_roof(mesh, building.footprint, height, roof_color);
+            } else {
+                emit_flat_roof(mesh, building.footprint, building.holes, height, roof_color);
+            }
+            break;
+
+        case RoofType::Flat:
+        case RoofType::Unknown:
+            emit_flat_roof(mesh, building.footprint, building.holes, height, roof_color);
+            break;
     }
 
     // Compute bounding box for frustum culling

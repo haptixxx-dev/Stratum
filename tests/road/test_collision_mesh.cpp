@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_collision_mesh.cpp
  * @brief The physics surface: what was deleted, what was bridged, and what must never open

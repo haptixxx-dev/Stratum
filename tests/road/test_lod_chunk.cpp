@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_lod_chunk.cpp
  * @brief LOD built from merged per-chunk geometry: does it actually reduce, and does it crack

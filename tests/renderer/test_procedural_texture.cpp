@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_procedural_texture.cpp
  * @brief The generated surface textures: tiling, determinism, layout, and the markings atlas

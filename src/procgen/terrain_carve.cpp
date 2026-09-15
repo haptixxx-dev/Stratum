@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file terrain_carve.cpp
  * @brief Implementation of the uniform-grid carve index and the per-chunk carve

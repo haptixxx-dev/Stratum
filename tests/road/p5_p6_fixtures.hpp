@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file p5_p6_fixtures.hpp
  * @brief Shared helpers for the P5 detail and P6 structure suites

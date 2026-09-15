@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_p5_p6_dump.cpp
  * @brief Writes the FULL road network -- paint, crossings and structures -- to OBJ

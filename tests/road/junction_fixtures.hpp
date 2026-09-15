@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file junction_fixtures.hpp
  * @brief Shared synthetic networks and 2D predicates for the P4 junction suites

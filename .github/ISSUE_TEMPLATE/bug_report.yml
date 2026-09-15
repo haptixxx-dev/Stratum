@@ -1,0 +1,49 @@
+name: Bug report
+description: Something is wrong with the geometry, the build, or the editor
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >
+        Exact steps. For a geometry bug, attach the .osm or .pbf extract and
+        give the coordinates — that is the single most useful thing here.
+      placeholder: |
+        1. Import ~/Downloads/lucan.osm
+        2. Look at the junction at 53.3557, -6.4489
+        3. The sidewalk z-fights with the carriageway
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Stratum version or commit
+      placeholder: "0.2.0, or 3f61a37"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Platform
+      options: [Linux, Windows, macOS]
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: Only needed for rendering bugs.
+      placeholder: "AMD RX 7800 XT, Mesa 25.2"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Console output
+      render: shell

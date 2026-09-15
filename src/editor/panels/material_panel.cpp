@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file material_panel.cpp
  * @brief The Materials panel: browse, edit, diagnose and persist the material set

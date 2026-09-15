@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
 /**
  * @file test_gpu_upload_batch.cpp
  * @brief The staging arena: what one frame uploads, from where, and what it reclaims
