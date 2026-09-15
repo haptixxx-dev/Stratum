@@ -437,10 +437,10 @@ public:
          * compound intersection with it: collect_arms() gives its arms to the
          * primary and returns none for it. Counted separately because it used to
          * land in @ref degenerate, and the width-scaled merge took that number
-         * from 41 to 679 on a Lucan extract -- a statistic that reports success
+         * from 41 to 512 on a Lucan extract -- a statistic that reports success
          * as failure is worse than no statistic.
          *
-         * With the two split apart, that extract reports 679 here and 0 in
+         * With the two split apart, that extract reports 512 here and 0 in
          * @ref degenerate. The 41 nodes that failed to solve before the merge
          * were themselves nodes standing too close together, so merging them is
          * what fixed them; they did not survive as failures alongside it.

@@ -523,6 +523,53 @@ void fill_widths(const std::vector<RoadProfile>& profiles, ArmRef& ref) {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // EVERY PAIR has to satisfy the merge condition, not just the pairs the
+    // flood walked over.
+    //
+    // The flood is transitive and the justification for merging is not. Two
+    // junctions are merged because their polygons would overlap; that says
+    // nothing about a third junction on the far side of one of them. A chain of
+    // narrow residential junctions four metres apart floods into a single
+    // cluster fifteen metres across whose ends have nothing to do with each
+    // other, and the arms of its middle members then leave from INSIDE the
+    // compound junction. build_junction_polygon() cannot put a mouth that starts
+    // inside the junction onto the boundary ring, so the ring spikes inward to
+    // reach it and crosses itself.
+    //
+    // A dual carriageway crossing another survives this, which is the case the
+    // width rule exists for: wide roads have big radii, so its four nodes are
+    // pairwise inside each other's reach. On a Lucan extract it kept 512 of the
+    // 679 merges, and of what it dropped nothing was a compound intersection --
+    // clusters of five, six and seven members disappeared entirely, the widest
+    // surviving cluster went from 15.4 m across to 5.8 m, and crossing rings on
+    // merged junctions fell from 15 to 4. Of the 512 that remain, 444 are pairs,
+    // 30 are triples and 5 are the four-node rectangle of one dual carriageway
+    // crossing another, which is the shape the width rule was written for.
+    //
+    // The cluster is refused WHOLE rather than pruned. Pruning would have to
+    // choose which member to drop, and every rule for choosing depends on
+    // GraphNodeId or on the order the flood ran -- exactly what this function
+    // promises its answer does not depend on. Refusing leaves the members to
+    // solve separately, which is the behaviour before the width rule and is
+    // wrong only in the way it was already wrong.
+    //
+    // Pairs, not a diameter: `reach` is the pair's own, so two wide roads are
+    // allowed to stand further apart than two narrow ones, which is the same
+    // scaling stub_threshold() uses and needs no tuning per city.
+    // ------------------------------------------------------------------------
+    for (size_t i = 0; i < cluster.size(); ++i) {
+        for (size_t j = i + 1; j < cluster.size(); ++j) {
+            const double gap = glm::length(graph.node(cluster[i]).position -
+                                           graph.node(cluster[j]).position);
+            const double reach = junction_radius(graph, profiles, cluster[i]) +
+                                 junction_radius(graph, profiles, cluster[j]);
+            if (!(gap < std::max(radius, reach))) {
+                return { node };     // not one junction after all
+            }
+        }
+    }
+
     return cluster;
 }
 

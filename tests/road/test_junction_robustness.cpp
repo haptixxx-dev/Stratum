@@ -899,11 +899,12 @@ TEST(JunctionRobustness, a_staggered_pair_closer_than_their_own_width_solves_as_
  * instead. The same pair on the westbound side does it again at the step that
  * closes the ring, and that one reached five metres across the junction and back.
  *
- * On a Lucan extract these two were the largest remaining cause of a crossing
- * ring on a merged junction: 33 of the 547 merged junctions came back as a hull
- * fallback, and 16 do now. The lone junctions are untouched, 7 before and 6
- * after, which is what says the repair reaches only the shape it was written
- * for -- it is skipped outright when every arm leaves one node.
+ * On a Lucan extract this was the largest single cause of a crossing ring on a
+ * merged junction. With it and the chain rule that follows it, merged junctions
+ * that fall back to a hull went from 33 of 547 to 4 of 512. The lone junctions
+ * are untouched, 7 before and 6 after, which is what says the repair reaches only
+ * the shape it was written for -- it is skipped outright when every arm leaves
+ * one node.
  *
  * @see JunctionRobustness.junctions_a_block_apart_are_not_merged for the other
  *      half of the merge contract.
@@ -951,4 +952,179 @@ TEST(JunctionRobustness, two_parallel_carriageways_merge_into_a_simple_ring) {
 
     // The whole invariant: a simple, counter-clockwise ring containing its node.
     check_usable(s);
+}
+
+/**
+ * @brief A fillet corner may not land off the end of its own chord
+ *
+ * FilletConfig::max_corner_reach_factor asks how far the corner point C stands
+ * BACK ALONG each arm, which is the right question for two arms that diverge and
+ * blind to the one that matters when they barely do: which way along the gap
+ * between them C lies.
+ *
+ * The shape is Lucan's node 957. Two junction nodes 3.9 m apart, and the pair
+ * that breaks it is the two eastbound arms -- one 6 m wide leaving the southern
+ * node at -2.1 degrees, one 2 m wide leaving the northern at -4.1. Two degrees of
+ * convergence over a chord a metre and a half long put C seven and a half metres
+ * WEST, behind a junction whose every arm here leaves east, and it still stood
+ * less than a trim plus a width back along either arm, so the widths bound passed
+ * it. The ring drawn through it cut straight across the junction and back.
+ *
+ * Measured in the chord's own length the same point projects at 4.9, where a real
+ * corner projects between 0 and 1. That is what this pins, and it needs no notion
+ * of how wide the roads are or how big the junction is.
+ */
+TEST(JunctionRobustness, a_corner_off_the_end_of_its_chord_is_refused) {
+    const std::vector<Road> roads = {
+        jt::make_road(1, { 10, 11 }, { { 0.0, -1.95 }, { 0.0, 1.95 } }),
+        jt::make_road(2, { 10, 1 },  { { 0.0, -1.95 }, { -199.18, 16.18 } }),
+        jt::make_road(3, { 10, 2 },  { { 0.0, -1.95 }, { 199.87, -9.28 } }),
+        jt::make_road(4, { 11, 3 },  { { 0.0, 1.95 }, { 199.49, -12.35 } }),
+        jt::make_road(5, { 11, 4 },  { { 0.0, 1.95 }, { 12.21, 201.58 } }),
+        jt::make_road(6, { 11, 5 },  { { 0.0, 1.95 }, { -199.41, 17.29 } }),
+    };
+    // Widths are the extract's: the southern eastbound arm is 6 m across and the
+    // northern one 2 m, which is what makes their edges converge so slowly.
+    const jt::Fixture fixture = jt::make_fixture(
+        roads, { jt::lane_profile(1, 3.0), jt::lane_profile(1, 3.0), jt::lane_profile(1, 6.0),
+                 jt::lane_profile(1, 2.0), jt::lane_profile(1, 3.0), jt::lane_profile(1, 2.0) });
+
+    GraphNodeId primary = kInvalidId;
+    for (size_t n = 0; n < fixture.graph.nodes().size(); ++n) {
+        if (fixture.graph.nodes()[n].degree() < 3) continue;
+        if (collect_arms(fixture.graph, fixture.profiles, static_cast<GraphNodeId>(n),
+                         stratum::osm::road::kCoincidentRadius).empty()) {
+            continue;
+        }
+        primary = static_cast<GraphNodeId>(n);
+    }
+    CHECK_TRUE(primary != kInvalidId);
+    if (primary == kInvalidId) return;
+
+    const Solved s = solve("a corner behind a junction that leaves east", fixture, primary);
+    CHECK_EQ(s.arms.size(), size_t{5});
+    check_usable(s);
+}
+
+/**
+ * @brief A CHAIN of junctions is not one junction
+ *
+ * The cluster flood is transitive; the reason for merging is not. Two junctions
+ * are merged because their polygons would overlap, and that says nothing about a
+ * third junction on the far side of one of them.
+ *
+ * Three narrow T-junctions 1.8 m apart. Each neighbouring pair is inside the
+ * other's reach -- 1.0 m of carriageway half-width each puts their threshold at
+ * 2.0 m -- so the flood walks the whole chain and offers a cluster 3.6 m across.
+ * The two ENDS are 3.6 m apart and their threshold is the same 2.0 m, so they are
+ * two junctions by the only rule that ever justified merging any of them.
+ *
+ * Left merged, the middle member's arms leave from INSIDE the compound junction,
+ * and build_junction_polygon() cannot put a mouth that starts inside the junction
+ * onto the boundary ring: it spikes inward to reach it and crosses itself. On a
+ * Lucan extract this was what remained after the parallel-mouth repair -- clusters
+ * of five, six and seven members, the widest 15.4 m across, contributing 11 of the
+ * 15 crossing rings left on merged junctions.
+ *
+ * The cluster is refused WHOLE. Pruning it would have to choose a member to drop,
+ * and every rule for choosing depends on GraphNodeId or on the order the flood
+ * ran -- which is what every_member_of_a_cluster_agrees_on_the_primary forbids.
+ */
+TEST(JunctionRobustness, a_chain_of_junctions_is_not_one_junction) {
+    const double step = 1.8;
+    const std::vector<Road> roads = {
+        jt::make_road(1, { 1, 10, 11, 12, 2 },
+                      { { -200.0, 0.0 }, { 0.0, 0.0 }, { step, 0.0 },
+                        { 2.0 * step, 0.0 }, { 200.0, 0.0 } }),
+        jt::make_road(2, { 3, 10 }, { { 0.0, -200.0 }, { 0.0, 0.0 } }),
+        jt::make_road(3, { 4, 11 }, { { step, 200.0 }, { step, 0.0 } }),
+        jt::make_road(4, { 5, 12 }, { { 2.0 * step, -200.0 }, { 2.0 * step, 0.0 } }),
+    };
+    // 2 m wide, so each junction's radius is 1 m and any pair's threshold is 2 m.
+    const jt::Fixture fixture = jt::make_fixture(
+        roads, { jt::lane_profile(1, 2.0), jt::lane_profile(1, 2.0),
+                 jt::lane_profile(1, 2.0), jt::lane_profile(1, 2.0) });
+
+    // All three solve, each on its own, each with its own three arms. Nothing is
+    // absorbed, so nothing reports an empty arm list.
+    size_t solved_nodes = 0;
+    for (size_t n = 0; n < fixture.graph.nodes().size(); ++n) {
+        if (fixture.graph.nodes()[n].degree() < 3) continue;
+
+        std::vector<GraphNodeId> cluster;
+        const std::vector<ArmRef> arms =
+            collect_arms(fixture.graph, fixture.profiles, static_cast<GraphNodeId>(n),
+                         stratum::osm::road::kCoincidentRadius, &cluster);
+
+        CHECK_EQ(cluster.size(), size_t{1});
+        CHECK_EQ(arms.size(), size_t{3});
+        ++solved_nodes;
+
+        const Solved s = solve("one of a refused chain", fixture, static_cast<GraphNodeId>(n));
+        check_usable(s);
+    }
+    CHECK_EQ(solved_nodes, size_t{3});
+}
+
+/**
+ * @brief The compound intersection the width rule exists for still merges
+ *
+ * The other half of a_chain_of_junctions_is_not_one_junction. An all-pairs rule
+ * that also threw away a dual carriageway crossing another would have undone the
+ * thing it was added to protect.
+ *
+ * One dual carriageway crossing another is four junction nodes in a rectangle, a
+ * shape OSM has no other way to express. Here the rectangle is 8 m on a side and
+ * the carriageways are 14 m wide, so every node's radius is 7 m and every pair's
+ * threshold is 14 m -- the sides at 8 m and the DIAGONALS at 11.3 m are both
+ * inside it. Wide roads are allowed to stand further apart than narrow ones, which
+ * is the same scaling the stub threshold uses.
+ */
+TEST(JunctionRobustness, a_dual_carriageway_crossing_still_merges_as_one) {
+    const double h = 4.0;
+    const std::vector<Road> roads = {
+        // The two north-south carriageways.
+        jt::make_road(1, { 1, 10, 13, 2 },
+                      { { -h, -200.0 }, { -h, -h }, { -h, h }, { -h, 200.0 } }),
+        jt::make_road(2, { 3, 11, 12, 4 },
+                      { { h, -200.0 }, { h, -h }, { h, h }, { h, 200.0 } }),
+        // And the two east-west ones, through the same four nodes.
+        jt::make_road(3, { 5, 10, 11, 6 },
+                      { { -200.0, -h }, { -h, -h }, { h, -h }, { 200.0, -h } }),
+        jt::make_road(4, { 7, 13, 12, 8 },
+                      { { -200.0, h }, { -h, h }, { h, h }, { 200.0, h } }),
+    };
+    const jt::Fixture fixture = jt::make_fixture(
+        roads, { jt::lane_profile(2, 7.0), jt::lane_profile(2, 7.0),
+                 jt::lane_profile(2, 7.0), jt::lane_profile(2, 7.0) });
+
+    // Four junction nodes; merging is a solving decision, not a graph edit.
+    size_t degree_four = 0;
+    for (const auto& n : fixture.graph.nodes()) {
+        if (n.degree() >= 3) ++degree_four;
+    }
+    CHECK_EQ(degree_four, size_t{4});
+
+    size_t emitting = 0;
+    size_t arms_on_primary = 0;
+    for (size_t n = 0; n < fixture.graph.nodes().size(); ++n) {
+        if (fixture.graph.nodes()[n].degree() < 3) continue;
+
+        std::vector<GraphNodeId> cluster;
+        const std::vector<ArmRef> arms =
+            collect_arms(fixture.graph, fixture.profiles, static_cast<GraphNodeId>(n),
+                         stratum::osm::road::kCoincidentRadius, &cluster);
+
+        // Every member sees the same cluster of four, whichever it is asked from.
+        CHECK_EQ(cluster.size(), size_t{4});
+        if (!arms.empty()) {
+            ++emitting;
+            arms_on_primary = arms.size();
+        }
+    }
+
+    // One junction, carrying the eight real approaches: two per side. The four
+    // rectangle edges are internal and are dropped.
+    CHECK_EQ(emitting, size_t{1});
+    CHECK_EQ(arms_on_primary, size_t{8});
 }

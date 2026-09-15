@@ -141,6 +141,18 @@ constexpr int kMaxArcSegments = 64;
 /// Radians in a quarter turn; the unit FilletConfig::segments_per_quarter_turn counts in
 constexpr double kQuarterTurn = 1.57079632679489661923;
 
+/**
+ * @brief How far off its own chord a fillet corner may still be a corner
+ *
+ * In chord lengths, either side. A corner point projects onto the chord between
+ * the two facing arm corners at 0 to 1 when it really is the corner between
+ * them; an acute fork puts it a little outside that, and this is the room it is
+ * given. Beyond it, C is somewhere else entirely -- see the test in
+ * append_corner() for the pair of parallel carriageways that produced one 4.9
+ * chord lengths past the end.
+ */
+constexpr double kCornerChordSlack = 1.0;
+
 /// Subtracted before the segment-count ceil() so an exact quarter turn cannot round up
 constexpr double kSegmentBias = 1e-9;
 
@@ -523,6 +535,39 @@ void append_corner(const ArmEnd& a_end, const ArmEnd& b_end,
     if (run_a > std::max(0.0, a_arm.trim) + reach_slack ||
         run_b > std::max(0.0, b_arm.trim) + reach_slack) {
         return;     // the "corner" is not near this junction; chord
+    }
+
+    // ------------------------------------------------------------------------
+    // And it has to be a corner of THIS PAIR. The test above measures how far C
+    // stands back along each arm, which is the right question for two arms that
+    // diverge, and blind to the one that matters when they do not: WHICH WAY
+    // along the gap between them C lies.
+    //
+    // Two nearly parallel arms leaving the same junction a few metres apart --
+    // the two carriageways of a dual carriageway, so this is a merged cluster's
+    // shape -- have a chord between their facing corners only a metre or two
+    // long, and offset lines that converge so slowly that C lands several metres
+    // beyond the end of it while still standing less than a trim plus a width
+    // back along either arm. The widths bound simply cannot see it: the run is
+    // small, and C is nowhere near the pair.
+    //
+    // Measured in the chord's own length, which needs no tuning and no notion of
+    // how big the junction is, a real corner projects onto its chord at roughly
+    // 0 to 1. On a Lucan extract the corner this rejects projected at 4.9 -- 7.5
+    // metres west of a pair of arms that both leave east -- and the ring drawn
+    // through it cut clean across the junction and back.
+    //
+    // The window is deliberately loose. An acute fork has a genuine corner a
+    // little off the end of a short chord, and that corner is the junction's
+    // real shape; only a C that has left the neighbourhood entirely is refused.
+    // ------------------------------------------------------------------------
+    const glm::dvec2 chord = pb - pa;
+    const double chord_len_sq = glm::dot(chord, chord);
+    if (chord_len_sq > 0.0) {
+        const double along = glm::dot(corner - pa, chord) / chord_len_sq;
+        if (along < -kCornerChordSlack || along > 1.0 + kCornerChordSlack) {
+            return;     // the corner belongs to no part of this gap; chord
+        }
     }
 
     if (turn > 0.0) {

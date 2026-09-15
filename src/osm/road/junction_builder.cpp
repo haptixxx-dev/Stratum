@@ -431,7 +431,7 @@ bool JunctionBuilder::solve_trims(RoadGraph& graph,
                 // reports it by returning NO arms while naming a different primary
                 // -- see its "Near-coincident junctions" section. Left folded in
                 // with the genuinely unsolvable, the width-scaled merge took
-                // `degenerate` from 41 to 679 on a Lucan extract, and all 679 of
+                // `degenerate` from 41 to 512 on a Lucan extract, and all 512 of
                 // those are merges: split out here, `degenerate` reads 0.
                 slot.merged_into_neighbour =
                     slot.arms.empty() && cluster.size() > 1 &&
