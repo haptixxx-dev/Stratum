@@ -55,7 +55,28 @@ struct DeviceHolder {
             SDL_WaitForGPUIdle(device);
             SDL_DestroyGPUDevice(device);
         }
-        if (video_ready) SDL_QuitSubSystem(SDL_INIT_VIDEO);
+            // SDL is NOT shut down here, and that is deliberate.
+            //
+            // Four GPU suites each keep their own function-local static
+            // DeviceHolder, so at exit() four destructors run in reverse
+            // construction order. Each owns its own SDL_GPUDevice, which is
+            // fine -- but SDL_Quit() is PROGRAM-global. The first holder to
+            // destruct unloaded the Vulkan backend out from under the other
+            // three, and the next SDL_DestroyGPUDevice() call then jumped
+            // through a driver that was no longer mapped:
+            //
+            //     Thread 1 received signal SIGSEGV
+            //     #1  VULKAN_DestroyDevice ()
+            //     #2  DeviceHolder::~DeviceHolder ()
+            //     #4  exit ()
+            //
+            // All 123 GPU tests passed first; the crash was purely in teardown,
+            // which is why it never showed up as a failing test. It also never
+            // showed up in CI at all, because these suites skip themselves with
+            // no GPU present and CI has none.
+            //
+            // Letting the process exit without SDL_Quit() is safe: the OS
+            // reclaims the device, and nothing runs after this that needs SDL.
     }
 };
 
