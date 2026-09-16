@@ -82,10 +82,18 @@ jobs:
       # happens to live in the GPU binary.
       - name: Report GPU backend and whether the suites ran
         if: always()
+        # The SAME environment as the Test step above. Without this the step
+        # measures a different world from the one it is meant to diagnose: the
+        # first version lacked SDL_VIDEODRIVER and reported "SDL video init
+        # failed: No available video device", which says nothing about whether
+        # lavapipe works and everything about the missing variable.
+        env:
+          SDL_VIDEODRIVER: offscreen
         run: |
           echo "--- vulkaninfo ---"
           vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverName" || \
             echo "no Vulkan device visible"
+          echo "--- SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-unset} ---"
           echo "--- stratum_gpu_tests ---"
           # stderr is NOT discarded here, deliberately. The suites print their
           # skip reason -- the string SDL_GetError() returned when
