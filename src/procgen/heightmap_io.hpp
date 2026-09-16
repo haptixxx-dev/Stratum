@@ -80,6 +80,13 @@
  * see the STBI_ONLY_PNG note in heightmap_io.cpp for why the other nine decoders
  * are compiled out rather than merely unused.
  *
+ * Greyscale PNG is accepted at all five legal depths, 1, 2, 4, 8 and 16. The
+ * sub-byte ones are not useful terrain and they are not refused either: they
+ * decode correctly, they are reported at their real depth, and the coarse-quantum
+ * warning then says out loud that a 1-bit file over a 200 m range resolves 200 m
+ * per step. Refusing them would be defensible; reporting them as 8-bit, which is
+ * what asking the decoder rather than the file gives you, would not.
+ *
  * PGM is supported not because anyone ships DEMs in it but because it is the one
  * raster format whose bytes a test can write by hand, which is what lets the
  * whole path be tested with no binary fixture checked into the repository.
@@ -418,15 +425,26 @@ struct HeightmapSourceInfo {
     HeightmapFormat format = HeightmapFormat::Unknown;
     int width = 0;              ///< Source image width in samples
     int height = 0;             ///< Source image height in samples
-    int bits_per_sample = 0;    ///< 8 or 16
+    /**
+     * @brief Bits the SOURCE stored each sample in
+     *
+     * 8 or 16 for a PGM, and 1, 2, 4, 8 or 16 for a PNG -- greyscale PNG allows
+     * all five, and the sub-byte depths are read out of IHDR rather than guessed
+     * from the decoder. stb hands a 1-bit sample back scaled to fill 0..255, so a
+     * depth taken from the decoded pixels would say 8 for a file with two
+     * distinct levels in it, and @ref max_sample_value and
+     * HeightmapImportResult::vertical_quantum_metres would both be wrong by a
+     * factor of 255 in the flattering direction.
+     */
+    int bits_per_sample = 0;
 
     /**
      * @brief Sample value that maps to ElevationRange::max_metres()
      *
-     * 255 for an 8-bit PNG, 65535 for a 16-bit PNG, and the DECLARED maxval from
-     * the header for a PGM -- which is a real third case, because the Netpbm
-     * format lets a file say `maxval 1000` and mean it, so a sample of 1000 is
-     * full scale even though the file stores 16 bits.
+     * Full scale of the SOURCE depth: 1, 3, 15, 255 or 65535 for a PNG, and the
+     * DECLARED maxval from the header for a PGM -- which is a real third case,
+     * because the Netpbm format lets a file say `maxval 1000` and mean it, so a
+     * sample of 1000 is full scale even though the file stores 16 bits.
      *
      * It is never the largest value present in the data. Normalising by the
      * observed maximum would make the vertical scale depend on whether the

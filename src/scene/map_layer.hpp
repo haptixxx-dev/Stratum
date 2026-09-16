@@ -67,10 +67,41 @@
  * ### What a sample costs
  *
  * With the record pointer hoisted (MapLayerStore::find() once, outside the
- * loop) and nearest filtering on a float image, one sample_scalar() is: two
- * subtractions, two multiplications, two std::floor calls, two index clamps,
- * one multiply-add and one load. No allocation, no virtual call, no map
- * lookup, no branch that is not perfectly predicted across a run.
+ * loop) and nearest filtering on a float image, one sample_scalar() is, in
+ * order: one emptiness-and-storage test, one placement validation (four
+ * std::isfinite), one finiteness test on the position (two std::isfinite),
+ * one half-open containment test, two subtractions, two DIVISIONS, two
+ * multiplications, two std::floor calls, two index clamps, one multiply-add
+ * and one load.
+ *
+ * Measured at -O2, 20M samples landing inside a 1024x1024 single-channel float
+ * layer, checksums identical across all three variants: **about 12.5 ns per
+ * sample**. Replacing the two divisions with a precomputed reciprocal takes it
+ * to 9.2 ns, and hoisting the placement validation and the storage test out of
+ * the loop as well takes it to 6.2 ns. So the two divisions cost about 3.3 ns
+ * and the per-sample validation about 3.1 ns, and neither is the majority of
+ * the sample -- the remaining 6 ns is the address arithmetic and the load.
+ *
+ * That validation is paid per sample on purpose, and the reason it cannot
+ * simply be dropped is MapSampleStatus::BadPlacement. A zero-extent or
+ * non-finite placement can reach the store through load(), and the three
+ * answers "this position is outside the layer", "this layer cannot be
+ * addressed at all" and "here is a border texel" have to stay
+ * distinguishable. Deciding validity BEFORE the containment test is what
+ * keeps them apart; deciding it after would report Outside for a layer that
+ * is in fact unusable, which is the same class of confusion as reporting a
+ * confident zero. Caching the decision on the record would buy back roughly
+ * half the sample, at the price of a derived field that six mutation sites --
+ * bind(), load(), and the apply() and revert() of the image and placement
+ * commands -- must all remember to refresh. A stale one does not crash; it
+ * returns a plausible number from the wrong texel, which is the exact drift
+ * this file argues against everywhere else. If a consumer ever needs the 6 ns
+ * version, the place to put it is an addressing value built once per loop and
+ * passed in, which cannot go stale because it does not outlive the loop.
+ *
+ * What the design does buy, and what the free inline functions are FOR, is
+ * that none of the above allocates, none of it is a virtual call, none of it
+ * is a map lookup, and all of it inlines into the caller's loop.
  *
  *   - Bilinear costs three more loads and three lerps.
  *   - An 8-bit image costs one integer-to-float conversion and one multiply.
@@ -98,8 +129,14 @@
  *     hands back `outside_value`, so an ignored status still yields a sane
  *     number, and so "everything outside the mask is buildable" and
  *     "everything outside the mask is blocked" are both one field away.
- *   - `MapEdge::Clamp` extends the border texel to infinity and reports `Ok`.
- *     A coarse global water mask wants this.
+ *   - `MapEdge::Clamp` extends the layer's border outward to infinity and
+ *     reports `Ok`. A coarse global water mask wants this. It means the same
+ *     thing whichever way the layer is backed: for an image the border TEXEL
+ *     is repeated, and for a callable the POSITION is clamped into the
+ *     rectangle and the callable evaluated there. An obstacle mask read from
+ *     a file and a procedural one written for a test therefore answer the
+ *     same way off the edge, which matters because a consumer holds both
+ *     through the same `MapLayerData` and cannot see which is which.
  *
  * `MapEdge::Wrap` is deliberately absent. A georeferenced image that repeats
  * has no meaning, and a procedural field that tiles is what a function layer
@@ -139,6 +176,27 @@
  *
  * The one deliberate exception is load(), for A2's loader, which populates a
  * document before there is a history to record into.
+ *
+ * ### Nothing persists a map layer yet
+ *
+ * As of this commit, A2's `Document` owns a LayerTree, an AttributeStore, a
+ * CommandStack, a selection and a georeference -- and no MapLayerStore. Saving
+ * and reloading a document therefore drops every map layer's type, placement,
+ * sampling policy and pixels, leaving a `LayerKind::Map` layer in the tree with
+ * nothing behind it. load() has no caller for the same reason.
+ *
+ * This is stated here rather than left to be discovered because the tree being
+ * in the document while the side table is not is precisely the "parallel
+ * universe" this file's design is meant to avoid, and a reader who sees
+ * load()'s "For A2's loader only" would otherwise reasonably assume A2 already
+ * covers it. Closing it means a MapLayerStore on Document and a "map_layers"
+ * chunk in the writer and the loader, routed through the same id remapping the
+ * layer tree uses -- ids must be remapped in lockstep or a record lands on the
+ * wrong layer.
+ *
+ * What must NOT happen is a loader being pointed at load() before its checks
+ * are trusted, which is why load()'s @return now spells out every rule it
+ * enforces rather than leaving two of them to the commands.
  *
  * ### This file does not decode images
  *
@@ -255,6 +313,36 @@ struct MapImage {
     [[nodiscard]] size_t value_count() const {
         return static_cast<size_t>(width) * static_cast<size_t>(height) *
                static_cast<size_t>(channels);
+    }
+
+    /**
+     * @brief Does the live buffer hold exactly the values the dimensions claim?
+     *
+     * fetch() indexes without a bounds check, and the index it computes comes
+     * from `width`, `height` and `channels`. That is only safe if the buffer
+     * was actually measured against those three, which is what this asks.
+     *
+     * Separate from image_well_formed(), which is the ACCEPTANCE question and
+     * is asked at the doors -- the factories, the commands, and load(). This is
+     * the narrower SAFETY question, asked by detail::locate() on the read path,
+     * so that a record assembled by hand and handed straight to the free
+     * sample_*() functions -- a path with no door to check it -- cannot make
+     * fetch() read off the end. True only for an image whose live buffer holds
+     * exactly value_count() values, or one that claims no texels at all, so it
+     * does not depend on empty() having been asked first.
+     */
+    [[nodiscard]] bool storage_intact() const {
+        const size_t needed = value_count();
+        // Branching the same way fetch() does, so this measures the buffer
+        // fetch() will actually index rather than the other one.
+        if (!u8.empty()) return u8.size() == needed;
+        if (!f32.empty()) return f32.size() == needed;
+        // No buffer at all. Intact only if the dimensions claimed nothing
+        // either. A dimensioned image with no pixels is normally stopped by
+        // empty() before it gets here, but answering "intact" on the strength
+        // of that would make this check depend on the very gate it is standing
+        // behind -- and fetch() would then index an empty vector.
+        return needed == 0;
     }
 
     /// Heap bytes held, for a command's footprint().
@@ -485,8 +573,9 @@ struct MapLayerData {
  * a record could otherwise reach the store.
  *
  * A malformed image is not checked here: it is caught by image_well_formed()
- * at the point an image is installed, and folding the two would give one
- * failure two meanings.
+ * at every point an image is installed -- the two factories,
+ * SetMapLayerImageCommand::apply() and MapLayerStore::load() -- and folding
+ * the two would give one failure two meanings.
  */
 [[nodiscard]] inline bool record_consistent(const MapLayerData& record) {
     return !(record.function && !record.image.empty());
@@ -578,6 +667,14 @@ namespace detail {
     return static_cast<long long>(std::floor(value));
 }
 
+/// The far edge of a placement axis, for the function-layer clamp. A separate
+/// name because `min + size` appears in the containment test too, where it is
+/// the EXCLUSIVE bound; here it is the inclusive one, and writing the sum twice
+/// under one name is how the two would quietly drift apart.
+[[nodiscard]] inline double place_max(double min_value, double size) {
+    return min_value + size;
+}
+
 /// Pull a continuous index into [0, count - 1]. One place, so the border rule
 /// cannot drift between the nearest and the bilinear path.
 [[nodiscard]] inline uint32_t clamp_texel(long long index, uint32_t count) {
@@ -613,6 +710,14 @@ struct TexelRead {
         read.status = MapSampleStatus::NoData;
         return read;
     }
+    // The buffer must match the dimensions the index below is built from.
+    // Every door into the store checks this already, so reaching it means the
+    // record was assembled by hand and passed straight to a free sample_*()
+    // function. NoData rather than a read off the end of the vector.
+    if (!map.image.storage_intact()) {
+        read.status = MapSampleStatus::NoData;
+        return read;
+    }
     if (!map.placement.valid_for_image()) {
         // Unreachable through the commands, which validate. Reachable through
         // MapLayerStore::load(), i.e. a document A2 read off disk.
@@ -633,7 +738,16 @@ struct TexelRead {
     // Containment in WORLD space, because that is where the half-open rule is
     // stated, and before any division, because that is what keeps a position a
     // thousand kilometres away from turning into a huge texel index.
-    if (!map.placement.contains(world_x, world_z)) {
+    //
+    // Written out rather than calling MapPlacement::contains(), which would
+    // repeat the two std::isfinite calls made immediately above. Both
+    // coordinates are known finite here and the placement is known
+    // valid_for_image(), so bounded is known true: the half-open comparison is
+    // all that is left of contains().
+    const MapPlacement& place = map.placement;
+    const bool inside = world_x >= place.min_x && world_x < place.min_x + place.size_x &&
+                        world_z >= place.min_z && world_z < place.min_z + place.size_z;
+    if (!inside) {
         if (map.sampling.edge == MapEdge::Outside) {
             read.status = MapSampleStatus::Outside;
             return read;
@@ -717,13 +831,38 @@ struct TexelRead {
     }
 
     if (map.function) {
+        double fx = world_x;
+        double fz = world_z;
         if (!map.placement.contains(world_x, world_z)) {
-            sample.status = MapSampleStatus::Outside;
-            sample.value = map.sampling.outside_value;
-            return sample;
+            // MapEdge::Clamp has to mean the same thing here as it does for an
+            // image, or the same MapSampling on two layers a consumer treats
+            // interchangeably answers differently off the edge. For an image
+            // the border texel is repeated; the callable's equivalent is to
+            // move the POSITION onto the border and ask there.
+            //
+            // A non-finite position is never clamped: contains() rejects it and
+            // it is not off any edge, so it stays Outside under both modes --
+            // clamping it would hand a not-a-number to the callable.
+            if (map.sampling.edge != MapEdge::Clamp || !map.placement.bounded ||
+                !std::isfinite(world_x) || !std::isfinite(world_z)) {
+                sample.status = MapSampleStatus::Outside;
+                sample.value = map.sampling.outside_value;
+                return sample;
+            }
+            // Clamped into the CLOSED rectangle, unlike containment, which is
+            // half-open. No texel index is derived from this, so the far edge
+            // costs nothing; and the half-open rule exists to settle which of
+            // two abutting layers owns a seam, which is already moot under
+            // Clamp because both of them answer everywhere.
+            const double max_x = detail::place_max(map.placement.min_x, map.placement.size_x);
+            const double max_z = detail::place_max(map.placement.min_z, map.placement.size_z);
+            fx = world_x < map.placement.min_x ? map.placement.min_x
+                                               : (world_x > max_x ? max_x : world_x);
+            fz = world_z < map.placement.min_z ? map.placement.min_z
+                                               : (world_z > max_z ? max_z : world_z);
         }
         sample.status = MapSampleStatus::Ok;
-        sample.value = map.function(world_x, world_z);
+        sample.value = map.function(fx, fz);
         return sample;
     }
 
@@ -793,6 +932,18 @@ struct TexelRead {
         return sample;
     }
     if (read.status != MapSampleStatus::Ok) return sample;
+
+    // Three reads are about to happen unconditionally, so three channels must
+    // exist. Every door that installs an image checks channels_match_type(),
+    // which makes this unreachable through the store -- but a record built by
+    // hand and passed straight to this free function has no door, and a
+    // one-channel buffer would be indexed twice past its end. WrongType: the
+    // question "what colour is here" has no answer from a mask.
+    if (map.image.channels < 3) {
+        sample.status = MapSampleStatus::WrongType;
+        sample.colour = glm::vec4(0.0f);
+        return sample;
+    }
 
     sample.colour.r = detail::read_channel(map.image, read, 0);
     sample.colour.g = detail::read_channel(map.image, read, 1);
@@ -883,10 +1034,20 @@ public:
      * into, and routing load through commands would make opening a file
      * undoable back to an empty scene.
      *
-     * @return false when @p layer is kInvalidLayer, and false for a record that
-     *         breaks the one-source-at-a-time rule -- see record_consistent().
-     *         This is the only door into the store that is not a command, so it
-     *         is the only place that rule could otherwise be bypassed.
+     * @return false, installing nothing, when @p layer is kInvalidLayer, or the
+     *         record breaks the one-source-at-a-time rule (record_consistent()),
+     *         or its image is malformed (image_well_formed()), or its image's
+     *         channel count contradicts its type (channels_match_type()).
+     *
+     * This is the only door into the store that is not a command, so every rule
+     * the commands enforce has to be enforced again here or it is not an
+     * invariant of the store at all -- it is a convention the commands happen
+     * to keep. The two image rules matter most, because the samplers index the
+     * buffer without a bounds check: a record whose buffer is shorter than
+     * width * height * channels reads past the end of it, and a one-channel
+     * image on a Texture layer is read for three channels by sample_colour().
+     * Neither shows up as a crash at load. Both show up much later, as a number
+     * from nowhere in the middle of a generation run.
      *
      * @note The tree is deliberately NOT consulted: the loader may well install
      *       records before it has built the tree. active_map_layers() is where
@@ -1082,6 +1243,16 @@ private:
     /// displaced. revert() swaps back, so at every apply() this is the incoming
     /// image again.
     MapImage m_image;
+
+    /// What this command DOES, fixed at construction.
+    ///
+    /// describe() cannot read m_image to decide: apply() swaps it, and
+    /// CommandStack::execute() asks for the label only once apply() has
+    /// succeeded. By then m_image holds the DISPLACED image, so a command that
+    /// installed pixels would be labelled "Clear map image" and one that
+    /// cleared them "Set map image" -- every step in the undo menu naming the
+    /// opposite of what it did.
+    bool m_clears;
 };
 
 /**
@@ -1140,6 +1311,14 @@ private:
  * Refused on a Texture layer, and refused on an image-backed layer -- clear the
  * image first, in the same transaction if you like.
  *
+ * Also refused on a record whose placement is BOUNDED but has no extent, which
+ * is what a freshly bound record has. Such a layer reports has_data() and is
+ * offered by active_map_layers(), while MapPlacement::contains() is false
+ * everywhere, so the callable is never invoked and every sample comes back
+ * Outside: a keep-out circle that keeps nothing out. The image path refuses the
+ * same state through valid_for_image(); this is that rule, for callables.
+ * MapPlacement::unbounded() is accepted, and is the way to say "everywhere".
+ *
  * Unlike every other setter here there is no equal-value guard: `std::function`
  * has no equality operator, and there is no way to ask whether two callables do
  * the same thing. Setting the same lambda twice therefore records two steps.
@@ -1160,6 +1339,10 @@ private:
     /// Swapped, like the image: at every apply() this holds the incoming
     /// callable and afterwards the one it displaced.
     MapFunction m_function;
+
+    /// What this command does, fixed at construction. Same reason as
+    /// SetMapLayerImageCommand::m_clears: describe() runs after the swap.
+    bool m_clears;
 };
 
 // ============================================================================

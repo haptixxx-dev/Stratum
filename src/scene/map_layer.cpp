@@ -272,6 +272,25 @@ bool MapLayerStore::load(LayerId layer, MapLayerData data) {
     // report Image while sample_scalar() quietly read the callable.
     if (!record_consistent(data)) return false;
 
+    // The same argument, for the two image rules -- and these two are the ones
+    // that are not merely confusing but unsafe, because the samplers index the
+    // buffer without a bounds check.
+    //
+    // A buffer shorter than width * height * channels gets past
+    // MapImage::empty(), which only asks whether there are pixels at all, so
+    // locate() proceeds and fetch() reads off the end of the vector. Unloaded
+    // images are a legal state, so this is image_well_formed(), which accepts
+    // the empty image and rejects only a malformed one.
+    if (!image_well_formed(data.image)) return false;
+
+    // And a Texture record carrying a one-channel image: sample_colour() reads
+    // channels 0, 1 and 2 unconditionally, so two of those three reads are past
+    // the end of a single-channel buffer. SetMapLayerImageCommand::apply()
+    // enforces this rule, and the loader is exactly the path that bypasses it.
+    if (!data.image.empty() && !channels_match_type(data.type, data.image.channels)) {
+        return false;
+    }
+
     m_records[layer] = std::move(data);
     return true;
 }
@@ -442,7 +461,13 @@ size_t UnbindMapLayerCommand::footprint() const {
 
 SetMapLayerImageCommand::SetMapLayerImageCommand(LayerTree& tree, MapLayerStore& store,
                                                  LayerId layer, MapImage image)
-    : MapLayerCommand(tree, store, layer), m_image(std::move(image)) {}
+    : MapLayerCommand(tree, store, layer),
+      m_image(std::move(image)),
+      // Read BEFORE the first apply(), because apply() swaps m_image and
+      // CommandStack::execute() takes the step label from describe() only after
+      // apply() has succeeded. Deciding the label from the member at that point
+      // reports the inverse of what happened.
+      m_clears(m_image.empty()) {}
 
 bool SetMapLayerImageCommand::apply() {
     if (!target_is_map_layer()) return false;
@@ -479,7 +504,7 @@ void SetMapLayerImageCommand::revert() {
 }
 
 std::string SetMapLayerImageCommand::describe() const {
-    return m_image.empty() ? "Clear map image" : "Set map image";
+    return m_clears ? "Clear map image" : "Set map image";
 }
 
 size_t SetMapLayerImageCommand::footprint() const {
@@ -581,7 +606,10 @@ bool SetMapLayerSamplingCommand::merge(const Command& next) {
 
 SetMapLayerFunctionCommand::SetMapLayerFunctionCommand(LayerTree& tree, MapLayerStore& store,
                                                        LayerId layer, MapFunction function)
-    : MapLayerCommand(tree, store, layer), m_function(std::move(function)) {}
+    : MapLayerCommand(tree, store, layer),
+      m_function(std::move(function)),
+      // Same swap, same reason as SetMapLayerImageCommand::m_clears.
+      m_clears(!m_function) {}
 
 bool SetMapLayerFunctionCommand::apply() {
     if (!target_is_map_layer()) return false;
@@ -594,6 +622,17 @@ bool SetMapLayerFunctionCommand::apply() {
         // is a second signature for a case nothing asks for.
         if (record->type == MapLayerType::Texture) return false;
         if (!record->image.empty()) return false;  // one source at a time
+
+        // A freshly bound record's placement is bounded with zero extent, and
+        // contains() is false everywhere on it. Accepting a callable against
+        // that produces a layer that reports has_data(), is handed to B8 by
+        // active_map_layers(), and never invokes the callable once: every
+        // sample comes back Outside. The image path refuses this same state via
+        // valid_for_image(); refusing it here is that rule for callables, so
+        // the caller hears about it instead of getting a keep-out circle that
+        // keeps nothing out. An UNBOUNDED placement is the deliberate
+        // "everywhere" case and is fine.
+        if (record->placement.bounded && !record->placement.valid_for_image()) return false;
     } else if (!record->function) {
         // Clearing a callable that is already clear changes nothing.
         return false;
@@ -613,7 +652,7 @@ void SetMapLayerFunctionCommand::revert() {
 }
 
 std::string SetMapLayerFunctionCommand::describe() const {
-    return m_function ? "Set map function" : "Clear map function";
+    return m_clears ? "Clear map function" : "Set map function";
 }
 
 // ============================================================================

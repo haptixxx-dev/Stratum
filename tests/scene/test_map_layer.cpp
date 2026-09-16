@@ -50,6 +50,7 @@
 
 using stratum::scene::active_map_layers;
 using stratum::scene::bind_map_layer;
+using stratum::scene::channels_match_type;
 using stratum::scene::CommandStack;
 using stratum::scene::CreateLayerCommand;
 using stratum::scene::DeleteLayerCommand;
@@ -454,6 +455,37 @@ TEST(MapLayer, clamp_extends_the_border_texel_and_reports_ok) {
     const MapScalarSample mixed = sample_scalar(*record, 5000.0, 20.5);
     CHECK_EQ(status_name(mixed.status), std::string("Ok"));
     CHECK_NEAR(mixed.value, 3.0, 1e-6);
+
+    // Far enough out to reach detail::floor_index()'s OWN guard, which the
+    // probes above never do: they are thousands of metres away, and the guard
+    // exists for 1e9. Converting a double this large to long long is undefined,
+    // and on x86-64 it yields LLONG_MIN -- a NEGATIVE index, which clamps to
+    // texel 0 and reports a confident 1 at the far corner instead of 6. So this
+    // is a probe whose right answer and whose wrong answer are both plausible
+    // values out of the image, and only the guard separates them.
+    const MapScalarSample enormous = sample_scalar(*record, 1.0e30, 1.0e30);
+    CHECK_EQ(status_name(enormous.status), std::string("Ok"));
+    CHECK_NEAR(enormous.value, 6.0, 1e-6);
+
+    const MapScalarSample negative = sample_scalar(*record, -1.0e30, -1.0e30);
+    CHECK_EQ(status_name(negative.status), std::string("Ok"));
+    CHECK_NEAR(negative.value, 1.0, 1e-6);
+
+    // Bilinear takes a different path through floor_index() -- it floors a
+    // half-texel-shifted position and then indexes the neighbour -- so it is
+    // guarded separately.
+    MapSampling smooth;
+    smooth.edge = MapEdge::Clamp;
+    smooth.outside_value = -7.0f;
+    smooth.filter = MapFilter::Bilinear;
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, map, smooth));
+    const MapLayerData* blended = f.store.find(map);
+    CHECK(blended != nullptr);
+    if (blended != nullptr) {
+        const MapScalarSample far_out = sample_scalar(*blended, 1.0e30, 1.0e30);
+        CHECK_EQ(status_name(far_out.status), std::string("Ok"));
+        CHECK_NEAR(far_out.value, 6.0, 1e-6);
+    }
 }
 
 TEST(MapLayer, a_position_that_is_not_a_number_is_outside_under_every_edge_mode) {
@@ -585,16 +617,22 @@ TEST(MapLayer, the_threshold_decides_which_texels_are_set_and_is_editable) {
     const LayerId map = make_map_layer(f, "obstacles");
     CHECK_TRUE(bind_map_layer(f.stack, f.tree, f.store, map, MapLayerType::Obstacle));
     CHECK_TRUE(set_map_layer_placement(f.stack, f.tree, f.store, map,
-                                       MapPlacement::rect(0.0, 0.0, 2.0, 1.0)));
+                                       MapPlacement::rect(0.0, 0.0, 3.0, 1.0)));
     CHECK_TRUE(set_map_layer_image(f.stack, f.tree, f.store, map,
-                                   make_f32_image(2, 1, 1, {0.4f, 0.6f})));
+                                   make_f32_image(3, 1, 1, {0.4f, 0.5f, 0.6f})));
 
     const MapLayerData* record = f.store.find(map);
     CHECK(record != nullptr);
     if (record == nullptr) return;
 
-    // Default threshold is 0.5, which straddles the two texels.
+    // Default threshold is 0.5, which straddles the outer two texels.
     CHECK_FALSE(is_obstacle(*record, 0.5, 0.5));
+    CHECK_TRUE(is_obstacle(*record, 2.5, 0.5));
+
+    // The middle texel holds exactly the threshold. The rule is "set when the
+    // value is >= this", so it counts as set -- and this is the only probe in
+    // the suite that can tell >= from >, which are otherwise indistinguishable
+    // for any texel that does not sit on the boundary.
     CHECK_TRUE(is_obstacle(*record, 1.5, 0.5));
 
     MapSampling low;
@@ -605,6 +643,7 @@ TEST(MapLayer, the_threshold_decides_which_texels_are_set_and_is_editable) {
     if (lowered != nullptr) {
         CHECK_TRUE(is_obstacle(*lowered, 0.5, 0.5));
         CHECK_TRUE(is_obstacle(*lowered, 1.5, 0.5));
+        CHECK_TRUE(is_obstacle(*lowered, 2.5, 0.5));
     }
 
     MapSampling high;
@@ -615,6 +654,19 @@ TEST(MapLayer, the_threshold_decides_which_texels_are_set_and_is_editable) {
     if (raised != nullptr) {
         CHECK_FALSE(is_obstacle(*raised, 0.5, 0.5));
         CHECK_FALSE(is_obstacle(*raised, 1.5, 0.5));
+        CHECK_FALSE(is_obstacle(*raised, 2.5, 0.5));
+    }
+
+    // And an exact threshold of 0.6 against the texel holding 0.6: still set,
+    // at the other end of the range, so the boundary rule is pinned twice.
+    MapSampling exact;
+    exact.threshold = 0.6f;
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, map, exact));
+    const MapLayerData* on_the_line = f.store.find(map);
+    CHECK(on_the_line != nullptr);
+    if (on_the_line != nullptr) {
+        CHECK_FALSE(is_obstacle(*on_the_line, 1.5, 0.5));
+        CHECK_TRUE(is_obstacle(*on_the_line, 2.5, 0.5));
     }
 }
 
@@ -923,6 +975,24 @@ TEST(MapLayer, a_malformed_image_is_rejected_at_construction_and_at_install) {
     CHECK_FALSE(image_well_formed(hollow));
     CHECK_TRUE(image_well_formed(MapImage{}));
 
+    // image_well_formed() is the ACCEPTANCE answer, asked at the doors.
+    // MapImage::empty() is the SAFETY one, asked on the read path, and it is
+    // what keeps the sampler off a buffer that is not there: a dimensioned
+    // image with no pixels must read as empty, or locate() proceeds to a
+    // fetch() that indexes a vector of length zero. Pinned directly, because
+    // every other check here would still pass if empty() stopped testing the
+    // buffers and only looked at the dimensions.
+    CHECK_TRUE(hollow.empty());
+    CHECK_TRUE(MapImage{}.empty());
+    CHECK_FALSE(make_f32_image(2, 2, 1, {1.0f, 2.0f, 3.0f, 4.0f}).empty());
+
+    MapLayerData hollow_record;
+    hollow_record.type = MapLayerType::Scalar;
+    hollow_record.placement = MapPlacement::rect(0.0, 0.0, 2.0, 2.0);
+    hollow_record.image = hollow;
+    CHECK_FALSE(hollow_record.has_data());
+    CHECK_EQ(status_name(sample_scalar(hollow_record, 0.5, 0.5).status), std::string("NoData"));
+
     // And the command refuses one built by hand, leaving the previous pixels in
     // place rather than half-installing.
     Fixture f;
@@ -985,7 +1055,23 @@ TEST(MapLayer, setting_an_image_undoes_and_redoes_without_losing_pixels) {
 
 TEST(MapLayer, unbinding_keeps_the_pixels_as_undo_state_and_says_how_big_they_are) {
     Fixture f;
-    const LayerId map = make_grid_layer(f);
+    const LayerId map = make_map_layer(f, "basemap");
+    CHECK_TRUE(bind_map_layer(f.stack, f.tree, f.store, map, MapLayerType::Scalar));
+    CHECK_TRUE(set_map_layer_placement(f.stack, f.tree, f.store, map,
+                                       MapPlacement::rect(0.0, 0.0, 64.0, 64.0)));
+
+    // 64 x 64 floats: 16384 bytes of pixels, which is a large multiple of
+    // sizeof(UnbindMapLayerCommand) + sizeof(MapLayerData). The six-float grid
+    // this test used to unbind was not -- the bound it asserted was cleared by
+    // the two structs alone, so a footprint() that counted the objects and none
+    // of the heap satisfied it, which is the one thing the assertion is for.
+    constexpr size_t kTexels = 64u * 64u;
+    constexpr size_t kPixelBytes = kTexels * sizeof(float);
+    std::vector<float> pixels(kTexels, 0.0f);
+    pixels[kTexels - 1u] = 42.0f;  // a value to recognise the undo by
+    CHECK_TRUE(set_map_layer_image(f.stack, f.tree, f.store, map,
+                                   make_f32_image(64, 64, 1, pixels)));
+    f.stack.seal();
 
     const size_t bytes_before = f.stack.bytes();
     CHECK_TRUE(unbind_map_layer(f.stack, f.tree, f.store, map));
@@ -996,15 +1082,17 @@ TEST(MapLayer, unbinding_keeps_the_pixels_as_undo_state_and_says_how_big_they_ar
 
     // The step must account for the image it is holding. Reporting only
     // sizeof(command) is exactly the failure Command::footprint() warns about:
-    // the stack's byte bound would stop bounding anything.
-    CHECK((bytes_after - bytes_before) >= sizeof(UnbindMapLayerCommand) + 6u * sizeof(float));
+    // the stack's byte bound would stop bounding anything. The pixels alone
+    // clear this bound, so the two structs cannot.
+    CHECK((bytes_after - bytes_before) >= kPixelBytes);
+    CHECK((sizeof(UnbindMapLayerCommand) + sizeof(MapLayerData)) < kPixelBytes);
 
     // Undo brings the record back whole, pixels and placement included.
     CHECK_TRUE(f.stack.undo());
     CHECK_TRUE(f.store.is_bound(map));
-    const MapScalarSample restored = f.store.sample_scalar(map, 12.5, 21.5);
+    const MapScalarSample restored = f.store.sample_scalar(map, 63.5, 63.5);
     CHECK_EQ(status_name(restored.status), std::string("Ok"));
-    CHECK_NEAR(restored.value, 6.0, 1e-6);
+    CHECK_NEAR(restored.value, 42.0, 1e-6);
 
     CHECK_TRUE(f.stack.redo());
     CHECK_FALSE(f.store.is_bound(map));
@@ -1292,4 +1380,343 @@ TEST(MapLayer, creating_binding_and_loading_in_one_transaction_undoes_as_one_ste
     CHECK_TRUE(f.stack.redo());
     CHECK_TRUE(f.tree.contains(map));
     CHECK_NEAR(f.store.sample_scalar(map, 12.5, 21.5).value, 6.0, 1e-6);
+}
+
+// ============================================================================
+// The loader's door
+//
+// MapLayerStore::load() is the one way into the store that is not a command,
+// so every rule the commands enforce has to be enforced again here. These are
+// not hypothetical: the samplers index the buffer without a bounds check, so a
+// record that gets past this door reads off the end of a vector rather than
+// failing at load.
+// ============================================================================
+
+TEST(MapLayer, loading_an_image_shorter_than_its_dimensions_is_refused) {
+    // width * height * channels says sixteen values; the buffer holds two.
+    // MapImage::empty() is false for this -- it only asks whether there are any
+    // pixels at all -- so nothing downstream stops it: locate() proceeds and
+    // fetch() indexes past the end.
+    Fixture f;
+    const LayerId map = make_map_layer(f, "from disk");
+
+    MapImage truncated;
+    truncated.width = 4;
+    truncated.height = 4;
+    truncated.channels = 1;
+    truncated.f32 = {1.0f, 2.0f};
+
+    CHECK_FALSE(image_well_formed(truncated));
+    CHECK_FALSE(truncated.empty());          // the reason the other checks miss it
+    CHECK_FALSE(truncated.storage_intact());
+
+    MapLayerData record;
+    record.type = MapLayerType::Scalar;
+    record.placement = MapPlacement::rect(0.0, 0.0, 4.0, 4.0);
+    record.image = truncated;
+
+    // record_consistent() passes -- there is only one source -- which is
+    // exactly why load() cannot stop at that check.
+    CHECK_TRUE(record_consistent(record));
+    CHECK_FALSE(f.store.load(map, record));
+    CHECK_FALSE(f.store.is_bound(map));
+    CHECK_EQ(status_name(f.store.sample_scalar(map, 3.5, 3.5).status), std::string("NoLayer"));
+
+    // And the read path refuses it too, for the record that never went through
+    // a door at all: built by hand and handed straight to the free function.
+    CHECK_EQ(status_name(sample_scalar(record, 3.5, 3.5).status), std::string("NoData"));
+
+    // The same dimensions with a full buffer load and sample normally, so the
+    // refusal is about the truncation and not about load() being broken.
+    MapLayerData whole;
+    whole.type = MapLayerType::Scalar;
+    whole.placement = MapPlacement::rect(0.0, 0.0, 4.0, 4.0);
+    whole.image = make_f32_image(4, 4, 1, std::vector<float>(16, 7.0f));
+    CHECK_TRUE(f.store.load(map, std::move(whole)));
+    CHECK_NEAR(f.store.sample_scalar(map, 3.5, 3.5).value, 7.0, 1e-6);
+}
+
+TEST(MapLayer, loading_a_texture_backed_by_a_one_channel_image_is_refused) {
+    // sample_colour() reads channels 0, 1 and 2 unconditionally, so a
+    // single-channel buffer is indexed twice past its end. The commands enforce
+    // channels_match_type(); the loader is the path that skips them.
+    Fixture f;
+    const LayerId map = make_map_layer(f, "from disk");
+
+    MapLayerData record;
+    record.type = MapLayerType::Texture;
+    record.placement = MapPlacement::rect(0.0, 0.0, 1.0, 1.0);
+    record.image = make_f32_image(1, 1, 1, {0.5f});
+
+    // Well-formed as an IMAGE, and consistent as a record. Only the
+    // channels-against-type rule rejects it, and only load() can apply that
+    // rule on this path.
+    CHECK_TRUE(image_well_formed(record.image));
+    CHECK_TRUE(record_consistent(record));
+    CHECK_FALSE(channels_match_type(MapLayerType::Texture, record.image.channels));
+
+    CHECK_FALSE(f.store.load(map, record));
+    CHECK_FALSE(f.store.is_bound(map));
+
+    // The read path refuses it as well, so a hand-built record that never met a
+    // door cannot get two reads past the end of a one-element buffer either.
+    const MapColourSample sample = sample_colour(record, 0.5, 0.5);
+    CHECK_EQ(status_name(sample.status), std::string("WrongType"));
+    CHECK_NEAR(sample.colour.r, 0.0, 1e-9);
+
+    // Three channels is the same picture with a legal shape, and it loads.
+    MapLayerData legal;
+    legal.type = MapLayerType::Texture;
+    legal.placement = MapPlacement::rect(0.0, 0.0, 1.0, 1.0);
+    legal.image = make_f32_image(1, 1, 3, {0.5f, 0.25f, 0.125f});
+    CHECK_TRUE(f.store.load(map, std::move(legal)));
+    const MapColourSample ok = f.store.sample_colour(map, 0.5, 0.5);
+    CHECK_EQ(status_name(ok.status), std::string("Ok"));
+    CHECK_NEAR(ok.colour.g, 0.25, 1e-6);
+    CHECK_NEAR(ok.colour.a, 1.0, 1e-6);
+}
+
+// ============================================================================
+// Labels
+// ============================================================================
+
+TEST(MapLayer, a_step_is_labelled_with_the_operation_it_performed) {
+    // Both of these commands SWAP their member in apply(), and
+    // CommandStack::execute() asks describe() for the label only AFTER apply()
+    // has succeeded. A describe() that reads the member therefore names the
+    // image or callable it displaced -- the inverse of what the step did.
+    Fixture f;
+    const LayerId map = make_map_layer(f, "field");
+    CHECK_TRUE(bind_map_layer(f.stack, f.tree, f.store, map, MapLayerType::Scalar));
+    CHECK_EQ(f.stack.undo_label(), std::string("Add map layer data"));
+
+    CHECK_TRUE(set_map_layer_placement(f.stack, f.tree, f.store, map, grid_placement()));
+    CHECK_EQ(f.stack.undo_label(), std::string("Move map layer"));
+
+    CHECK_TRUE(set_map_layer_image(f.stack, f.tree, f.store, map, grid_image()));
+    CHECK_EQ(f.stack.undo_label(), std::string("Set map image"));
+
+    CHECK_TRUE(set_map_layer_image(f.stack, f.tree, f.store, map, MapImage{}));
+    CHECK_EQ(f.stack.undo_label(), std::string("Clear map image"));
+
+    // The label has to survive the round trip as well: redo re-applies, which
+    // swaps again, and the step keeps the label it was given when it was made.
+    CHECK_TRUE(f.stack.undo());
+    CHECK_EQ(f.stack.redo_label(), std::string("Clear map image"));
+    CHECK_EQ(f.stack.undo_label(), std::string("Set map image"));
+    CHECK_TRUE(f.stack.redo());
+    CHECK_EQ(f.stack.undo_label(), std::string("Clear map image"));
+
+    // Same for the callable. The image is clear by now, so a function is legal.
+    CHECK_TRUE(set_map_layer_function(f.stack, f.tree, f.store, map,
+                                      [](double, double) { return 1.0f; }));
+    CHECK_EQ(f.stack.undo_label(), std::string("Set map function"));
+
+    CHECK_TRUE(set_map_layer_function(f.stack, f.tree, f.store, map, nullptr));
+    CHECK_EQ(f.stack.undo_label(), std::string("Clear map function"));
+
+    CHECK_TRUE(f.stack.undo());
+    CHECK_EQ(f.stack.redo_label(), std::string("Clear map function"));
+    CHECK_EQ(f.stack.undo_label(), std::string("Set map function"));
+
+    // Unbinding names itself too.
+    f.stack.seal();
+    CHECK_TRUE(unbind_map_layer(f.stack, f.tree, f.store, map));
+    CHECK_EQ(f.stack.undo_label(), std::string("Remove map layer data"));
+}
+
+// ============================================================================
+// A callable needs a placement it can answer within
+// ============================================================================
+
+TEST(MapLayer, a_callable_is_refused_on_a_placement_with_no_extent) {
+    // A freshly bound record's placement is bounded with zero extent, so
+    // contains() is false everywhere on it. A callable accepted against that
+    // gives a layer that reports has_data() and is offered to a consumer by
+    // active_map_layers(), while every sample comes back Outside and the
+    // callable is never invoked once: a keep-out circle that keeps nothing out.
+    Fixture f;
+    const LayerId map = make_map_layer(f, "keep out");
+    CHECK_TRUE(bind_map_layer(f.stack, f.tree, f.store, map, MapLayerType::Obstacle));
+
+    const size_t depth = f.stack.undo_depth();
+    CHECK_FALSE(set_map_layer_function(f.stack, f.tree, f.store, map,
+                                       [](double, double) { return 1.0f; }));
+    CHECK_EQ(f.stack.undo_depth(), depth);
+
+    // Refused means refused: no data, and nothing offered to a consumer.
+    const MapLayerData* empty_record = f.store.find(map);
+    CHECK(empty_record != nullptr);
+    if (empty_record != nullptr) CHECK_FALSE(empty_record->has_data());
+    CHECK_EQ(active_map_layers(f.tree, f.store, MapLayerType::Obstacle).size(), size_t{0});
+
+    // With a real rectangle the same callable goes in, and now it actually runs.
+    CHECK_TRUE(set_map_layer_placement(f.stack, f.tree, f.store, map,
+                                       MapPlacement::rect(-10.0, -10.0, 20.0, 20.0)));
+    CHECK_TRUE(set_map_layer_function(f.stack, f.tree, f.store, map,
+                                      [](double, double) { return 1.0f; }));
+    const MapLayerData* live = f.store.find(map);
+    CHECK(live != nullptr);
+    if (live != nullptr) {
+        CHECK_EQ(status_name(sample_scalar(*live, 0.0, 0.0).status), std::string("Ok"));
+        CHECK_TRUE(is_obstacle(*live, 0.0, 0.0));
+    }
+    CHECK_EQ(active_map_layers(f.tree, f.store, MapLayerType::Obstacle).size(), size_t{1});
+
+    // Unbounded is the deliberate "everywhere" case and is accepted directly,
+    // so the rule is about an unusable extent and not about bounded placements.
+    const LayerId global = make_map_layer(f, "everywhere");
+    CHECK_TRUE(bind_map_layer(f.stack, f.tree, f.store, global, MapLayerType::Obstacle));
+    CHECK_TRUE(
+        set_map_layer_placement(f.stack, f.tree, f.store, global, MapPlacement::unbounded()));
+    CHECK_TRUE(set_map_layer_function(f.stack, f.tree, f.store, global,
+                                      [](double, double) { return 1.0f; }));
+
+    // Clearing a callable is never blocked by the placement rule -- a layer must
+    // always be able to get back to empty.
+    CHECK_TRUE(set_map_layer_function(f.stack, f.tree, f.store, global, nullptr));
+}
+
+// ============================================================================
+// One meaning for MapEdge::Clamp
+// ============================================================================
+
+TEST(MapLayer, clamp_answers_the_same_off_the_edge_for_pixels_and_for_a_callable) {
+    // A consumer holds both through the same MapLayerData and cannot see which
+    // is which, so the same MapSampling must mean the same thing on both. For
+    // an image Clamp repeats the border texel; the callable's equivalent is to
+    // move the position onto the border and ask there.
+    Fixture f;
+
+    MapSampling clamped;
+    clamped.edge = MapEdge::Clamp;
+    clamped.outside_value = -7.0f;  // never a legal answer, so it cannot be mistaken
+
+    const MapPlacement place = MapPlacement::rect(0.0, 0.0, 2.0, 2.0);
+
+    const LayerId raster = make_map_layer(f, "from a file");
+    CHECK_TRUE(bind_map_layer(f.stack, f.tree, f.store, raster, MapLayerType::Scalar));
+    CHECK_TRUE(set_map_layer_placement(f.stack, f.tree, f.store, raster, place));
+    CHECK_TRUE(set_map_layer_image(f.stack, f.tree, f.store, raster,
+                                   make_f32_image(2, 2, 1, {1.0f, 2.0f, 3.0f, 4.0f})));
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, raster, clamped));
+
+    const LayerId field = make_map_layer(f, "procedural");
+    CHECK_TRUE(bind_map_layer(f.stack, f.tree, f.store, field, MapLayerType::Scalar));
+    CHECK_TRUE(set_map_layer_placement(f.stack, f.tree, f.store, field, place));
+    // Reads the position back, so a clamped position is visible in the answer:
+    // clamping to the far corner must report 2, not the 500 that was asked for.
+    CHECK_TRUE(set_map_layer_function(f.stack, f.tree, f.store, field,
+                                      [](double x, double z) {
+                                          return static_cast<float>(x * 10.0 + z);
+                                      }));
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, field, clamped));
+
+    const MapLayerData* image_backed = f.store.find(raster);
+    const MapLayerData* function_backed = f.store.find(field);
+    CHECK(image_backed != nullptr);
+    CHECK(function_backed != nullptr);
+    if (image_backed == nullptr || function_backed == nullptr) return;
+
+    // Far off the far corner. Both must report Ok, and neither may report the
+    // outside value -- that is the whole disagreement.
+    const MapScalarSample from_image = sample_scalar(*image_backed, 500.0, 500.0);
+    const MapScalarSample from_function = sample_scalar(*function_backed, 500.0, 500.0);
+    CHECK_EQ(status_name(from_image.status), std::string("Ok"));
+    CHECK_EQ(status_name(from_function.status), std::string("Ok"));
+    CHECK_NEAR(from_image.value, 4.0, 1e-6);      // the far border texel
+    CHECK_NEAR(from_function.value, 22.0, 1e-6);  // 10 * 2 + 2, i.e. the far corner
+
+    // And off the near corner, where the clamp goes the other way.
+    CHECK_NEAR(sample_scalar(*image_backed, -500.0, -500.0).value, 1.0, 1e-6);
+    CHECK_NEAR(sample_scalar(*function_backed, -500.0, -500.0).value, 0.0, 1e-6);
+
+    // One axis at a time, so a clamp that only handles both-at-once is caught.
+    CHECK_NEAR(sample_scalar(*function_backed, 500.0, 1.0).value, 21.0, 1e-6);
+    CHECK_NEAR(sample_scalar(*function_backed, 1.0, 500.0).value, 12.0, 1e-6);
+
+    // Under MapEdge::Outside the two agree the other way: both decline.
+    MapSampling outside;
+    outside.edge = MapEdge::Outside;
+    outside.outside_value = -7.0f;
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, field, outside));
+    const MapLayerData* declining = f.store.find(field);
+    CHECK(declining != nullptr);
+    if (declining != nullptr) {
+        const MapScalarSample sample = sample_scalar(*declining, 500.0, 500.0);
+        CHECK_EQ(status_name(sample.status), std::string("Outside"));
+        CHECK_NEAR(sample.value, -7.0, 1e-6);
+    }
+
+    // A position that is not a number is not off any edge, so Clamp does not
+    // rescue it: clamping it would hand a not-a-number to the callable.
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, field, clamped));
+    const MapLayerData* clamping = f.store.find(field);
+    CHECK(clamping != nullptr);
+    if (clamping != nullptr) {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        const MapScalarSample sample = sample_scalar(*clamping, nan, 1.0);
+        CHECK_EQ(status_name(sample.status), std::string("Outside"));
+        CHECK_NEAR(sample.value, -7.0, 1e-6);
+    }
+}
+
+// ============================================================================
+// The sampling command merges like the placement command does
+// ============================================================================
+
+TEST(MapLayer, dragging_a_threshold_is_one_undo_step_that_returns_to_where_it_started) {
+    Fixture f;
+    const LayerId map = make_grid_layer(f, MapLayerType::Obstacle);
+
+    // Every threshold here is exact in binary, so CHECK_NEAR compares a float
+    // against a double literal with no representation error to absorb. 0.9f,
+    // for instance, differs from the double 0.9 by 2.4e-8 -- larger than the
+    // epsilon a test like this would naturally reach for.
+    MapSampling start;
+    start.threshold = 0.25f;
+    MapSampling middle;
+    middle.threshold = 0.5f;
+    MapSampling end;
+    end.threshold = 0.75f;
+
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, map, start));
+    f.stack.seal();
+    const size_t depth_after_start = f.stack.undo_depth();
+
+    // Two more, unsealed: one slider drag.
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, map, middle));
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, map, end));
+    CHECK_EQ(f.stack.undo_depth(), depth_after_start + 1u);
+
+    const MapLayerData* dragged = f.store.find(map);
+    CHECK(dragged != nullptr);
+    if (dragged != nullptr) CHECK_NEAR(dragged->sampling.threshold, 0.75, 1e-9);
+
+    // One undo returns to where the gesture began, not to its middle. Keeping
+    // the successor's OLD value is the classic merge bug and would land here on
+    // 0.5 -- halfway through a drag the user made in one motion.
+    CHECK_TRUE(f.stack.undo());
+    const MapLayerData* reverted = f.store.find(map);
+    CHECK(reverted != nullptr);
+    if (reverted != nullptr) CHECK_NEAR(reverted->sampling.threshold, 0.25, 1e-9);
+
+    CHECK_TRUE(f.stack.redo());
+    const MapLayerData* redone = f.store.find(map);
+    CHECK(redone != nullptr);
+    if (redone != nullptr) CHECK_NEAR(redone->sampling.threshold, 0.75, 1e-9);
+
+    // A gesture that ends where it began must NOT merge itself into a no-op
+    // step: its redo would hit apply()'s equal-value guard and be dropped.
+    f.stack.seal();
+    const size_t depth = f.stack.undo_depth();
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, map, middle));
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, map, end));
+    CHECK_EQ(f.stack.undo_depth(), depth + 2u);
+
+    // A sealed step absorbs nothing, so the seal really is what ends a gesture.
+    f.stack.seal();
+    const size_t sealed_depth = f.stack.undo_depth();
+    CHECK_TRUE(set_map_layer_sampling(f.stack, f.tree, f.store, map, start));
+    CHECK_EQ(f.stack.undo_depth(), sealed_depth + 1u);
 }

@@ -21,6 +21,18 @@
  *   - `from_a_road_graph_a_grade_separation_stays_two_nodes` seeds from a bridge
  *     crossing a road. Keying the load by OSM id alone merges the crossing into
  *     one node, and the arm count goes from 2 to 4.
+ *   - `which_node_keeps_an_osm_id_does_not_depend_on_the_order_of_the_ways`
+ *     seeds the SAME two ways in both orders. A load that hands the OSM id to
+ *     whichever edge reaches it first gives two different answers, which means
+ *     every NodeId in a selection or a saved document names a different piece of
+ *     road after a reload.
+ *
+ * Two shapes are worth knowing about, because most of the file does not use
+ * them: `loud_attributes()` sets every field of SegmentAttributes to something
+ * that is not its default, and `check_every_attribute()` compares them one at a
+ * time rather than through `operator==`. A test that spells "the tags came
+ * through" as a single operator call is worth exactly as much as that operator,
+ * and nothing used to check the operator.
  *
  * Coordinates are deliberately asymmetric and splits deliberately off-centre, so
  * a mistake that happens to commute -- a midpoint split, a swapped x and y -- has
@@ -154,11 +166,112 @@ EditableGraph seed_from(std::vector<Road> roads) {
     return EditableGraph::from_road_graph(graph);
 }
 
+/// Every attribute set to something that is not its default, so a copy that
+/// dropped any single one of them fails the comparison.
+SegmentAttributes loud_attributes() {
+    SegmentAttributes a;
+    a.type = RoadType::Tertiary;
+    a.layer = -2;
+    a.width = 9.25f;
+    a.lanes = 5;
+    a.lanes_forward = 3;
+    a.lanes_backward = 2;
+    a.is_oneway = true;
+    a.is_bridge = true;
+    a.is_tunnel = true;
+    a.is_roundabout = true;
+    a.is_link = true;
+    a.sidewalk = SideFlags::Left;
+    a.cycleway = SideFlags::Right;
+    a.parking = SideFlags::Both;
+    a.shoulder = SideFlags::None;
+    a.surface = "sett";
+    a.name = "Bull Alley Street";
+    return a;
+}
+
+/**
+ * @brief Compare every field of @p actual against @p expected, one check each
+ *
+ * Spelled out rather than routed through `operator==`, because a test whose whole
+ * assertion is one call to that operator cannot tell a copy that dropped a field
+ * from an operator that answers true to everything -- and a mutant that replaced
+ * the operator's body with `return true` did pass the entire suite. These checks
+ * are what it fails, and they also name the field that went missing instead of
+ * reporting "the struct differs".
+ *
+ * `segment_attributes_compare_field_by_field` covers the operator itself; this
+ * covers the callers that copy the struct.
+ */
+void check_every_attribute(const SegmentAttributes& actual,
+                           const SegmentAttributes& expected) {
+    CHECK_EQ(static_cast<int>(actual.type), static_cast<int>(expected.type));
+    CHECK_EQ(actual.layer, expected.layer);
+    CHECK_NEAR(actual.width, expected.width, 1e-6);
+    CHECK_EQ(actual.lanes, expected.lanes);
+    CHECK_EQ(actual.lanes_forward, expected.lanes_forward);
+    CHECK_EQ(actual.lanes_backward, expected.lanes_backward);
+    CHECK_EQ(actual.is_oneway, expected.is_oneway);
+    CHECK_EQ(actual.is_bridge, expected.is_bridge);
+    CHECK_EQ(actual.is_tunnel, expected.is_tunnel);
+    CHECK_EQ(actual.is_roundabout, expected.is_roundabout);
+    CHECK_EQ(actual.is_link, expected.is_link);
+    CHECK_EQ(static_cast<int>(actual.sidewalk), static_cast<int>(expected.sidewalk));
+    CHECK_EQ(static_cast<int>(actual.cycleway), static_cast<int>(expected.cycleway));
+    CHECK_EQ(static_cast<int>(actual.parking), static_cast<int>(expected.parking));
+    CHECK_EQ(static_cast<int>(actual.shoulder), static_cast<int>(expected.shoulder));
+    CHECK_EQ(actual.surface, expected.surface);
+    CHECK_EQ(actual.name, expected.name);
+}
+
 } // namespace
 
 // ============================================================================
 // Identity
 // ============================================================================
+
+TEST(GraphEdit, segment_attributes_compare_field_by_field) {
+    // The split test and the delete-undo test both spell "the tags came through"
+    // as one call to operator==, which makes that operator worth exactly as much
+    // as they are. Replacing its body with `return true` used to pass every test
+    // in this file. Each check below is a field that mutant now fails on.
+    CHECK_TRUE(SegmentAttributes{} == SegmentAttributes{});
+    CHECK_FALSE(SegmentAttributes{} != SegmentAttributes{});
+    CHECK_TRUE(loud_attributes() == loud_attributes());
+    CHECK_FALSE(loud_attributes() != loud_attributes());
+
+    /// Change one field of a default struct and require both operators to see it,
+    /// both ways round, so neither side of the comparison can be the ignored one.
+    auto field_matters = [](auto change) {
+        const SegmentAttributes base;
+        SegmentAttributes changed;
+        change(changed);
+        CHECK_FALSE(base == changed);
+        CHECK_TRUE(base != changed);
+        CHECK_FALSE(changed == base);
+        CHECK_TRUE(changed != base);
+    };
+
+    // All seventeen. A field added to SegmentAttributes needs a line here and a
+    // line in the operator; neither one alone is a check.
+    field_matters([](SegmentAttributes& a) { a.type = RoadType::Motorway; });
+    field_matters([](SegmentAttributes& a) { a.layer = -2; });
+    field_matters([](SegmentAttributes& a) { a.width = 9.25f; });
+    field_matters([](SegmentAttributes& a) { a.lanes = 5; });
+    field_matters([](SegmentAttributes& a) { a.lanes_forward = 3; });
+    field_matters([](SegmentAttributes& a) { a.lanes_backward = 2; });
+    field_matters([](SegmentAttributes& a) { a.is_oneway = true; });
+    field_matters([](SegmentAttributes& a) { a.is_bridge = true; });
+    field_matters([](SegmentAttributes& a) { a.is_tunnel = true; });
+    field_matters([](SegmentAttributes& a) { a.is_roundabout = true; });
+    field_matters([](SegmentAttributes& a) { a.is_link = true; });
+    field_matters([](SegmentAttributes& a) { a.sidewalk = SideFlags::Left; });
+    field_matters([](SegmentAttributes& a) { a.cycleway = SideFlags::Right; });
+    field_matters([](SegmentAttributes& a) { a.parking = SideFlags::Both; });
+    field_matters([](SegmentAttributes& a) { a.shoulder = SideFlags::None; });
+    field_matters([](SegmentAttributes& a) { a.surface = "sett"; });
+    field_matters([](SegmentAttributes& a) { a.name = "Bull Alley Street"; });
+}
 
 TEST(GraphEdit, authored_nodes_take_negative_ids_that_no_osm_node_can_have) {
     EditableGraph graph;
@@ -334,6 +447,218 @@ TEST(GraphEdit, a_node_and_the_segment_through_it_undo_as_one_transaction) {
     CHECK_FALSE(graph.contains_node(b));
     CHECK_TRUE(graph.contains_node(a));
     CHECK_EQ(stack.undo_depth(), depth);
+
+    // And back again, on the same handles. Without the redo this test passed
+    // against an AddSegmentCommand whose apply() moved its own record into the
+    // graph: the first apply worked, and every one after it inserted an empty
+    // segment. "A command owns whatever its undo needs" is only checked by
+    // asking the command to do the work twice.
+    CHECK_TRUE(stack.redo());
+    CHECK_TRUE(graph.contains_node(b));
+    CHECK_TRUE(graph.contains_segment(road));
+    const auto* restored = graph.find_segment(road);
+    CHECK_TRUE(restored != nullptr);
+    if (restored == nullptr) return;
+    CHECK_EQ(restored->node_ids.size(), size_t{2});
+    CHECK_EQ(restored->node_ids.front(), a);
+    CHECK_EQ(restored->node_ids.back(), b);
+    CHECK_EQ(stack.undo_depth(), depth + 1);
+}
+
+// ============================================================================
+// Undo and redo, more than once
+//
+// One undo proves a command can be reversed. It does not prove the command still
+// holds what a SECOND apply() needs, and that is where the contract
+// scene/command.hpp puts first -- "a command owns whatever its undo needs" --
+// actually breaks: an apply() that moved its own record into the graph works
+// once and then inserts an empty segment for ever after, with every single-cycle
+// test still green. So each command that owns heap state is cycled three times
+// and its state re-checked each time round, not only at the end.
+// ============================================================================
+
+TEST(GraphEdit, add_segment_survives_three_undo_redo_cycles) {
+    EditableGraph graph;
+    CommandStack stack;
+    const SegmentAttributes attributes = loud_attributes();
+
+    const NodeId a = make_node(graph, stack, 0.0, 0.0);
+    const NodeId b = make_node(graph, stack, 70.0, 0.0);
+    const NodeId c = make_node(graph, stack, 70.0, 45.0);
+    stack.seal();
+
+    auto add = std::make_unique<AddSegmentCommand>(graph, std::vector<NodeId>{a, b, c},
+                                                   attributes);
+    const SegmentId road = add->segment();
+    const WayId way = add->way();
+    CHECK_TRUE(stack.execute(std::move(add)));
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        CHECK_TRUE(stack.undo());
+        CHECK_FALSE(graph.contains_segment(road));
+        CHECK_EQ(graph.segment_count(), size_t{0});
+        CHECK_EQ(graph.arm_count(a), size_t{0});
+        CHECK_EQ(graph.reference_count(b), size_t{0});
+
+        CHECK_TRUE(stack.redo());
+        const auto* record = graph.find_segment(road);
+        CHECK_TRUE(record != nullptr);
+        if (record == nullptr) return;
+
+        // The CONTENTS, not just the handle. A command that handed its own record
+        // to the graph instead of a copy re-inserts an empty street on the second
+        // apply, and only the vertex list and the tags say so.
+        CHECK_EQ(record->node_ids.size(), size_t{3});
+        CHECK_EQ(record->node_ids.front(), a);
+        CHECK_EQ(record->node_ids[1], b);
+        CHECK_EQ(record->node_ids.back(), c);
+        CHECK_EQ(record->source_way, way);
+        check_every_attribute(record->attributes, attributes);
+
+        CHECK_EQ(graph.arm_count(a), size_t{1});
+        CHECK_EQ(graph.reference_count(b), size_t{1});
+        CHECK_EQ(graph.arm_count(b), size_t{0});
+    }
+}
+
+TEST(GraphEdit, delete_segment_survives_three_undo_redo_cycles) {
+    EditableGraph graph;
+    CommandStack stack;
+    const SegmentAttributes attributes = loud_attributes();
+
+    const NodeId a = make_node(graph, stack, 0.0, 0.0);
+    const NodeId b = make_node(graph, stack, 70.0, 12.0);
+    const SegmentId road = make_segment(graph, stack, {a, b}, attributes);
+    stack.seal();
+    CHECK_TRUE(stack.execute(std::make_unique<DeleteSegmentCommand>(graph, road)));
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        CHECK_TRUE(stack.undo());
+        const auto* restored = graph.find_segment(road);
+        CHECK_TRUE(restored != nullptr);
+        if (restored == nullptr) return;
+        CHECK_EQ(restored->node_ids.size(), size_t{2});
+        CHECK_EQ(restored->node_ids.front(), a);
+        CHECK_EQ(restored->node_ids.back(), b);
+        check_every_attribute(restored->attributes, attributes);
+        CHECK_EQ(graph.arm_count(a), size_t{1});
+        CHECK_EQ(graph.segments_at(b).size(), size_t{1});
+
+        CHECK_TRUE(stack.redo());
+        CHECK_FALSE(graph.contains_segment(road));
+        CHECK_EQ(graph.segment_count(), size_t{0});
+        // Nodes stay, and the usage table lets go of them completely -- a stale
+        // entry here would read downstream as an arm of a street that is gone.
+        CHECK_EQ(graph.node_count(), size_t{2});
+        CHECK_EQ(graph.arm_count(a), size_t{0});
+        CHECK_TRUE(graph.segments_at(b).empty());
+    }
+}
+
+TEST(GraphEdit, delete_node_survives_three_undo_redo_cycles) {
+    EditableGraph graph;
+    CommandStack stack;
+    const SegmentAttributes attributes = loud_attributes();
+
+    const NodeId a = make_node(graph, stack, 0.0, 0.0);
+    const NodeId b = make_node(graph, stack, 70.0, 12.0);
+    const SegmentId road = make_segment(graph, stack, {a, b}, attributes);
+    stack.seal();
+
+    // b is an endpoint of a two-node street, so the command has to own BOTH the
+    // node and the whole street to be able to put them back.
+    CHECK_TRUE(stack.execute(std::make_unique<DeleteNodeCommand>(graph, b)));
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        CHECK_TRUE(stack.undo());
+        CHECK_TRUE(graph.contains_node(b));
+        CHECK_NEAR(position_of(graph, b).x, 70.0, kExact);
+        CHECK_NEAR(position_of(graph, b).y, 12.0, kExact);
+        const auto* restored = graph.find_segment(road);
+        CHECK_TRUE(restored != nullptr);
+        if (restored == nullptr) return;
+        CHECK_EQ(restored->node_ids.size(), size_t{2});
+        CHECK_EQ(restored->node_ids.back(), b);
+        check_every_attribute(restored->attributes, attributes);
+        CHECK_EQ(graph.arm_count(b), size_t{1});
+
+        CHECK_TRUE(stack.redo());
+        CHECK_FALSE(graph.contains_node(b));
+        CHECK_FALSE(graph.contains_segment(road));
+        CHECK_EQ(graph.node_count(), size_t{1});
+        CHECK_EQ(graph.reference_count(a), size_t{0});
+    }
+}
+
+TEST(GraphEdit, deleting_an_interior_node_survives_three_undo_redo_cycles) {
+    EditableGraph graph;
+    CommandStack stack;
+    const NodeId a = make_node(graph, stack, 0.0, 0.0);
+    const NodeId m = make_node(graph, stack, 40.0, 20.0);
+    const NodeId b = make_node(graph, stack, 100.0, 0.0);
+    const SegmentId road = make_segment(graph, stack, {a, m, b});
+    stack.seal();
+
+    // The other branch of DeleteNodeCommand: the street survives with a rewritten
+    // vertex list rather than being removed and put back whole.
+    CHECK_TRUE(stack.execute(std::make_unique<DeleteNodeCommand>(graph, m)));
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        CHECK_TRUE(stack.undo());
+        CHECK_TRUE(graph.contains_node(m));
+        const auto* restored = graph.find_segment(road);
+        CHECK_TRUE(restored != nullptr);
+        if (restored == nullptr) return;
+        CHECK_EQ(restored->node_ids.size(), size_t{3});
+        CHECK_EQ(restored->node_ids[1], m);
+        CHECK_NEAR(position_of(graph, m).x, 40.0, kExact);
+        CHECK_EQ(graph.reference_count(m), size_t{1});
+
+        CHECK_TRUE(stack.redo());
+        CHECK_FALSE(graph.contains_node(m));
+        const auto* after = graph.find_segment(road);
+        CHECK_TRUE(after != nullptr);
+        if (after == nullptr) return;
+        CHECK_EQ(after->node_ids.size(), size_t{2});
+        CHECK_NEAR(graph.length(road), 100.0, 1e-9);
+    }
+}
+
+TEST(GraphEdit, a_committed_transaction_survives_three_undo_redo_cycles) {
+    EditableGraph graph;
+    CommandStack stack;
+    const NodeId a = make_node(graph, stack, -12.0, 3.0);
+    stack.seal();
+    const size_t depth = stack.undo_depth();
+
+    stack.begin_transaction("Draw street");
+    auto node_command = std::make_unique<AddNodeCommand>(graph, glm::dvec2(45.0, 18.0));
+    const NodeId b = node_command->node();
+    CHECK_TRUE(stack.execute(std::move(node_command)));
+    const SegmentId road = make_segment(graph, stack, {a, b});
+    stack.commit_transaction();
+    CHECK((road != kInvalidSegment));
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        CHECK_TRUE(stack.undo());
+        CHECK_FALSE(graph.contains_segment(road));
+        CHECK_FALSE(graph.contains_node(b));
+        CHECK_EQ(graph.node_count(), size_t{1});
+        CHECK_EQ(stack.undo_depth(), depth);
+
+        CHECK_TRUE(stack.redo());
+        CHECK_TRUE(graph.contains_node(b));
+        CHECK_NEAR(position_of(graph, b).x, 45.0, kExact);
+        CHECK_NEAR(position_of(graph, b).y, 18.0, kExact);
+        const auto* restored = graph.find_segment(road);
+        CHECK_TRUE(restored != nullptr);
+        if (restored == nullptr) return;
+        CHECK_EQ(restored->node_ids.size(), size_t{2});
+        CHECK_EQ(restored->node_ids.front(), a);
+        CHECK_EQ(restored->node_ids.back(), b);
+        CHECK_EQ(graph.arm_count(b), size_t{1});
+        CHECK_EQ(stack.undo_depth(), depth + 1);
+    }
 }
 
 // ============================================================================
@@ -565,6 +890,13 @@ TEST(GraphEdit, deleting_a_segment_marks_it_so_the_solver_can_drop_it) {
     EditableGraph graph;
     CommandStack stack;
     const Hub h = build_hub(graph, stack);
+
+    // A street nowhere near the hub, so "and nothing else" means something: with
+    // only the hub's own three segments in the graph, a delete that marked
+    // everything would be indistinguishable from one that marked the right three.
+    const NodeId far_a = make_node(graph, stack, 500.0, 500.0);
+    const NodeId far_b = make_node(graph, stack, 560.0, 520.0);
+    const SegmentId far = make_segment(graph, stack, {far_a, far_b});
     graph.clear_dirty();
 
     CHECK_TRUE(stack.execute(std::make_unique<DeleteSegmentCommand>(graph, h.west_arm)));
@@ -576,6 +908,18 @@ TEST(GraphEdit, deleting_a_segment_marks_it_so_the_solver_can_drop_it) {
     // And the arms it left behind, whose junction just lost a leg.
     CHECK_EQ(graph.dirty_segments().count(h.east_arm), size_t{1});
     CHECK_EQ(graph.dirty_segments().count(h.north_arm), size_t{1});
+
+    // Those three and no more. Counting three ids and never the set left the size
+    // of an incremental re-solve pinned by nothing at all.
+    CHECK_EQ(graph.dirty_segments().count(far), size_t{0});
+    CHECK_EQ(graph.dirty_segments().size(), size_t{3});
+
+    // Both ends of what went: the hub lost a leg, and the far end of the deleted
+    // arm is now an orphan whose solved dead-end cap has to go with it.
+    CHECK_EQ(graph.dirty_nodes().count(h.hub), size_t{1});
+    CHECK_EQ(graph.dirty_nodes().count(h.west), size_t{1});
+    CHECK_EQ(graph.dirty_nodes().count(far_a), size_t{0});
+    CHECK_EQ(graph.dirty_nodes().size(), size_t{2});
 }
 
 // ============================================================================
@@ -683,9 +1027,11 @@ TEST(GraphEdit, deleting_an_endpoint_of_a_two_node_segment_takes_the_segment_wit
     EditableGraph graph;
     CommandStack stack;
 
-    SegmentAttributes attributes;
-    attributes.name = "Ship Street Little";
-    attributes.lanes = 3;
+    // Every field non-default, so an undo that restored the segment but reset a
+    // tag to its default is visible. The old version carried two fields and
+    // compared the rest through operator==, which meant fifteen of them were
+    // pinned by nothing.
+    const SegmentAttributes attributes = loud_attributes();
 
     const NodeId a = make_node(graph, stack, 0.0, 0.0);
     const NodeId b = make_node(graph, stack, 70.0, 12.0);
@@ -708,7 +1054,7 @@ TEST(GraphEdit, deleting_an_endpoint_of_a_two_node_segment_takes_the_segment_wit
     if (restored == nullptr) return;
     CHECK_EQ(restored->node_ids.size(), size_t{2});
     CHECK_EQ(restored->node_ids.back(), b);
-    CHECK_TRUE(restored->attributes == attributes);
+    check_every_attribute(restored->attributes, attributes);
     CHECK_EQ(graph.arm_count(b), size_t{1});
     CHECK_NEAR(position_of(graph, b).x, 70.0, kExact);
 }
@@ -736,6 +1082,111 @@ TEST(GraphEdit, deleting_a_segment_leaves_its_nodes_behind) {
     CHECK_EQ(graph.arm_count(h.hub), size_t{3});
     CHECK_EQ(graph.segment_count(), size_t{3});
     CHECK_TRUE(graph.orphan_nodes().empty());
+}
+
+TEST(GraphEdit, a_way_that_closes_on_itself_is_one_segment_and_two_references) {
+    EditableGraph graph;
+    CommandStack stack;
+    const NodeId a = make_node(graph, stack, 0.0, 0.0);
+    const NodeId m = make_node(graph, stack, 60.0, 20.0);
+    const NodeId b = make_node(graph, stack, 120.0, -10.0);
+
+    // A closed ring, spelled the way OSM spells one: the first id repeated last.
+    const SegmentId ring = make_segment(graph, stack, {a, m, b, a});
+    CHECK((ring != kInvalidSegment));
+
+    // Twice as a reference -- it arrives and it leaves -- but ONE entry in the
+    // segment list. Without the per-segment dedupe in add_usage() a ring reads
+    // downstream as two streets meeting, and no other segment in this file
+    // touches a node more than once, so nothing else here needs that dedupe.
+    CHECK_EQ(graph.reference_count(a), size_t{2});
+    CHECK_EQ(graph.arm_count(a), size_t{2});
+    CHECK_TRUE(graph.is_shared(a));
+    CHECK_EQ(graph.segments_at(a).size(), size_t{1});
+    CHECK_EQ(graph.segments_at(a).front(), ring);
+
+    // A node it merely passes through is ordinary.
+    CHECK_EQ(graph.reference_count(m), size_t{1});
+    CHECK_EQ(graph.arm_count(m), size_t{0});
+    CHECK_FALSE(graph.is_shared(m));
+
+    // Shared by one segment is still shared, so deleting the node is refused.
+    CHECK_FALSE(stack.execute(std::make_unique<DeleteNodeCommand>(graph, a)));
+    CHECK_TRUE(graph.contains_node(a));
+
+    // Removing the ring lets go of BOTH references, not one: dropping the segment
+    // from the list on the first vertex would leave a usage entry for a street
+    // that no longer exists.
+    CHECK_TRUE(stack.execute(std::make_unique<DeleteSegmentCommand>(graph, ring)));
+    CHECK_EQ(graph.reference_count(a), size_t{0});
+    CHECK_EQ(graph.arm_count(a), size_t{0});
+    CHECK_TRUE(graph.segments_at(a).empty());
+
+    CHECK_TRUE(stack.undo());
+    CHECK_EQ(graph.reference_count(a), size_t{2});
+    CHECK_EQ(graph.arm_count(a), size_t{2});
+    CHECK_EQ(graph.segments_at(a).size(), size_t{1});
+}
+
+TEST(GraphEdit, deleting_the_turn_of_an_out_and_back_way_collapses_the_repeat) {
+    EditableGraph graph;
+    CommandStack stack;
+    const NodeId a = make_node(graph, stack, 0.0, 0.0);
+    const NodeId m = make_node(graph, stack, 60.0, 20.0);
+    const NodeId b = make_node(graph, stack, 120.0, 0.0);
+
+    // Out to m, straight back through a, then on to b. Dropping m leaves
+    // [a, a, b], which is not a line: without the consecutive-duplicate collapse
+    // in without_node() the graph refuses the rewrite and the delete fails for a
+    // reason the user has no way to see. No other test reaches that line.
+    const SegmentId road = make_segment(graph, stack, {a, m, a, b});
+    CHECK((road != kInvalidSegment));
+    CHECK_EQ(graph.reference_count(a), size_t{2});
+    CHECK_EQ(graph.segments_at(a).size(), size_t{1});
+
+    CHECK_TRUE(stack.execute(std::make_unique<DeleteNodeCommand>(graph, m)));
+
+    CHECK_FALSE(graph.contains_node(m));
+    const auto* after = graph.find_segment(road);
+    CHECK_TRUE(after != nullptr);
+    if (after == nullptr) return;
+    CHECK_EQ(after->node_ids.size(), size_t{2});
+    CHECK_EQ(after->node_ids.front(), a);
+    CHECK_EQ(after->node_ids.back(), b);
+    CHECK_EQ(graph.reference_count(a), size_t{1});
+    CHECK_NEAR(graph.length(road), 120.0, 1e-9);
+
+    CHECK_TRUE(stack.undo());
+    const auto* restored = graph.find_segment(road);
+    CHECK_TRUE(restored != nullptr);
+    if (restored == nullptr) return;
+    CHECK_EQ(restored->node_ids.size(), size_t{4});
+    CHECK_EQ(graph.reference_count(a), size_t{2});
+    CHECK_EQ(graph.segments_at(a).size(), size_t{1});
+}
+
+TEST(GraphEdit, deleting_the_turn_of_a_two_vertex_out_and_back_takes_the_way) {
+    EditableGraph graph;
+    CommandStack stack;
+    const NodeId a = make_node(graph, stack, 0.0, 0.0);
+    const NodeId m = make_node(graph, stack, 60.0, 20.0);
+
+    // Out and straight back, with nothing beyond. Dropping m collapses the whole
+    // way to a single vertex, and a one-point way is not a line.
+    const SegmentId road = make_segment(graph, stack, {a, m, a});
+    CHECK((road != kInvalidSegment));
+
+    CHECK_TRUE(stack.execute(std::make_unique<DeleteNodeCommand>(graph, m)));
+    CHECK_FALSE(graph.contains_segment(road));
+    CHECK_FALSE(graph.contains_node(m));
+    CHECK_TRUE(graph.contains_node(a));
+    CHECK_EQ(graph.reference_count(a), size_t{0});
+
+    CHECK_TRUE(stack.undo());
+    CHECK_TRUE(graph.contains_segment(road));
+    CHECK_TRUE(graph.contains_node(m));
+    CHECK_EQ(graph.reference_count(a), size_t{2});
+    CHECK_EQ(graph.segments_at(a).size(), size_t{1});
 }
 
 TEST(GraphEdit, a_junction_is_removed_by_deleting_its_segments_then_its_node) {
@@ -794,34 +1245,6 @@ TEST(GraphEdit, an_aborted_transaction_leaves_the_graph_as_it_was) {
 // Splitting
 // ============================================================================
 
-namespace {
-
-/// Every attribute set to something that is not its default, so a split that
-/// dropped any single one of them fails the comparison.
-SegmentAttributes loud_attributes() {
-    SegmentAttributes a;
-    a.type = RoadType::Tertiary;
-    a.layer = -2;
-    a.width = 9.25f;
-    a.lanes = 5;
-    a.lanes_forward = 3;
-    a.lanes_backward = 2;
-    a.is_oneway = true;
-    a.is_bridge = true;
-    a.is_tunnel = true;
-    a.is_roundabout = true;
-    a.is_link = true;
-    a.sidewalk = SideFlags::Left;
-    a.cycleway = SideFlags::Right;
-    a.parking = SideFlags::Both;
-    a.shoulder = SideFlags::None;
-    a.surface = "sett";
-    a.name = "Bull Alley Street";
-    return a;
-}
-
-} // namespace
-
 TEST(GraphEdit, split_gives_both_halves_every_attribute_and_the_parent_way) {
     EditableGraph graph;
     CommandStack stack;
@@ -850,12 +1273,13 @@ TEST(GraphEdit, split_gives_both_halves_every_attribute_and_the_parent_way) {
     CHECK_TRUE(right != nullptr);
     if (left == nullptr || right == nullptr) return;
 
+    // Field by field, not `== attributes`. Routing the whole assertion through
+    // one operator call made this test blind to a copy that dropped a field: it
+    // could no longer tell that from an operator that answers true to everything.
+    check_every_attribute(left->attributes, attributes);
+    check_every_attribute(right->attributes, attributes);
     CHECK_TRUE(left->attributes == attributes);
     CHECK_TRUE(right->attributes == attributes);
-    // Spelled out for two of them, so a failure names the field rather than the
-    // whole struct.
-    CHECK_EQ(right->attributes.name, std::string{"Bull Alley Street"});
-    CHECK_EQ(right->attributes.lanes_backward, 2);
 
     // Two segments of ONE street, which is what RoadGraph produces when it cuts a
     // way at a junction. A fresh way id on either half would read downstream as
@@ -973,6 +1397,49 @@ TEST(GraphEdit, split_within_the_snap_reuses_the_shape_point_it_landed_on) {
     CHECK_NEAR(graph.length(first), 40.0, 1e-9);
 }
 
+TEST(GraphEdit, a_split_that_ties_between_two_spans_takes_the_earlier_one) {
+    EditableGraph graph;
+    CommandStack stack;
+
+    // A right angle. From inside the corner, (50, 50) is exactly 50 metres off
+    // BOTH legs -- 2500 either way, in exact binary, so this is a real tie and not
+    // a near one -- and the two answers are 100 metres apart. Only the tie-break
+    // decides which street the user gets.
+    const NodeId a = make_node(graph, stack, 0.0, 0.0);
+    const NodeId corner = make_node(graph, stack, 100.0, 0.0);
+    const NodeId b = make_node(graph, stack, 100.0, 100.0);
+    const SegmentId road = make_segment(graph, stack, {a, corner, b});
+
+    auto split = std::make_unique<SplitSegmentCommand>(graph, road, glm::dvec2(50.0, 50.0));
+    const SegmentId first = split->first_half();
+    const SegmentId second = split->second_half();
+    SplitSegmentCommand* raw = split.get();
+    const bool ok = stack.execute(std::move(split));
+    CHECK_TRUE(ok);
+    if (!ok) return;
+
+    // Ties go to the EARLIEST span, so the cut lands on the first leg at (50, 0).
+    // Letting the later span win instead puts it on the second leg at (100, 50):
+    // the same tie, a different street, and a redo that can disagree with the
+    // apply it is repeating. Nothing in this file pinned that rule before.
+    CHECK_NEAR(position_of(graph, raw->join_node()).x, 50.0, 1e-9);
+    CHECK_NEAR(position_of(graph, raw->join_node()).y, 0.0, 1e-9);
+
+    const auto* left = graph.find_segment(first);
+    const auto* right = graph.find_segment(second);
+    CHECK_TRUE(left != nullptr);
+    CHECK_TRUE(right != nullptr);
+    if (left == nullptr || right == nullptr) return;
+
+    // The corner stays on the SECOND half, which is what taking the earlier span
+    // means in terms of the vertex lists.
+    CHECK_EQ(left->node_ids.size(), size_t{2});
+    CHECK_EQ(right->node_ids.size(), size_t{3});
+    CHECK_EQ(right->node_ids[1], corner);
+    CHECK_NEAR(graph.length(first), 50.0, 1e-9);
+    CHECK_NEAR(graph.length(second), 150.0, 1e-9);
+}
+
 TEST(GraphEdit, split_outside_the_snap_creates_a_node_next_to_the_shape_point) {
     EditableGraph graph;
     CommandStack stack;
@@ -1045,6 +1512,16 @@ TEST(GraphEdit, from_a_road_graph_a_grade_separation_stays_two_nodes) {
     CHECK_TRUE(graph.contains_node(NodeId{21}));
     CHECK_EQ(graph.arm_count(NodeId{21}), size_t{2});
 
+    // WHICH of the two grades keeps the OSM id, spelled out. Both carry two arms,
+    // so the tie goes to the lower layer=*: 21 is the road on the ground, not the
+    // bridge over it. Only searching for "the other identity" left this passing
+    // whichever way round the two came out, which is exactly what hid the id
+    // moving with the order of the ways.
+    const auto* kept = graph.find_node(NodeId{21});
+    CHECK_TRUE(kept != nullptr);
+    if (kept == nullptr) return;
+    CHECK_EQ(kept->layer, 0);
+
     // Find the other identity sitting on the same coordinate.
     NodeId twin = kInvalidNode;
     for (const auto& entry : graph.nodes()) {
@@ -1057,6 +1534,10 @@ TEST(GraphEdit, from_a_road_graph_a_grade_separation_stays_two_nodes) {
     // Re-keyed into the local space, because the OSM id was already spent.
     CHECK((twin < 0));
     CHECK_EQ(graph.arm_count(twin), size_t{2});
+    const auto* bridge = graph.find_node(twin);
+    CHECK_TRUE(bridge != nullptr);
+    if (bridge == nullptr) return;
+    CHECK_EQ(bridge->layer, 1);
 
     // Neither crossing way can see the other's node, so nothing downstream can
     // ever decide the two meet.
@@ -1066,6 +1547,78 @@ TEST(GraphEdit, from_a_road_graph_a_grade_separation_stays_two_nodes) {
             std::find(ids.begin(), ids.end(), NodeId{21}) != ids.end();
         const bool has_twin = std::find(ids.begin(), ids.end(), twin) != ids.end();
         CHECK_FALSE(has_osm && has_twin);
+    }
+}
+
+TEST(GraphEdit, which_node_keeps_an_osm_id_does_not_depend_on_the_order_of_the_ways) {
+    // Way 1 runs THROUGH node 31 on the ground; way 2 merely ends on it, one
+    // layer up. RoadGraph splits node 31 per layer, so only one of the two
+    // identities can keep the OSM id -- and which one must be a property of the
+    // data, not of where the ways happen to sit in ParsedOSMData::roads.
+    //
+    // The through road carries two arms and the stub one, so the through road
+    // keeps it either way round. Handing the id to whoever asked first moved it
+    // to the layer-1 stub as soon as the stub was listed first: a NodeId a
+    // selection, a rule or a saved document was holding then named a different
+    // piece of road after nothing but a re-export of the same extract.
+    const Road through =
+        make_road(1, {30, 31, 32}, {{-50.0, 0.0}, {0.0, 0.0}, {60.0, 0.0}}, 0);
+    const Road stub = make_road(2, {31, 33}, {{0.0, 0.0}, {0.0, 45.0}}, 1);
+
+    const EditableGraph forwards = seed_from({through, stub});
+    const EditableGraph backwards = seed_from({stub, through});
+
+    for (const EditableGraph* graph : {&forwards, &backwards}) {
+        CHECK_EQ(graph->node_count(), size_t{5});
+        CHECK_EQ(graph->segment_count(), size_t{3});
+        CHECK_TRUE(graph->contains_node(NodeId{31}));
+
+        // The ground identity, in both.
+        const auto* kept = graph->find_node(NodeId{31});
+        CHECK_TRUE(kept != nullptr);
+        if (kept == nullptr) return;
+        CHECK_EQ(kept->layer, 0);
+        CHECK_EQ(graph->arm_count(NodeId{31}), size_t{2});
+
+        // The stub's end is the one re-keyed into the local space.
+        NodeId twin = kInvalidNode;
+        for (const auto& entry : graph->nodes()) {
+            if (entry.first == NodeId{31}) continue;
+            if (entry.second.position == glm::dvec2(0.0, 0.0)) twin = entry.first;
+        }
+        CHECK((twin < 0));
+        if (twin == kInvalidNode) return;
+        CHECK_EQ(graph->arm_count(twin), size_t{1});
+        const auto* rekeyed = graph->find_node(twin);
+        CHECK_TRUE(rekeyed != nullptr);
+        if (rekeyed == nullptr) return;
+        CHECK_EQ(rekeyed->layer, 1);
+    }
+}
+
+TEST(GraphEdit, the_osm_id_follows_the_arms_before_it_follows_the_lower_layer) {
+    // Way 1 is a deck on layer 1 running THROUGH node 41; way 2 is on the ground
+    // and merely ends on it. The two clauses of the rule disagree here, which is
+    // the only way either of them is pinned: most arms says the deck keeps the
+    // id, lowest layer says the ground road does.
+    //
+    // Arms win. The id belongs to the grade most of the network meets there, and
+    // layer=* is the tie-break for when the arms cannot decide -- which is the
+    // grade separation in from_a_road_graph_a_grade_separation_stays_two_nodes,
+    // where both grades carry two.
+    const Road deck =
+        make_road(1, {40, 41, 42}, {{-50.0, 0.0}, {0.0, 0.0}, {60.0, 0.0}}, 1);
+    const Road ground = make_road(2, {41, 43}, {{0.0, 0.0}, {0.0, 45.0}}, 0);
+
+    const EditableGraph forwards = seed_from({deck, ground});
+    const EditableGraph backwards = seed_from({ground, deck});
+
+    for (const EditableGraph* graph : {&forwards, &backwards}) {
+        const auto* kept = graph->find_node(NodeId{41});
+        CHECK_TRUE(kept != nullptr);
+        if (kept == nullptr) return;
+        CHECK_EQ(kept->layer, 1);
+        CHECK_EQ(graph->arm_count(NodeId{41}), size_t{2});
     }
 }
 
@@ -1121,6 +1674,12 @@ TEST(GraphEdit, a_seeded_graph_never_hands_out_an_id_it_already_contains) {
     // An extract that has already been through an editor carries negative ids of
     // its own. Starting the local allocator at -1 regardless would hand back -1,
     // the insert would refuse, and the edit would fail for no visible reason.
+    //
+    // The priming in from_road_graph() is the whole of the mechanism now: the
+    // second copies of the rule that used to sit inside insert_node() and
+    // insert_segment() were branches no caller could reach, so nothing could hold
+    // them to anything. Everything below therefore rests on the one place that
+    // does the work.
     EditableGraph graph = seed_from({
         make_road(-5, {-1, -2}, {{0.0, 0.0}, {30.0, 0.0}}),
     });
@@ -1203,12 +1762,18 @@ TEST(GraphEdit, every_edit_names_itself_for_the_undo_menu) {
     CHECK_EQ(stack.undo_label(), std::string{"Delete node"});
 }
 
-TEST(GraphEdit, a_command_holding_a_deleted_street_reports_what_it_holds) {
-    // Two identical edits apart from the length of one tag. The stack's byte
-    // total has to tell them apart, because CommandStackConfig::max_bytes bounds
-    // nothing otherwise: a command that keeps a deleted street alive for undo and
-    // reports only sizeof(*this) makes the ceiling a fiction.
-    auto delete_a_street_named = [](const std::string& name) -> size_t {
+TEST(GraphEdit, every_command_that_holds_a_street_reports_what_it_holds) {
+    // The same edit twice, apart from the length of one tag. The stack's byte
+    // total has to tell the two apart, because CommandStackConfig::max_bytes
+    // bounds nothing otherwise: a command that keeps a street alive for its undo
+    // and reports only sizeof(*this) makes the ceiling a fiction.
+    //
+    // All FOUR commands that keep one, not just the delete. Reducing the other
+    // three overrides to a bare sizeof passed the whole suite while only
+    // DeleteSegmentCommand was ever measured.
+    enum class Which { Add, DeleteSegment, DeleteNode, Split };
+
+    auto cost_of = [](Which which, const std::string& name) -> size_t {
         EditableGraph graph;
         CommandStack stack;
         SegmentAttributes attributes;
@@ -1216,17 +1781,60 @@ TEST(GraphEdit, a_command_holding_a_deleted_street_reports_what_it_holds) {
 
         const NodeId a = make_node(graph, stack, 0.0, 0.0);
         const NodeId b = make_node(graph, stack, 50.0, 0.0);
-        const SegmentId road = make_segment(graph, stack, {a, b}, attributes);
 
+        if (which == Which::Add) {
+            stack.seal();
+            const size_t before = stack.bytes();
+            auto add = std::make_unique<AddSegmentCommand>(
+                graph, std::vector<NodeId>{a, b}, attributes);
+            if (!stack.execute(std::move(add))) return 0;
+            return stack.bytes() - before;
+        }
+
+        const SegmentId road = make_segment(graph, stack, {a, b}, attributes);
+        if (road == kInvalidSegment) return 0;
+        stack.seal();
         const size_t before = stack.bytes();
-        if (!stack.execute(std::make_unique<DeleteSegmentCommand>(graph, road))) return 0;
+
+        bool ok = false;
+        if (which == Which::DeleteSegment) {
+            ok = stack.execute(std::make_unique<DeleteSegmentCommand>(graph, road));
+        } else if (which == Which::DeleteNode) {
+            // An endpoint of a two-node street, so the command has to keep the
+            // whole street as well as the node.
+            ok = stack.execute(std::make_unique<DeleteNodeCommand>(graph, b));
+        } else {
+            ok = stack.execute(
+                std::make_unique<SplitSegmentCommand>(graph, road, glm::dvec2(19.0, 4.0)));
+        }
+        if (!ok) return 0;
         return stack.bytes() - before;
     };
 
-    const size_t small = delete_a_street_named("A");
-    const size_t large = delete_a_street_named(std::string(4096, 'x'));
+    const std::string tiny{"A"};
+    const std::string huge(4096, 'x');
 
-    CHECK((small > 0));
-    CHECK((small < large));
-    CHECK((large - small >= size_t{4000}));
+    const size_t add_small = cost_of(Which::Add, tiny);
+    const size_t add_large = cost_of(Which::Add, huge);
+    CHECK((add_small > 0));
+    CHECK((add_small < add_large));
+    CHECK((add_large - add_small >= size_t{4000}));
+
+    const size_t erase_small = cost_of(Which::DeleteSegment, tiny);
+    const size_t erase_large = cost_of(Which::DeleteSegment, huge);
+    CHECK((erase_small > 0));
+    CHECK((erase_small < erase_large));
+    CHECK((erase_large - erase_small >= size_t{4000}));
+
+    const size_t node_small = cost_of(Which::DeleteNode, tiny);
+    const size_t node_large = cost_of(Which::DeleteNode, huge);
+    CHECK((node_small > 0));
+    CHECK((node_small < node_large));
+    CHECK((node_large - node_small >= size_t{4000}));
+
+    const size_t split_small = cost_of(Which::Split, tiny);
+    const size_t split_large = cost_of(Which::Split, huge);
+    CHECK((split_small > 0));
+    CHECK((split_small < split_large));
+    CHECK((split_large - split_small >= size_t{4000}));
 }

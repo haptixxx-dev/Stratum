@@ -52,11 +52,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -132,12 +134,19 @@ Mesh make_quad(float x0, float z0, float x1, float z1, float y,
     const glm::vec3 corners[4] = {
         { x0, y, z0 }, { x1, y, z0 }, { x1, y, z1 }, { x0, y, z1 }
     };
-    for (const glm::vec3& p : corners) {
+    for (size_t i = 0; i < 4u; ++i) {
+        const glm::vec3& p = corners[i];
         Vertex v;
         v.position = p;
         v.normal = { 0.0f, 1.0f, 0.0f };
         v.uv = { p.x * 0.1f, p.z * 0.1f };
         v.color = color;
+        // The bitangent sign is deliberately NEITHER +1 nor -1. Both writers snap it
+        // to one or the other, and a fixture that only ever supplies a value already
+        // snapped cannot tell a writer that snaps from one that passes the raw float
+        // through -- which is a flat black normal map in any consumer that reads it.
+        // 0 is what a producer that never computed tangents leaves behind.
+        v.tangent = { 1.0f, 0.0f, 0.0f, (i % 2u == 0u) ? 0.0f : -0.5f };
         mesh.vertices.push_back(v);
     }
     mesh.indices = { 0, 1, 2, 0, 2, 3 };
@@ -208,10 +217,25 @@ Scene make_city() {
     Scene scene;
 
     // Terrain: 6 by 6 cells of 25 m from the origin, covering chunks (0,0) to (2,2).
+    //
+    // TWO materials over one index buffer, and that is load-bearing. Every other
+    // object here carries exactly one, and with a one-material scene "the OBJ writer
+    // opens one `o` record per object" is forced by the fixture rather than by the
+    // writer's run logic -- a writer that opened a record per RANGE would be
+    // indistinguishable from a correct one. Splitting the terrain in two is the
+    // cheapest way to make that difference visible in every test that counts `o`
+    // records. Triangle count, centroids and chunk assignment are all unchanged.
     {
+        Mesh mesh = make_grid(0.0f, 0.0f, 6, 6, 25.0f,
+                              { 0.3f, 0.5f, 0.2f, 1.0f }, MaterialId::Grass);
+        const auto indices = static_cast<uint32_t>(mesh.indices.size());
+        const uint32_t half = (indices / 6u) * 3u;   // a triangle boundary, not a byte one
+        mesh.submeshes.clear();
+        mesh.submeshes.push_back(SubMesh{ 0u, half, MaterialId::Grass, 0u });
+        mesh.submeshes.push_back(SubMesh{ half, indices - half, MaterialId::Gravel, 0u });
+
         SceneObject object;
-        object.mesh = &scene.add(make_grid(0.0f, 0.0f, 6, 6, 25.0f,
-                                           { 0.3f, 0.5f, 0.2f, 1.0f }, MaterialId::Grass));
+        object.mesh = &scene.add(std::move(mesh));
         object.kind = SceneObjectKind::Terrain;
         object.name = "tile_0_0";
         object.layer = "terrain";
@@ -344,6 +368,7 @@ struct ObjFace {
 struct ObjFile {
     std::vector<glm::vec3> positions;
     std::vector<glm::vec3> normals;
+    std::vector<glm::vec2> uvs;
     std::vector<ObjFace> faces;
     std::vector<std::string> objects;       ///< `o` names, in file order
     std::vector<std::string> materials;     ///< `usemtl` names, first appearance order
@@ -393,6 +418,13 @@ ObjFile read_obj(const fs::path& path) {
             glm::vec3 n{ 0.0f };
             stream >> n.x >> n.y >> n.z;
             out.normals.push_back(n);
+        } else if (tag == "vt") {
+            // Read so that a writer which swapped u and v can be caught. The suite
+            // used to parse v and vn only, so the `vt` block was written into every
+            // file and inspected by nothing.
+            glm::vec2 t{ 0.0f };
+            stream >> t.x >> t.y;
+            out.uvs.push_back(t);
         } else if (tag == "o") {
             std::string name;
             stream >> name;
@@ -556,6 +588,26 @@ std::vector<glm::vec3> read_vec3(const GltfFile& gltf, size_t accessor_index) {
     return out;
 }
 
+std::vector<glm::vec2> read_vec2(const GltfFile& gltf, size_t accessor_index) {
+    std::vector<glm::vec2> out;
+    size_t offset = 0;
+    size_t count = 0;
+    if (!accessor_span(gltf, accessor_index, sizeof(float) * 2u, offset, count)) return out;
+    out.resize(count);
+    std::memcpy(out.data(), gltf.bin.data() + offset, count * sizeof(float) * 2u);
+    return out;
+}
+
+std::vector<glm::vec4> read_vec4(const GltfFile& gltf, size_t accessor_index) {
+    std::vector<glm::vec4> out;
+    size_t offset = 0;
+    size_t count = 0;
+    if (!accessor_span(gltf, accessor_index, sizeof(float) * 4u, offset, count)) return out;
+    out.resize(count);
+    std::memcpy(out.data(), gltf.bin.data() + offset, count * sizeof(float) * 4u);
+    return out;
+}
+
 std::vector<uint32_t> read_indices(const GltfFile& gltf, size_t accessor_index) {
     std::vector<uint32_t> out;
     size_t offset = 0;
@@ -564,6 +616,37 @@ std::vector<uint32_t> read_indices(const GltfFile& gltf, size_t accessor_index) 
     out.resize(count);
     std::memcpy(out.data(), gltf.bin.data() + offset, count * sizeof(uint32_t));
     return out;
+}
+
+/**
+ * @brief The runs of (object record, material) the faces of a file fall under
+ *
+ * Consecutive faces sharing both keys collapse into one entry, so the result is the
+ * GROUP STRUCTURE of the file rather than its face list. That is what makes the
+ * grouping contract checkable: "object 0's ranges, then object 1's" is a statement
+ * about this sequence and about nothing a face count can see.
+ *
+ * A group that is re-entered later in the file appears as a second run, which is
+ * exactly the failure the contiguity assertions look for.
+ */
+std::vector<std::pair<std::string, std::string>> face_groups(const ObjFile& obj) {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const ObjFace& face : obj.faces) {
+        if (out.empty() || out.back().first != face.object
+            || out.back().second != face.material) {
+            out.emplace_back(face.object, face.material);
+        }
+    }
+    return out;
+}
+
+/// The object-record index `n` out of a `<prefix>_o<n>_<name>` record name, or -1
+long record_index(const std::string& record) {
+    const size_t marker = record.find("_o");
+    if (marker == std::string::npos) return -1;
+    const std::string digits = record.substr(marker + 2u);
+    if (digits.empty() || std::isdigit(static_cast<unsigned char>(digits[0])) == 0) return -1;
+    return std::strtol(digits.c_str(), nullptr, 10);
 }
 
 /// Every `# stratum:object` line of a file, in order
@@ -616,8 +699,13 @@ TEST(SceneExport, chunking_conserves_every_triangle_across_mesh_kinds) {
 
     const SceneExportStats stats = export_scene(scene.objects, dir, cfg);
 
+    // stats.triangles counts what reached DISK, so these two together say "every
+    // input triangle was written and no chunk was silently missing". Either one
+    // alone is the exporter marking its own homework; the multiset comparison
+    // against the files below is what actually proves it.
     CHECK_EQ(stats.triangles, scene.triangles());
     CHECK_EQ(stats.dropped_triangles, size_t{ 0 });
+    CHECK_EQ(stats.unwritten_triangles, size_t{ 0 });
     CHECK_EQ(stats.objects, scene.objects.size());
     CHECK((size_t{ 1 }) < stats.chunks);
     CHECK_EQ(stats.written_files.size(), stats.files);
@@ -749,6 +837,7 @@ TEST(SceneExport, unchunked_export_writes_one_file) {
 
     CHECK_EQ(stats.chunks, size_t{ 1 });
     CHECK_EQ(stats.triangles, scene.triangles());
+    CHECK_EQ(stats.unwritten_triangles, size_t{ 0 });
     CHECK_TRUE(fs::exists(dir / "scene.obj"));
     CHECK_TRUE(fs::exists(dir / "scene.mtl"));
     CHECK_TRUE(chunk_files(dir, "scene", ".obj").empty());
@@ -759,9 +848,36 @@ TEST(SceneExport, unchunked_export_writes_one_file) {
     CHECK_EQ(obj.mtllib, std::string{ "scene.mtl" });
 
     // One `o` record per contributing object, and no object opened twice.
+    //
+    // This only says anything because make_city()'s terrain carries TWO materials:
+    // it contributes two ranges to this file, so a writer that opened a record per
+    // range rather than per object emits seven records here instead of six. With one
+    // material per object the count was forced by the fixture and the run logic in
+    // write_obj_file() was unasserted.
     CHECK_EQ(obj.objects.size(), scene.objects.size());
     const std::set<std::string> unique(obj.objects.begin(), obj.objects.end());
     CHECK_EQ(unique.size(), obj.objects.size());
+
+    // And the records are in ascending object order, each opened once, with that
+    // object's material groups contiguous underneath it.
+    const std::vector<std::pair<std::string, std::string>> groups = face_groups(obj);
+    std::set<std::string> seen;
+    std::string current;
+    long previous_index = -1;
+    size_t reopened = 0;
+    size_t out_of_order = 0;
+    for (const auto& [record, material] : groups) {
+        (void)material;
+        if (record == current) continue;
+        if (!seen.insert(record).second) ++reopened;
+        const long index = record_index(record);
+        if (!(previous_index < index)) ++out_of_order;
+        previous_index = index;
+        current = record;
+    }
+    CHECK_EQ(reopened, size_t{ 0 });
+    CHECK_EQ(out_of_order, size_t{ 0 });
+    CHECK_EQ(seen.size(), scene.objects.size());
 }
 
 /// Nothing in, nothing out -- and no empty file left behind.
@@ -848,16 +964,25 @@ TEST(SceneExport, object_metadata_survives_into_gltf) {
     CHECK_TRUE(gltf.ok);
     if (!gltf.ok) return;
 
+    // ONE PRIMITIVE PER (OBJECT, MATERIAL) GROUP, which is what the header promises
+    // and not one per object: make_city()'s terrain carries two materials, so it
+    // contributes two primitives to this file. Asserting one per object would have
+    // been asserting a property of the fixture.
     const auto& primitives = gltf.doc["meshes"][0]["primitives"];
-    CHECK_EQ(primitives.size(), scene.objects.size());
+    CHECK_EQ(primitives.size(), scene.objects.size() + 1u);
 
     bool found_town_hall = false;
     std::set<int64_t> ids;
+    std::map<long, size_t> primitives_per_object;
+    std::vector<long> primitive_objects;
     for (const auto& primitive : primitives) {
         CHECK_TRUE(primitive.contains("extras"));
         if (!primitive.contains("extras")) continue;
         const auto& info = primitive["extras"]["stratum"];
         ids.insert(info.value("osm_id", int64_t{ -1 }));
+        const long index = info.value("index", -1L);
+        ++primitives_per_object[index];
+        primitive_objects.push_back(index);
         if (info.value("osm_id", int64_t{ 0 }) == 4242) {
             found_town_hall = true;
             CHECK_EQ(info.value("kind", std::string{}), std::string{ "Building" });
@@ -871,6 +996,20 @@ TEST(SceneExport, object_metadata_survives_into_gltf) {
     // the wrong object's metadata.
     CHECK((ids.count(77)) == size_t{ 1 });
     CHECK((ids.count(78)) == size_t{ 1 });
+
+    // Every object contributed, and the two-material terrain contributed twice while
+    // both of its primitives named the SAME object -- a primitive taking its extras
+    // from its own position in the range list rather than from its range's owner
+    // would give them different ones.
+    CHECK_EQ(primitives_per_object.size(), scene.objects.size());
+    CHECK_EQ(primitives_per_object[0], size_t{ 2 });
+
+    // Primitives come out object-major, so an object's primitives are adjacent.
+    size_t out_of_order = 0;
+    for (size_t i = 1; i < primitive_objects.size(); ++i) {
+        if (primitive_objects[i] < primitive_objects[i - 1]) ++out_of_order;
+    }
+    CHECK_EQ(out_of_order, size_t{ 0 });
 }
 
 /**
@@ -1082,6 +1221,7 @@ TEST(SceneExport, the_gltf_writer_conserves_every_triangle) {
 
     const SceneExportStats stats = export_scene(scene.objects, dir, cfg);
     CHECK_EQ(stats.triangles, scene.triangles());
+    CHECK_EQ(stats.unwritten_triangles, size_t{ 0 });
     // One `.gltf` and one `.bin` per chunk.
     CHECK_EQ(stats.files, stats.chunks * 2u);
 
@@ -1089,19 +1229,81 @@ TEST(SceneExport, the_gltf_writer_conserves_every_triangle) {
     CHECK_EQ(chunks.size(), stats.chunks);
 
     std::multiset<TriKey> recovered;
+    size_t wrong_mode = 0;
+    size_t wrong_bounds = 0;
+    size_t unsnapped_tangents = 0;
+    size_t wrong_uvs = 0;
+
     for (const ChunkFile& chunk : chunks) {
         const GltfFile gltf = read_gltf(chunk.path);
         CHECK_TRUE(gltf.ok);
         if (!gltf.ok) continue;
 
         for (const auto& primitive : gltf.doc["meshes"][0]["primitives"]) {
+            // 4 is TRIANGLES. A primitive left at 0 is POINTS, which every viewer
+            // honours: the geometry is all present and the file draws as a dust
+            // cloud, so a test that only decodes POSITION and the indices sees a
+            // perfect export.
+            if (primitive.value("mode", -1) != 4) ++wrong_mode;
+
             const std::vector<uint32_t> indices =
                 read_indices(gltf, primitive["indices"].get<size_t>());
-            const std::vector<glm::vec3> positions =
-                read_vec3(gltf, primitive["attributes"]["POSITION"].get<size_t>());
+            const size_t position_accessor =
+                primitive["attributes"]["POSITION"].get<size_t>();
+            const std::vector<glm::vec3> positions = read_vec3(gltf, position_accessor);
             CHECK_FALSE(indices.empty());
             CHECK_FALSE(positions.empty());
             CHECK_EQ(indices.size() % 3u, size_t{ 0 });
+
+            // The POSITION accessor's min and max are REQUIRED by glTF 2.0 and are
+            // what a viewer frames the scene with. Exchanged, they describe an
+            // inverted box and the model is off screen, while every byte of geometry
+            // is still correct -- so nothing that reads the buffer can notice.
+            const auto& accessor = gltf.doc["accessors"][position_accessor];
+            if (!accessor.contains("min") || !accessor.contains("max")) {
+                ++wrong_bounds;
+            } else {
+                glm::vec3 low(std::numeric_limits<float>::max());
+                glm::vec3 high(std::numeric_limits<float>::lowest());
+                for (const glm::vec3& p : positions) {
+                    low = glm::min(low, p);
+                    high = glm::max(high, p);
+                }
+                for (int axis = 0; axis < 3; ++axis) {
+                    const auto declared_min = accessor["min"][static_cast<size_t>(axis)]
+                                                  .get<double>();
+                    const auto declared_max = accessor["max"][static_cast<size_t>(axis)]
+                                                  .get<double>();
+                    if (std::abs(declared_min - static_cast<double>(low[axis])) > 1e-3
+                        || std::abs(declared_max - static_cast<double>(high[axis])) > 1e-3) {
+                        ++wrong_bounds;
+                    }
+                }
+            }
+
+            // TANGENT.w is a handedness flag and is one of exactly two values. The
+            // fixture supplies 0 and -0.5, so a writer passing the raw float through
+            // is visible here and nowhere else.
+            const std::vector<glm::vec4> tangents =
+                read_vec4(gltf, primitive["attributes"]["TANGENT"].get<size_t>());
+            for (const glm::vec4& t : tangents) {
+                if (t.w != 1.0f && t.w != -1.0f) ++unsnapped_tangents;
+            }
+
+            // make_quad() derives uv from the position, so u and v exchanged is
+            // recoverable from the file alone.
+            const std::vector<glm::vec2> uvs =
+                read_vec2(gltf, primitive["attributes"]["TEXCOORD_0"].get<size_t>());
+            if (uvs.size() != positions.size()) {
+                ++wrong_uvs;
+            } else {
+                for (size_t i = 0; i < uvs.size(); ++i) {
+                    if (std::abs(uvs[i].x - positions[i].x * 0.1f) > 1e-3f
+                        || std::abs(uvs[i].y - positions[i].z * 0.1f) > 1e-3f) {
+                        ++wrong_uvs;
+                    }
+                }
+            }
 
             for (size_t t = 0; t + 2u < indices.size(); t += 3u) {
                 if (indices[t] >= positions.size() || indices[t + 1] >= positions.size()
@@ -1119,6 +1321,10 @@ TEST(SceneExport, the_gltf_writer_conserves_every_triangle) {
 
     CHECK_EQ(recovered.size(), expected.size());
     CHECK_TRUE(recovered == expected);
+    CHECK_EQ(wrong_mode, size_t{ 0 });
+    CHECK_EQ(wrong_bounds, size_t{ 0 });
+    CHECK_EQ(unsnapped_tangents, size_t{ 0 });
+    CHECK_EQ(wrong_uvs, size_t{ 0 });
 }
 
 // ============================================================================
@@ -1183,17 +1389,42 @@ TEST(SceneExport, z_up_rotates_positions_for_obj) {
 
     // glTF 2.0 requires Y up, so the same request is ignored there rather than
     // written out as a file that is valid and wrong in every viewer.
+    //
+    // The glTF writer now READS cfg.y_up like the OBJ writer does, and relies on
+    // effective_config() having forced it true for this format. That is what makes
+    // these assertions able to fail: while the writer ignored the flag outright, the
+    // fixup could be deleted entirely and every line below still passed, because
+    // nothing downstream of it could tell the difference.
     cfg.format = SceneExportFormat::Gltf;
     const fs::path gltf_dir = scratch_dir("z_up_gltf");
     export_scene({ object }, gltf_dir, cfg);
     const GltfFile gltf = read_gltf(gltf_dir / "scene.gltf");
     CHECK_TRUE(gltf.ok);
     if (!gltf.ok) return;
-    const std::vector<glm::vec3> positions = read_vec3(
-        gltf, gltf.doc["meshes"][0]["primitives"][0]["attributes"]["POSITION"].get<size_t>());
+    const auto& attributes = gltf.doc["meshes"][0]["primitives"][0]["attributes"];
+    const std::vector<glm::vec3> positions =
+        read_vec3(gltf, attributes["POSITION"].get<size_t>());
     CHECK_EQ(positions.size(), size_t{ 3 });
+    CHECK_NEAR(positions[0].x, 1.0, 1e-4);
     CHECK_NEAR(positions[0].y, 2.0, 1e-4);
     CHECK_NEAR(positions[0].z, 3.0, 1e-4);
+
+    // The normal is not rotated either, or the geometry is Y up and the shading is
+    // Z up, which is worse than either frame consistently.
+    const std::vector<glm::vec3> gltf_normals =
+        read_vec3(gltf, attributes["NORMAL"].get<size_t>());
+    CHECK_EQ(gltf_normals.size(), size_t{ 3 });
+    CHECK_NEAR(gltf_normals[0].x, 0.0, 1e-4);
+    CHECK_NEAR(gltf_normals[0].y, 1.0, 1e-4);
+    CHECK_NEAR(gltf_normals[0].z, 0.0, 1e-4);
+
+    // And asking for Y up explicitly produces the very same bytes, so "ignored" is
+    // checked as an equality and not only against hand-written expectations.
+    cfg.y_up = true;
+    const fs::path gltf_up = scratch_dir("y_up_gltf");
+    export_scene({ object }, gltf_up, cfg);
+    CHECK_FALSE(file_bytes(gltf_up / "scene.bin").empty());
+    CHECK_EQ(file_bytes(gltf_dir / "scene.bin"), file_bytes(gltf_up / "scene.bin"));
 }
 
 // ============================================================================
@@ -1245,9 +1476,25 @@ TEST(SceneExport, unassignable_triangles_are_dropped_and_counted) {
     CHECK_TRUE(obj.ok);
     CHECK_EQ(obj.faces.size(), size_t{ 2 });
     // Nothing non-finite reached the file, which would poison a reader's bounds.
+    //
+    // Checked on the NORMALS and TEXTURE COORDINATES as well, and then on the raw
+    // bytes. This loop used to read obj.positions alone, which is the one attribute
+    // the centroid guard already protects -- so it could not see a `vn nan` or a
+    // `vt nan` line, and both were being written. See
+    // a_nan_in_any_vertex_attribute_never_reaches_a_file for the fixture that
+    // actually drives one in.
     for (const glm::vec3& p : obj.positions) {
         CHECK_TRUE(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z));
     }
+    for (const glm::vec3& n : obj.normals) {
+        CHECK_TRUE(std::isfinite(n.x) && std::isfinite(n.y) && std::isfinite(n.z));
+    }
+    for (const glm::vec2& uv : obj.uvs) {
+        CHECK_TRUE(std::isfinite(uv.x) && std::isfinite(uv.y));
+    }
+    const std::string bytes = file_bytes(dir / "scene.obj");
+    CHECK((bytes.find("nan")) == std::string::npos);
+    CHECK((bytes.find("inf")) == std::string::npos);
 }
 
 /**
@@ -1273,13 +1520,34 @@ TEST(SceneExport, an_export_is_deterministic) {
     const std::vector<ChunkFile> chunks = chunk_files(first, "scene", ".obj");
     CHECK_FALSE(chunks.empty());
     size_t differing = 0;
+    size_t groups_out_of_order = 0;
     for (const ChunkFile& chunk : chunks) {
         const std::string one = file_bytes(chunk.path);
         const std::string two = file_bytes(second / chunk.path.filename());
         CHECK_FALSE(one.empty());
         if (one != two) ++differing;
+
+        // Byte equality between two runs IN ONE PROCESS does not prove the grouping
+        // container is ordered: an unordered_map fed the same keys in the same order
+        // reproduces its own iteration order exactly, so both files agree and both
+        // are wrong. The ORDER itself is the thing to assert.
+        //
+        // Object index ascending, and no (object, material) group ever re-entered.
+        // Only the object half is checked here: within an object the groups ascend by
+        // PACKED MaterialKey, which is not the order their names sort in, and the
+        // file carries the names. a_chunk_groups_by_object_then_material pins the
+        // material half down against a fixture whose packed order is known.
+        long previous_object = -1;
+        std::set<std::pair<std::string, std::string>> seen_groups;
+        for (const auto& [record, material] : face_groups(read_obj(chunk.path))) {
+            const long index = record_index(record);
+            if (index < previous_object) ++groups_out_of_order;
+            if (!seen_groups.emplace(record, material).second) ++groups_out_of_order;
+            previous_object = index;
+        }
     }
     CHECK_EQ(differing, size_t{ 0 });
+    CHECK_EQ(groups_out_of_order, size_t{ 0 });
 
     // written_files is documented to ascend by grid x then z. Parse the cells back
     // out of the names and check the sequence really ascends: comparing the list
@@ -1304,6 +1572,568 @@ TEST(SceneExport, an_export_is_deterministic) {
         if (!(cells[i - 1] < cells[i])) ++out_of_order;
     }
     CHECK_EQ(out_of_order, size_t{ 0 });
+}
+
+/**
+ * A cell index that int32_t cannot hold is refused, not wrapped.
+ *
+ * `static_cast<int32_t>(std::floor(coord / size))` is UNDEFINED outside the int32
+ * range, and on x86 it produces INT32_MIN. Every such triangle therefore used to land
+ * in one cell named `scene_-2147483648_-2147483648`, and the sums still balanced: the
+ * conservation test passed, and "every triangle lands in the chunk its name claims"
+ * quietly stopped being true while two unrelated regions merged into one file.
+ *
+ * The centroid being FINITE is not enough to prevent it, which is the whole point --
+ * the quotient is what has to fit, and it depends on chunk_size as much as on the
+ * coordinate.
+ */
+TEST(SceneExport, a_cell_index_that_cannot_be_represented_is_dropped_and_counted) {
+    struct Probe {
+        const char* what;
+        float x0;
+        float z0;
+        float chunk;
+    };
+    // Three ways to overflow from values that are each individually ordinary. The
+    // third is the set_origin() trap in CLAUDE.md: wgs84_to_local() returns raw
+    // Mercator metres when no origin was set, and 2e7 of them against a small cell is
+    // not an absurd thing for a caller to ask for.
+    const Probe probes[] = {
+        { "a far-away coordinate", 1e20f, 1e20f, 500.0f },
+        { "a vanishingly small cell", 1.0f, 1.0f, 1e-30f },
+        { "raw Mercator against a 5 mm cell", 2e7f, 2e7f, 0.005f }
+    };
+
+    for (const Probe& probe : probes) {
+        const Mesh mesh = make_quad(probe.x0, probe.z0, probe.x0 + 2.0f, probe.z0 + 2.0f,
+                                    0.0f, { 1.0f, 1.0f, 1.0f, 1.0f }, MaterialId::Wall);
+        SceneObject object;
+        object.mesh = &mesh;
+        object.name = probe.what;
+
+        const fs::path dir = scratch_dir("unindexable");
+        SceneExportConfig cfg;
+        cfg.chunk_size = probe.chunk;
+        const SceneExportStats stats = export_scene({ object }, dir, cfg);
+
+        CHECK_EQ(stats.triangles, size_t{ 0 });
+        CHECK_EQ(stats.dropped_triangles, triangle_count(mesh));
+        CHECK_EQ(stats.chunks, size_t{ 0 });
+        CHECK_EQ(stats.files, size_t{ 0 });
+        // The wrapped cell, spelled out: this is the file the defect produced.
+        CHECK_FALSE(fs::exists(dir / "scene_-2147483648_-2147483648.obj"));
+
+        size_t entries = 0;
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(dir, ec)) {
+            (void)entry;
+            ++entries;
+        }
+        CHECK_EQ(entries, size_t{ 0 });
+    }
+
+    // A refusal is per triangle, not per export: geometry that CAN be indexed is
+    // still written, and the three buckets still add up to the input.
+    const Mesh good = make_quad(10.0f, 10.0f, 20.0f, 20.0f, 0.0f,
+                                { 1.0f, 1.0f, 1.0f, 1.0f }, MaterialId::Wall);
+    const Mesh far = make_quad(1e20f, 1e20f, 1e20f + 2.0f, 1e20f + 2.0f, 0.0f,
+                               { 1.0f, 1.0f, 1.0f, 1.0f }, MaterialId::Wall);
+    std::vector<SceneObject> mixed(2);
+    mixed[0].mesh = &good;
+    mixed[1].mesh = &far;
+
+    const fs::path dir = scratch_dir("unindexable_mixed");
+    SceneExportConfig cfg;
+    cfg.chunk_size = kChunk;
+    const SceneExportStats stats = export_scene(mixed, dir, cfg);
+
+    CHECK_EQ(stats.triangles, size_t{ 2 });
+    CHECK_EQ(stats.dropped_triangles, size_t{ 2 });
+    CHECK_EQ(stats.unwritten_triangles, size_t{ 0 });
+    CHECK_EQ(stats.triangles + stats.dropped_triangles + stats.unwritten_triangles,
+             triangle_count(good) + triangle_count(far));
+    CHECK_EQ(stats.chunks, size_t{ 1 });
+
+    const std::vector<ChunkFile> chunks = chunk_files(dir, "scene", ".obj");
+    CHECK_EQ(chunks.size(), size_t{ 1 });
+    CHECK_EQ(chunks[0].cx, 0L);
+    CHECK_EQ(chunks[0].cz, 0L);
+}
+
+/**
+ * A chunk whose file could not be written is not reported as written.
+ *
+ * SceneExportStats::triangles used to be credited where a triangle was ROUTED, which
+ * is before any file is opened. A chunk that then failed to open was skipped, and its
+ * triangles stayed in the total: a caller checking `triangles + dropped == input` was
+ * told the export had conserved everything while a whole file was missing from disk.
+ * stats.vertices and stats.chunks were already credited on success, so the two halves
+ * of the same stats struct disagreed about the same failure.
+ *
+ * A DIRECTORY standing where a chunk file should go is the cheapest reliable way to
+ * make one open fail without making them all fail, so the success path stays covered
+ * in the same export.
+ */
+TEST(SceneExport, a_chunk_that_cannot_be_written_is_counted_as_unwritten) {
+    const Mesh blocked = make_quad(10.0f, 10.0f, 20.0f, 20.0f, 0.0f,
+                                   { 1.0f, 1.0f, 1.0f, 1.0f }, MaterialId::Wall);
+    const Mesh writable = make_quad(110.0f, 110.0f, 120.0f, 120.0f, 0.0f,
+                                    { 1.0f, 1.0f, 1.0f, 1.0f }, MaterialId::Roof);
+    std::vector<SceneObject> objects(2);
+    objects[0].mesh = &blocked;
+    objects[1].mesh = &writable;
+
+    const fs::path dir = scratch_dir("open_failure");
+    std::error_code ec;
+    fs::create_directories(dir / "scene_0_0.obj", ec);
+    CHECK_TRUE(fs::is_directory(dir / "scene_0_0.obj"));
+
+    SceneExportConfig cfg;
+    cfg.chunk_size = kChunk;
+    const SceneExportStats stats = export_scene(objects, dir, cfg);
+
+    const size_t input = triangle_count(blocked) + triangle_count(writable);
+
+    // Only the chunk that reached disk is counted as written, and the blocked one is
+    // accounted for rather than absorbed.
+    CHECK_EQ(stats.chunks, size_t{ 1 });
+    CHECK_EQ(stats.triangles, triangle_count(writable));
+    CHECK_EQ(stats.unwritten_triangles, triangle_count(blocked));
+    CHECK_EQ(stats.dropped_triangles, size_t{ 0 });
+    CHECK_EQ(stats.triangles + stats.dropped_triangles + stats.unwritten_triangles, input);
+
+    // And stats.triangles agrees with what a consumer can actually load.
+    size_t on_disk = 0;
+    for (const ChunkFile& chunk : chunk_files(dir, "scene", ".obj")) {
+        const ObjFile obj = read_obj(chunk.path);
+        CHECK_TRUE(obj.ok);
+        on_disk += obj.faces.size();
+    }
+    CHECK_EQ(on_disk, stats.triangles);
+    CHECK_EQ(stats.written_files.size(), stats.files);
+}
+
+/**
+ * A name prefix cannot move the output out of the directory it was given.
+ *
+ * name_prefix is an editor-facing config field, and the stem it produces is
+ * concatenated into `out_dir / (stem + ext)`. sanitize_token() -- which is all it used
+ * to get -- makes a string safe as an OBJ TOKEN and passes '/', '\\' and '.' straight
+ * through, so:
+ *
+ *  - "../escaped" wrote `out_dir/../escaped.obj`, one level ABOVE out_dir, and
+ *    reported success with a path the caller never asked for;
+ *  - "sub/thing" named a directory ensure_directory() never created, so every open
+ *    failed and the export produced nothing while still reporting triangles.
+ */
+TEST(SceneExport, a_name_prefix_cannot_escape_the_output_directory) {
+    const Mesh mesh = make_quad(1.0f, 1.0f, 3.0f, 3.0f, 0.0f,
+                                { 1.0f, 1.0f, 1.0f, 1.0f }, MaterialId::Wall);
+    SceneObject object;
+    object.mesh = &mesh;
+    object.name = "Hall";
+
+    const fs::path root = scratch_dir("prefix_escape");
+    const fs::path dir = root / "inside";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    const char* const hostile[] = { "../escaped", "sub/thing", "..", ".", "a\\b", "c:name" };
+
+    for (const char* prefix : hostile) {
+        for (const auto& entry : fs::directory_iterator(dir, ec)) {
+            fs::remove_all(entry.path(), ec);
+        }
+
+        SceneExportConfig cfg;
+        cfg.chunk_size = kChunk;
+        cfg.name_prefix = prefix;
+        const SceneExportStats stats = export_scene({ object }, dir, cfg);
+
+        // It still exports. A stem that cannot name a file is a bug, not a refusal.
+        CHECK_EQ(stats.triangles, triangle_count(mesh));
+        CHECK_EQ(stats.unwritten_triangles, size_t{ 0 });
+        CHECK((size_t{ 0 }) < stats.files);
+
+        // Every file landed DIRECTLY inside out_dir, under a single-component name.
+        size_t escaped = 0;
+        for (const std::string& written : stats.written_files) {
+            const fs::path file(written);
+            if (fs::weakly_canonical(file.parent_path(), ec) != fs::weakly_canonical(dir, ec)) {
+                ++escaped;
+            }
+            if (written.find("..") != std::string::npos) ++escaped;
+            if (!fs::exists(file)) ++escaped;
+        }
+        CHECK_EQ(escaped, size_t{ 0 });
+
+        // Nothing appeared beside out_dir, which is where "../escaped" used to write.
+        size_t siblings = 0;
+        for (const auto& entry : fs::directory_iterator(root, ec)) {
+            if (entry.path().filename() != "inside") ++siblings;
+        }
+        CHECK_EQ(siblings, size_t{ 0 });
+
+        // And no subdirectory was invented under out_dir either.
+        size_t subdirectories = 0;
+        for (const auto& entry : fs::directory_iterator(dir, ec)) {
+            if (entry.is_directory()) ++subdirectories;
+        }
+        CHECK_EQ(subdirectories, size_t{ 0 });
+    }
+}
+
+/**
+ * A NaN in ANY vertex attribute is scrubbed, not written.
+ *
+ * The centroid guard rejects a triangle whose POSITION is non-finite and rejects
+ * nothing else, so a vertex with a finite position and a NaN normal, uv, tangent or
+ * colour reached both writers untouched: the OBJ got `vt nan` and `vn nan` lines that
+ * strict importers refuse, and the glTF `.bin` got NaN floats, which the validator
+ * reports as ACCESSOR_INVALID_FLOAT. One bad vertex cost a whole file its validity.
+ *
+ * road_export.cpp documents this exact hole and scrubs per component before encoding.
+ * One bad vertex should cost one vertex.
+ */
+TEST(SceneExport, a_nan_in_any_vertex_attribute_never_reaches_a_file) {
+    const float nan = std::nanf("");
+
+    // Five corners, one broken attribute each, and every position finite so that not
+    // one of these triangles is dropped by the centroid guard.
+    Mesh mesh = make_quad(1.0f, 1.0f, 3.0f, 3.0f, 0.0f,
+                          { 0.5f, 0.5f, 0.5f, 1.0f }, MaterialId::Wall);
+    mesh.vertices[0].normal.x = nan;
+    mesh.vertices[1].uv.x = nan;
+    mesh.vertices[2].tangent.x = nan;
+    mesh.vertices[3].color.r = nan;
+    // A normal that is ENTIRELY non-finite scrubs to (0, 0, 0), which is not a
+    // normal. It falls back to straight up, exactly as road_export.cpp does.
+    Vertex all_bad = mesh.vertices[0];
+    all_bad.position = { 2.0f, 0.0f, 2.5f };
+    all_bad.normal = { nan, nan, nan };
+    mesh.vertices.push_back(all_bad);
+    mesh.indices.push_back(0);
+    mesh.indices.push_back(1);
+    mesh.indices.push_back(4);
+    mesh.submeshes.clear();
+    mesh.submeshes.push_back(SubMesh{ 0u, static_cast<uint32_t>(mesh.indices.size()),
+                                      MaterialId::Wall, 0u });
+
+    SceneObject object;
+    object.mesh = &mesh;
+    object.name = "Broken";
+
+    const fs::path dir = scratch_dir("nan_attributes");
+    SceneExportConfig cfg;
+    cfg.chunk_size = 0.0f;
+    const SceneExportStats stats = export_scene({ object }, dir, cfg);
+
+    // Nothing is dropped: every centroid is finite, so this is a scrub and not a
+    // refusal, and the triangle count is untouched.
+    CHECK_EQ(stats.triangles, triangle_count(mesh));
+    CHECK_EQ(stats.dropped_triangles, size_t{ 0 });
+
+    const ObjFile obj = read_obj(dir / "scene.obj");
+    CHECK_TRUE(obj.ok);
+    CHECK_EQ(obj.faces.size(), triangle_count(mesh));
+
+    const std::string bytes = file_bytes(dir / "scene.obj");
+    CHECK((bytes.find("nan")) == std::string::npos);
+    CHECK((bytes.find("NaN")) == std::string::npos);
+    CHECK((bytes.find("inf")) == std::string::npos);
+
+    CHECK_EQ(obj.normals.size(), mesh.vertices.size());
+    CHECK_EQ(obj.uvs.size(), mesh.vertices.size());
+    for (const glm::vec3& n : obj.normals) {
+        CHECK_TRUE(std::isfinite(n.x) && std::isfinite(n.y) && std::isfinite(n.z));
+    }
+    for (const glm::vec2& uv : obj.uvs) {
+        CHECK_TRUE(std::isfinite(uv.x) && std::isfinite(uv.y));
+    }
+    // The all-NaN normal came back as straight up rather than as a zero vector.
+    CHECK_NEAR(obj.normals[4].x, 0.0, 1e-4);
+    CHECK_NEAR(obj.normals[4].y, 1.0, 1e-4);
+    CHECK_NEAR(obj.normals[4].z, 0.0, 1e-4);
+    // A scrubbed component becomes 0 and its neighbours are untouched: the fix costs
+    // one component, not the whole vertex.
+    CHECK_NEAR(obj.normals[0].x, 0.0, 1e-4);
+    CHECK_NEAR(obj.normals[0].y, 1.0, 1e-4);
+
+    // The same vertices through the other writer, read out of the .bin.
+    const fs::path gltf_dir = scratch_dir("nan_attributes_gltf");
+    cfg.format = SceneExportFormat::Gltf;
+    export_scene({ object }, gltf_dir, cfg);
+
+    const GltfFile gltf = read_gltf(gltf_dir / "scene.gltf");
+    CHECK_TRUE(gltf.ok);
+    if (!gltf.ok) return;
+
+    const auto& attributes = gltf.doc["meshes"][0]["primitives"][0]["attributes"];
+    size_t non_finite = 0;
+    for (const glm::vec3& v : read_vec3(gltf, attributes["POSITION"].get<size_t>())) {
+        if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z)) ++non_finite;
+    }
+    for (const glm::vec3& v : read_vec3(gltf, attributes["NORMAL"].get<size_t>())) {
+        if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z)) ++non_finite;
+    }
+    for (const glm::vec2& v : read_vec2(gltf, attributes["TEXCOORD_0"].get<size_t>())) {
+        if (!std::isfinite(v.x) || !std::isfinite(v.y)) ++non_finite;
+    }
+    for (const glm::vec4& v : read_vec4(gltf, attributes["COLOR_0"].get<size_t>())) {
+        if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z)
+            || !std::isfinite(v.w)) {
+            ++non_finite;
+        }
+    }
+    for (const glm::vec4& v : read_vec4(gltf, attributes["TANGENT"].get<size_t>())) {
+        if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z)
+            || !std::isfinite(v.w)) {
+            ++non_finite;
+        }
+    }
+    CHECK_EQ(non_finite, size_t{ 0 });
+}
+
+/**
+ * A chunk holding two multi-material objects groups by OBJECT first, then material.
+ *
+ * This is the one thing the scene exporter changed relative to the road exporter, and
+ * every other fixture in this suite hides it: make_city()'s objects carried a single
+ * material each until this test was written, and the two multi-material fixtures hold
+ * exactly ONE object. With one object, or with one material per object, "object then
+ * material" and "material then object" produce the same file, so the ordering that
+ * write_obj_file()'s one-record-per-object run logic depends on was unasserted.
+ *
+ * Four groups in one chunk, chosen so the two orderings disagree: object 0 takes
+ * Asphalt (slot 1) and Wall (slot 11), object 1 takes Concrete (slot 2) and Roof
+ * (slot 12). Grouping by material first would interleave them as
+ * Asphalt/Concrete/Wall/Roof, i.e. objects 0, 1, 0, 1.
+ */
+TEST(SceneExport, a_chunk_groups_by_object_then_material) {
+    const auto two_material_quad = [](float x0, float z0, MaterialId first,
+                                      MaterialId second) {
+        Mesh mesh = make_quad(x0, z0, x0 + 4.0f, z0 + 4.0f, 0.0f,
+                              { 0.5f, 0.5f, 0.5f, 1.0f }, first);
+        const Mesh other = make_quad(x0, z0 + 6.0f, x0 + 4.0f, z0 + 10.0f, 0.0f,
+                                     { 0.5f, 0.5f, 0.5f, 1.0f }, second);
+        mesh.append(other, second);
+        mesh.compute_bounds();
+        return mesh;
+    };
+
+    // Both well inside cell (0, 0), so this is one chunk and the grouping is the only
+    // thing deciding the file's shape.
+    const Mesh first = two_material_quad(2.0f, 2.0f, MaterialId::Asphalt, MaterialId::Wall);
+    const Mesh second = two_material_quad(20.0f, 2.0f, MaterialId::Concrete, MaterialId::Roof);
+
+    std::vector<SceneObject> objects(2);
+    objects[0].mesh = &first;
+    objects[0].name = "Alpha";
+    objects[1].mesh = &second;
+    objects[1].name = "Beta";
+
+    const fs::path dir = scratch_dir("grouping");
+    SceneExportConfig cfg;
+    cfg.chunk_size = kChunk;
+    const SceneExportStats stats = export_scene(objects, dir, cfg);
+
+    CHECK_EQ(stats.chunks, size_t{ 1 });
+    CHECK_EQ(stats.triangles, size_t{ 8 });
+
+    const ObjFile obj = read_obj(dir / "scene_0_0.obj");
+    CHECK_TRUE(obj.ok);
+    CHECK_EQ(obj.faces.size(), size_t{ 8 });
+
+    // Exactly one `o` record per object, in ascending object order.
+    CHECK_EQ(obj.objects.size(), size_t{ 2 });
+    CHECK_EQ(obj.objects[0], std::string{ "scene_o0_Alpha" });
+    CHECK_EQ(obj.objects[1], std::string{ "scene_o1_Beta" });
+
+    // Four groups, contiguous, object-major. Within an object the groups ascend by
+    // PACKED MaterialKey, which is (slot << 16) | variant -- so Asphalt (1) before
+    // Wall (11), and Concrete (2) before Roof (12).
+    const std::vector<std::pair<std::string, std::string>> groups = face_groups(obj);
+    CHECK_EQ(groups.size(), size_t{ 4 });
+    if (groups.size() == 4u) {
+        CHECK_EQ(groups[0].first, std::string{ "scene_o0_Alpha" });
+        CHECK_EQ(groups[0].second, std::string{ "stratum_Asphalt" });
+        CHECK_EQ(groups[1].first, std::string{ "scene_o0_Alpha" });
+        CHECK_EQ(groups[1].second, std::string{ "stratum_Wall" });
+        CHECK_EQ(groups[2].first, std::string{ "scene_o1_Beta" });
+        CHECK_EQ(groups[2].second, std::string{ "stratum_Concrete" });
+        CHECK_EQ(groups[3].first, std::string{ "scene_o1_Beta" });
+        CHECK_EQ(groups[3].second, std::string{ "stratum_Roof" });
+    }
+
+    // Two faces per group, so no group was emptied or doubled by the reordering.
+    std::map<std::pair<std::string, std::string>, size_t> per_group;
+    for (const ObjFace& face : obj.faces) ++per_group[{ face.object, face.material }];
+    CHECK_EQ(per_group.size(), size_t{ 4 });
+    for (const auto& [key, count] : per_group) {
+        (void)key;
+        CHECK_EQ(count, size_t{ 2 });
+    }
+
+    // While here: make_quad() derives uv from the position, so the OBJ `vt` block can
+    // be checked against the `v` block. Nothing else in the suite read `vt` at all, so
+    // a writer that exchanged u and v was invisible.
+    CHECK_EQ(obj.uvs.size(), obj.positions.size());
+    size_t wrong_uvs = 0;
+    for (size_t i = 0; i < obj.uvs.size(); ++i) {
+        if (std::abs(obj.uvs[i].x - obj.positions[i].x * 0.1f) > 1e-3f
+            || std::abs(obj.uvs[i].y - obj.positions[i].z * 0.1f) > 1e-3f) {
+            ++wrong_uvs;
+        }
+    }
+    CHECK_EQ(wrong_uvs, size_t{ 0 });
+
+    // The same grouping reaches glTF: one primitive per (object, material).
+    const fs::path gltf_dir = scratch_dir("grouping_gltf");
+    cfg.format = SceneExportFormat::Gltf;
+    export_scene(objects, gltf_dir, cfg);
+    const GltfFile gltf = read_gltf(gltf_dir / "scene_0_0.gltf");
+    CHECK_TRUE(gltf.ok);
+    if (!gltf.ok) return;
+    CHECK_EQ(gltf.doc["meshes"][0]["primitives"].size(), size_t{ 4 });
+    CHECK_EQ(gltf.doc["materials"].size(), size_t{ 4 });
+
+    std::vector<long> primitive_objects;
+    for (const auto& primitive : gltf.doc["meshes"][0]["primitives"]) {
+        primitive_objects.push_back(
+            primitive["extras"]["stratum"]["index"].get<long>());
+    }
+    CHECK_EQ(primitive_objects.size(), size_t{ 4 });
+    if (primitive_objects.size() == 4u) {
+        CHECK_EQ(primitive_objects[0], 0L);
+        CHECK_EQ(primitive_objects[1], 0L);
+        CHECK_EQ(primitive_objects[2], 1L);
+        CHECK_EQ(primitive_objects[3], 1L);
+    }
+}
+
+/**
+ * The material key is the (slot, variant) PAIR, and the variant reaches the file.
+ *
+ * Keying on the slot alone merges a cobbled carriageway with an asphalt one before any
+ * writer sees them, and the two can then never be given different textures downstream.
+ * Every other fixture in this suite passes variant 0, so the second half of the key was
+ * never exercised: a key built as `{ sub.material, 0 }` passed the whole suite.
+ */
+TEST(SceneExport, a_material_variant_is_part_of_the_key) {
+    // One slot, two variants. Asphalt variant 7 is "Coloured" in road_style.cpp's
+    // frozen table, and those names travel in exported files.
+    Mesh mesh = make_quad(1.0f, 1.0f, 3.0f, 3.0f, 0.0f,
+                          { 0.5f, 0.5f, 0.5f, 1.0f }, MaterialId::Asphalt);
+    const Mesh coloured = make_quad(5.0f, 1.0f, 7.0f, 3.0f, 0.0f,
+                                    { 0.5f, 0.5f, 0.5f, 1.0f }, MaterialId::Asphalt);
+    mesh.append(coloured, MaterialId::Asphalt);
+    mesh.submeshes.clear();
+    mesh.submeshes.push_back(SubMesh{ 0u, 6u, MaterialId::Asphalt, 0u });
+    mesh.submeshes.push_back(SubMesh{ 6u, 6u, MaterialId::Asphalt, 7u });
+    mesh.compute_bounds();
+
+    SceneObject object;
+    object.mesh = &mesh;
+    object.name = "Street";
+
+    const fs::path dir = scratch_dir("variants");
+    SceneExportConfig cfg;
+    cfg.chunk_size = 0.0f;
+    const SceneExportStats stats = export_scene({ object }, dir, cfg);
+    CHECK_EQ(stats.triangles, size_t{ 4 });
+
+    const std::string expected_plain =
+        std::string{ "stratum_" }
+        + stratum::osm::road::material_key_name({ MaterialId::Asphalt, 0 });
+    const std::string expected_variant =
+        std::string{ "stratum_" }
+        + stratum::osm::road::material_key_name({ MaterialId::Asphalt, 7 });
+    CHECK_EQ(expected_plain, std::string{ "stratum_Asphalt" });
+    CHECK_EQ(expected_variant, std::string{ "stratum_Asphalt.Coloured" });
+
+    // TWO usemtl groups, not one merged range.
+    const ObjFile obj = read_obj(dir / "scene.obj");
+    CHECK_TRUE(obj.ok);
+    CHECK_EQ(obj.faces.size(), size_t{ 4 });
+    CHECK_EQ(obj.materials.size(), size_t{ 2 });
+
+    std::map<std::string, size_t> per_material;
+    for (const ObjFace& face : obj.faces) ++per_material[face.material];
+    CHECK_EQ(per_material.size(), size_t{ 2 });
+    CHECK_EQ(per_material[expected_plain], size_t{ 2 });
+    CHECK_EQ(per_material[expected_variant], size_t{ 2 });
+
+    // And two newmtl entries, so a consumer can bind them separately.
+    const std::string mtl = file_bytes(dir / "scene.mtl");
+    CHECK((mtl.find("newmtl " + expected_plain + "\n")) != std::string::npos);
+    CHECK((mtl.find("newmtl " + expected_variant + "\n")) != std::string::npos);
+
+    // glTF agrees: two materials, not one.
+    const fs::path gltf_dir = scratch_dir("variants_gltf");
+    cfg.format = SceneExportFormat::Gltf;
+    export_scene({ object }, gltf_dir, cfg);
+    const GltfFile gltf = read_gltf(gltf_dir / "scene.gltf");
+    CHECK_TRUE(gltf.ok);
+    if (!gltf.ok) return;
+    CHECK_EQ(gltf.doc["materials"].size(), size_t{ 2 });
+    std::set<std::string> names;
+    for (const auto& material : gltf.doc["materials"]) {
+        names.insert(material.value("name", std::string{}));
+    }
+    CHECK_EQ(names.size(), size_t{ 2 });
+    CHECK_TRUE(names.count(expected_plain) == 1u);
+    CHECK_TRUE(names.count(expected_variant) == 1u);
+}
+
+/**
+ * A centroid exactly on a cell boundary lands in the HIGHER cell, every time.
+ *
+ * floor() semantics, so 50.0 against a 50 m grid is cell 1 and not cell 0. Every other
+ * fixture here deliberately avoids the line -- a tie whose side depends on the last bit
+ * of a float makes a test fail for reasons that have nothing to do with the exporter --
+ * which left the tie itself undocumented and unasserted. It is worth pinning down
+ * exactly because it is the case a reader will wonder about.
+ */
+TEST(SceneExport, a_centroid_on_a_boundary_lands_in_the_higher_cell) {
+    // A triangle whose three corners average to exactly (50, 0, 50).
+    Mesh mesh;
+    const glm::vec3 corners[3] = {
+        { 40.0f, 0.0f, 50.0f }, { 60.0f, 0.0f, 40.0f }, { 50.0f, 0.0f, 60.0f }
+    };
+    for (const glm::vec3& p : corners) {
+        Vertex v;
+        v.position = p;
+        v.normal = { 0.0f, 1.0f, 0.0f };
+        mesh.vertices.push_back(v);
+    }
+    mesh.indices = { 0, 1, 2 };
+    mesh.compute_bounds();
+
+    const glm::vec3 centroid = (corners[0] + corners[1] + corners[2]) / 3.0f;
+    CHECK_NEAR(centroid.x, 50.0, 1e-5);
+    CHECK_NEAR(centroid.z, 50.0, 1e-5);
+
+    SceneObject object;
+    object.mesh = &mesh;
+    object.name = "OnTheLine";
+
+    const fs::path dir = scratch_dir("boundary");
+    SceneExportConfig cfg;
+    cfg.chunk_size = kChunk;
+    const SceneExportStats stats = export_scene({ object }, dir, cfg);
+
+    CHECK_EQ(stats.chunks, size_t{ 1 });
+    CHECK_EQ(stats.triangles, size_t{ 1 });
+    // The higher cell. floor(50 / 50) is 1, and the lower cell must not be written.
+    CHECK_TRUE(fs::exists(dir / "scene_1_1.obj"));
+    CHECK_FALSE(fs::exists(dir / "scene_0_0.obj"));
+
+    const std::vector<ChunkFile> chunks = chunk_files(dir, "scene", ".obj");
+    CHECK_EQ(chunks.size(), size_t{ 1 });
+    if (chunks.size() == 1u) {
+        CHECK_EQ(chunks[0].cx, 1L);
+        CHECK_EQ(chunks[0].cz, 1L);
+    }
 }
 
 // ============================================================================
