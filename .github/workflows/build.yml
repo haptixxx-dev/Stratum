@@ -71,14 +71,24 @@ jobs:
           SDL_VIDEODRIVER: offscreen
         run: ctest --preset ci
 
-      # Visible in the log so it is obvious whether the GPU suites ran or
-      # skipped, rather than having to infer it from the test count.
-      - name: Report GPU backend
+      # ctest hides a test's stdout unless it fails, so its summary cannot say
+      # whether the GPU suites ran or skipped -- both report success. Run the
+      # binary directly for the one line that distinguishes them:
+      #
+      #   "123 passed, 0 failed"              lavapipe gives SDL_GPU a backend
+      #   "91 passed, 0 failed, 32 skipped"   it does not, and 32 tests are dead
+      #
+      # Only 32 of the 123 need a device; the other 91 are CPU-side logic that
+      # happens to live in the GPU binary.
+      - name: Report GPU backend and whether the suites ran
         if: always()
         run: |
           echo "--- vulkaninfo ---"
           vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverName" || \
             echo "no Vulkan device visible"
+          echo "--- stratum_gpu_tests ---"
+          ./build/ci/bin/stratum_gpu_tests 2>/dev/null | tail -3 || \
+            echo "gpu test binary did not run"
 
   # ══════════════════════════════════════════════════════════════════════════
   # BUILD - three-platform release matrix, packaged for the release job.
