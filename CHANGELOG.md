@@ -8,6 +8,69 @@ Releases map to the milestones in `docs/plans/milestones.md`.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-16
+
+Milestone **M2 (scene foundations)** complete, plus the first of M3, M7 and M8.
+
+Stratum stops being a viewer. It now has a scene it can edit, undo and save.
+
+### Added
+
+- **The scene model** (`src/scene/`), which everything after this stands on:
+  an undo/redo command stack, a layer tree, typed attributes with layer
+  inheritance and source tracking, selection, session georeferencing, and
+  save/load to a `.stratum` document.
+
+  Every mutation goes through the command stack, and that is enforced by the
+  compiler rather than by convention: `LayerTree`, `AttributeStore` and
+  `MapLayer` keep their mutating API private with their command classes as the
+  only friends.
+
+- **Block extraction** (`osm/road/blocks.*`) — the planar faces a street
+  network encloses. The keystone of the roadmap: lots, rule targets and
+  facades all sit on it.
+- **Street graph editing** (`osm/road/graph_edit.*`) — add, move, delete and
+  split, through the command stack, preserving the rule that junctions are
+  found by shared OSM node identity rather than endpoint proximity.
+- **Heightmap import** (`procgen/heightmap_io.*`) — PNG and PGM. Terrain is no
+  longer noise-only.
+- **Typed map layers** (`scene/map_layer.*`) — obstacle, water, texture, scalar
+  and function layers, which street growth, zoning and scatter all consume.
+- **Whole-scene export** (`osm/scene_export.*`) — buildings, areas and terrain
+  leave through the same path as roads, keeping the invariant that every
+  triangle lands in exactly one chunk and none is split at a boundary.
+- `stratum_core` may now read and write images, a deliberate decision (#13) so
+  that heightmap import and, later, facade texturing work with no window open.
+
+### Fixed
+
+Found by adversarial review with mutation testing, on code that compiled and
+passed its own tests:
+
+- **Block extraction produced faces with a slit in the ring.** Antennae were
+  cancelled positionally rather than topologically, so a spur ending in a loop
+  came back with a perimeter of 597.99 where the answer is 456.57. An exact
+  duplicate way destroyed the whole surrounding block, returning zero faces
+  where there should be one.
+- **Saving a document could terminate the process.** Non-UTF-8 text in a layer
+  name reached the JSON writer, which throws, with no handler — so a name
+  pasted from a Latin-1 source killed the editor and took the unsaved document
+  with it.
+- A map layer would accept a short buffer and a channel/type mismatch on load,
+  then be sampled out of bounds.
+- Chunk indexing in the scene exporter was signed-overflow UB on a scene far
+  from the origin, and object names were not sanitised against path escape.
+- Selection could invalidate its own iterators: a const read swept dead members
+  out of the storage those iterators indexed.
+
+### Changed
+
+- `CLAUDE.md` corrected. Among other drift it claimed an EnTT ECS for scene
+  management; EnTT is linked and included by nothing. The scene model is plain
+  owning structures with stable handles.
+- `docs/roadmap.md` removed, superseded by `docs/plans/milestones.md`.
+
+
 ## [0.3.0] — 2026-09-15
 
 Milestones **M0 (open source ready)** and **M1 (visible wins)**, both complete.
