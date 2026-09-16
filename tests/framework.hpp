@@ -134,6 +134,28 @@ int run_all(int argc, char** argv);
 void register_teardown(void (*fn)());
 
 /**
+ * @brief Mark the running test as skipped, with a reason, and stop counting it
+ *
+ * A skipped test is NOT a passing test, and until this existed the framework
+ * could not tell the difference.
+ *
+ * The GPU suites are the reason. Every one of them guards on a device being
+ * available and bails with a bare `return` when there is none, which the
+ * framework counted as a pass. So 123 GPU tests reported "123 passed, 0 failed"
+ * on a machine with no GPU at all, and reported exactly the same thing on a
+ * machine with one. The number carried no information, and a teardown segfault
+ * lived in those suites indefinitely because nothing ever indicated they were
+ * not really running.
+ *
+ * Call this, then return. The test is reported as skipped and the reason is
+ * printed in the summary, so a run that skipped everything cannot be mistaken
+ * for a run that passed everything.
+ *
+ * @param reason Why. Shown in the summary; keep it short and specific.
+ */
+void skip_test(const char* reason);
+
+/**
  * @brief Static-initialisation helper that registers one test case
  *
  * Not used directly; the TEST macro instantiates it.

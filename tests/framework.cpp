@@ -72,6 +72,23 @@ std::vector<void (*)()>& teardowns() {
 
 } // namespace
 
+namespace {
+
+/// Reason the running test gave for skipping, or null when it did not.
+const char* g_current_skip = nullptr;
+
+/// Every skip this run, as "Suite.test: reason".
+std::vector<std::string>& skipped_tests() {
+    static std::vector<std::string> s;
+    return s;
+}
+
+} // namespace
+
+void skip_test(const char* reason) {
+    g_current_skip = (reason != nullptr) ? reason : "no reason given";
+}
+
 void register_teardown(void (*fn)()) {
     if (fn != nullptr) teardowns().push_back(fn);
 }
@@ -106,6 +123,7 @@ int run_all(int argc, char** argv) {
 
     g_total_failures = 0;
     int passed = 0;
+    int skipped = 0;
     int failed = 0;
     const char* current_suite = nullptr;
 
@@ -119,13 +137,22 @@ int run_all(int argc, char** argv) {
         std::cout.flush();
 
         g_current_failures = 0;
+        g_current_skip = nullptr;
         if (test_case.fn != nullptr) {
             test_case.fn();
         } else {
             report_failure(test_case.file, test_case.line, "test body is null", std::string{});
         }
 
-        if (g_current_failures == 0) {
+        if (g_current_skip != nullptr && g_current_failures == 0) {
+            // Skipped beats passed. A test that never ran its assertions has
+            // not passed them, and reporting otherwise is how a whole suite can
+            // sit dead for months while the summary reads green.
+            ++skipped;
+            skipped_tests().push_back(std::string(test_case.suite) + "." + test_case.name +
+                                      ": " + g_current_skip);
+            std::cout << "  SKIP " << test_case.name << " (" << g_current_skip << ")\n";
+        } else if (g_current_failures == 0) {
             ++passed;
             std::cout << "  PASS " << test_case.name << '\n';
         } else {
@@ -143,6 +170,9 @@ int run_all(int argc, char** argv) {
     teardowns().clear();
 
     std::cout << '\n' << passed << " passed, " << failed << " failed";
+    if (skipped > 0) {
+        std::cout << ", " << skipped << " skipped";
+    }
     if (g_total_failures > 0) {
         std::cout << " (" << g_total_failures << " failing checks)";
     }
