@@ -38,7 +38,8 @@ jobs:
             libxfixes-dev libxrandr-dev libxrender-dev libxss-dev libxtst-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev libjack-jackd2-dev \
             libsndio-dev libdecor-0-dev libudev-dev libdbus-1-dev libfribidi-dev \
-            libthai-dev libunwind-dev libvulkan-dev
+            libthai-dev libunwind-dev libvulkan-dev \
+            mesa-vulkan-drivers vulkan-tools
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1
@@ -53,10 +54,31 @@ jobs:
       - name: Build
         run: cmake --build --preset ci
 
-      # stratum_gpu_tests self-skips its GPU-labelled suites when no device is
-      # present, so this is safe on a headless runner.
+      # The GPU suites have never actually run. They skip themselves when
+      # SDL_CreateGPUDevice() finds no backend, and no runner has a GPU, so 123
+      # tests have only ever reported "skipped" in this project's history.
+      #
+      # mesa-vulkan-drivers brings lavapipe, a software Vulkan device, and the
+      # offscreen video driver lets SDL bring its video subsystem up with no
+      # display -- SDL_CreateGPUDevice() returns "Video subsystem not
+      # initialized" otherwise, which reads like a missing GPU and is not.
+      #
+      # This cannot make CI worse. If lavapipe does not give SDL_GPU a usable
+      # backend, the suites skip exactly as they already do. If it does, 123
+      # tests start asserting something.
       - name: Test
+        env:
+          SDL_VIDEODRIVER: offscreen
         run: ctest --preset ci
+
+      # Visible in the log so it is obvious whether the GPU suites ran or
+      # skipped, rather than having to infer it from the test count.
+      - name: Report GPU backend
+        if: always()
+        run: |
+          echo "--- vulkaninfo ---"
+          vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverName" || \
+            echo "no Vulkan device visible"
 
   # ══════════════════════════════════════════════════════════════════════════
   # BUILD - three-platform release matrix, packaged for the release job.
