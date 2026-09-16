@@ -18,8 +18,10 @@ the code more recently.
 
 Stratum is a C++20 desktop application that converts OpenStreetMap data into
 optimized, textured 3D maps for video games. SDL3 + SDL_GPU (Vulkan backend)
-for rendering, Dear ImGui for the editor UI, EnTT for scene management.
-`VERSION` is `0.1.0`.
+for rendering, Dear ImGui for the editor UI, and a handle-based scene model in
+`src/scene` (not an ECS — see Key patterns).
+`VERSION` is `0.3.0`; it is read from the `VERSION` file at configure time, and
+the release workflow refuses a tag that disagrees with it.
 
 ## Build
 
@@ -43,8 +45,8 @@ See `docs/agents/build-test-run.md` for what each preset is for.
 
 ## Tests
 
-**Tests exist.** `tests/` holds 48 `.cpp` files across `core`, `geometry`,
-`osm`, `procgen`, `renderer` and `road`, producing two executables:
+**Tests exist.** `tests/` holds 63 `.cpp` files across `core`, `geometry`,
+`osm`, `procgen`, `renderer`, `road` and `scene`, producing two executables:
 `stratum_tests` (core-only, `tests/CMakeLists.txt:160`) and `stratum_gpu_tests`
 (`:299`, with self-skipping GPU-labelled suites).
 
@@ -61,8 +63,10 @@ because they are absent.
 
 - **stratum_core** (static lib, `CMakeLists.txt:70`) — engine-agnostic. Contains
   `src/osm`, `src/osm/road`, `src/geometry`, `src/procgen`, `src/scene` only.
-  Links `glm`, `osmium`, `Clipper2`, `meshoptimizer`, `draco`. Must NOT depend on
-  SDL, ImGui or rendering code.
+  Links `glm`, `osmium`, `Clipper2`, `meshoptimizer`, `draco`, `stb`. Must NOT
+  depend on SDL, ImGui or rendering code. `stb` is there deliberately — decision
+  Q2 (#13) allows core to read and write pixel data, so heightmap import and,
+  later, facade texturing and atlas packing work with no window open.
 - **stratum_editor_lib** (static lib, `CMakeLists.txt:172`) — the SDL3 + ImGui
   editor: rendering, UI panels, camera, gizmos. Depends on stratum_core.
 - **stratum** (executable) — just `main.cpp`, links stratum_editor_lib.
@@ -82,16 +86,35 @@ because they are absent.
   for viewport, scene hierarchy, properties, OSM import, procgen.
 - `osm/` — OSM parsing (libosmium), coordinate projection, mesh building,
   quadtree spatial index and streaming.
-- `osm/road/` — road network topology and geometry, solved network-wide.
+- `osm/road/` — road network topology and geometry, solved network-wide. Also
+  `blocks.*` (the planar faces the streets enclose — the input to lot
+  subdivision) and `graph_edit.*` (mutating the graph through the command stack).
 - `geometry/` — shared geometry utilities, including the ambient-occlusion baker.
-- `procgen/` — noise, heightmap terrain, terrain mesh building, tile management.
-- `scene/` — the scene model. Currently the undo/redo command stack (A4); layers,
-  attributes and selection land here as M2 continues. **Every mutation of the
-  scene goes through `CommandStack::execute()`.** A mutation that skips it is a
-  hole in the history, and the symptom shows up as an undo several steps later
-  restoring state that was never current.
+- `procgen/` — noise, heightmap terrain, terrain mesh building, tile management,
+  and heightmap import from PNG and PGM.
+- `scene/` — the scene model, complete as of M2: the undo/redo command stack,
+  the layer tree, typed attributes with layer inheritance, selection,
+  georeferencing, and save/load. **Every mutation of the scene goes through
+  `CommandStack::execute()`.** A mutation that skips it is a hole in the history,
+  and the symptom shows up as an undo several steps later restoring state that
+  was never current.
+
+  That rule is enforced structurally rather than by convention: `LayerTree`,
+  `AttributeStore` and `MapLayer` all keep their mutating API private with their
+  command classes as the only friends. Follow that pattern in anything new here.
+
+  One subtlety worth knowing before touching `selection.cpp`: a const member
+  function may FORGET a dead member where it lies, but may never move a survivor
+  or change the length. Iterators index the storage directly, so moving one
+  invalidates them. `rebuild()`, `trim_tail()` and `compact_if_sparse()` are
+  non-const precisely so a const accessor cannot call them.
 
 ### Key data flows
+
+**Export:** meshes → `osm/scene_export.*` → chunked OBJ or glTF. Generalised from
+`osm/road/road_export.*`, and it keeps that file's invariant: every triangle
+lands in exactly one chunk, chosen by centroid, and no triangle is split at a
+boundary. Sum the chunk counts and you get the input count back.
 
 **OSM:** `.osm`/`.pbf` → `OSMParser` → `ParsedOSMData` → `MeshBuilder`
 (buildings and areas) and `road::RoadNetworkBuilder` (roads, topology-driven)
@@ -122,7 +145,11 @@ were fixed there and should not be reintroduced.
 
 ### Key patterns
 
-- **EnTT ECS** for scene management.
+- **Handle-based scene model, NOT an ECS.** EnTT is linked into `stratum_core`
+  and used by nothing in `src/`. The scene uses plain owning structures with
+  stable integer handles: `LayerId` is never reused, and `AttributeObject`
+  carries a generation so a recycled slot cannot alias. Do not introduce EnTT
+  into `src/scene` without a system that actually iterates components.
 - **Tile-based streaming** for OSM data and terrain, with frustum culling.
 - **Handle-based GPU resources** (`uint32_t` IDs, not raw pointers).
 - Junctions are found by shared OSM node **identity**, never endpoint proximity.
