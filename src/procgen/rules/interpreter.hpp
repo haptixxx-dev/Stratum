@@ -29,6 +29,15 @@
  * places. When the body ends, a shape that produced no children and was not
  * discarded is a TERMINAL: it is the output.
  *
+ * Names are LEXICALLY scoped. A rule body sees its own parameters and its own
+ * `let`s, the file's attributes and constants, and nothing of the rule that
+ * called it -- so `rule A(w: float) { B(); }` does not let `B` read `w`. A rule
+ * whose meaning depended on its caller could not be read on its own, and the
+ * fault would surface inside the callee with nothing pointing at the caller that
+ * supplied the name. Call ARGUMENTS are evaluated in the caller's frame, before
+ * the callee exists, which is what keeps `Floor(height - 1)` meaning the
+ * caller's `height`.
+ *
  * ================================================================================
  * THE THREE THINGS THAT ARE EASY TO GET WRONG
  * ================================================================================
@@ -47,7 +56,13 @@
  *     child. Emitting it means the author sees a truncated tower, which points
  *     at the mistake, rather than an empty viewport, which does not.
  *   - **A shape cap.** A total, so that a rule which recurses shallowly but
- *     branches widely is caught too.
+ *     branches widely is caught too. A child the cap refuses does not count
+ *     against its parent, so a parent whose every child was refused is still a
+ *     terminal and still emits its own geometry. That is the same argument the
+ *     depth cap makes: truncated output points at the mistake, and an empty
+ *     viewport does not. No surviving shape's seed moves because of it, since
+ *     the shape count never falls and every child after the first refusal is
+ *     refused too.
  *
  * Both are Severity::Error, not warnings, so GenerationResult::ok() is false and
  * no caller mistakes truncated output for finished output. A generation that hit
@@ -85,6 +100,14 @@
  * siblings. Internally this unwinds through a private exception type, exactly as
  * parser.hpp describes for its own recovery; it never crosses this header.
  *
+ * The same rule holds one level up, for the file's own attributes and constants.
+ * Each is resolved independently, in declaration order, so a file with three bad
+ * defaults reports all three in source order rather than stopping at the first.
+ * A declaration whose expression fails is recorded as unresolvable and reported
+ * at its own line; only a shape that READS it is abandoned. So a stray
+ * `const junk : float = 1.0 / 0.0` next to a working `@start` rule costs the
+ * author a diagnostic, not the whole generation.
+ *
  * ================================================================================
  * EXTENDING IT: D3, D4, D5, D6
  * ================================================================================
@@ -109,6 +132,18 @@
  * interpreter.cpp when D3 and D4 land. Until then they report themselves the same
  * way, once per source location, and evaluation continues so that the rest of the
  * rule still produces its geometry.
+ *
+ * ### Adding a statement kind: what actually protects you
+ *
+ * Do NOT rely on the `switch` over StmtKind in State::exec() having no `default:`.
+ * A missing case there is a -Wswitch WARNING, and nothing in this tree sets
+ * -Werror, so it builds; the warning then sits in the build output where nobody
+ * reads it. What protects a new statement kind is a `static_assert` on
+ * `std::variant_size_v<StmtNode>` immediately above that switch, which is a hard
+ * compile error the moment ast.hpp gains an alternative. Widening that number
+ * without adding the case is how a statement becomes a silent no-op, and the
+ * assert says so. Behind both, the fallthrough past the switch reports "this
+ * statement is not implemented in this build" rather than returning quietly.
  */
 
 #pragma once
@@ -405,6 +440,21 @@ public:
 
     /// Report at @p loc, but only the first time for that location and message
     void report_once(Severity severity, const SourceLoc& loc, std::string message);
+
+    /**
+     * @brief Is there a shape to read, or is a file-level value being resolved?
+     *
+     * False while an attribute default or a constant is being evaluated. The
+     * `shape` in a FunctionArgs is then a default-constructed Shape and not the
+     * shape of anything, so a function that reads geometry must say so rather
+     * than return the zero it would otherwise compute from an empty shape. A
+     * silent zero out of `const base : float = geometry.area()` is a wrong
+     * building with nothing pointing at the line that caused it.
+     *
+     * The equivalent for `shape.sx` is enforced by the interpreter itself; a
+     * registered function is outside that and has to ask.
+     */
+    [[nodiscard]] bool has_current_shape() const;
 
     /// Append a line to GenerationResult::log
     void log(std::string line);

@@ -18,6 +18,7 @@
 #include <cmath>
 #include <set>
 #include <utility>
+#include <variant>
 
 namespace stratum::procgen::rules {
 
@@ -112,11 +113,42 @@ struct Interpreter::State {
     /// leaving a block is a resize rather than a map erase.
     std::vector<std::pair<std::string, Value>> locals;
 
+    /**
+     * @brief Where the CURRENT rule's bindings start in @p locals
+     *
+     * The search floor, and the whole of what makes this language lexically
+     * scoped rather than dynamically scoped. One vector holds every frame's
+     * bindings, so a search that ran to index 0 would walk out of the rule being
+     * evaluated and into the rule that CALLED it: `rule A(w: float) { B(); }`
+     * would let `B` read `w`, and `B` would then mean something different
+     * depending on who called it. That is a bug that cannot be found by reading
+     * `B`, which is the worst kind this file can have.
+     *
+     * Saved and restored around every rule invocation, so it is the callee's
+     * base while the callee runs and the caller's again afterwards. Arguments
+     * are evaluated BEFORE it moves, which is what keeps `Floor(height - 1)`
+     * meaning the caller's `height`.
+     */
+    size_t frame_base = 0;
+
     /// Attribute and constant values, resolved once each. See resolve_global().
     std::map<std::string, Value> globals;
     std::map<std::string, const AttrDecl*> attr_decls;
     std::map<std::string, const ConstDecl*> const_decls;
     std::set<std::string> resolving;
+
+    /**
+     * @brief File-level values whose expression failed, reported once each
+     *
+     * A constant that divides by zero is a fault in that constant, not in the
+     * file. Recording it here rather than abandoning the run is what lets a good
+     * `@start` rule still produce its building, and it is the same argument the
+     * shape caps and the AbandonShape unwind make: one malformed thing must not
+     * cost the other four thousand. A name in here has already been reported at
+     * its declaration, so a rule that READS it gets the short message from
+     * resolve_global() and abandons only its own shape.
+     */
+    std::set<std::string> unresolvable;
 
     /// True while an attribute default or a constant is being evaluated, which is
     /// when `shape.*` has no shape to mean.
@@ -193,6 +225,17 @@ struct Interpreter::State {
         throw AbandonShape{};
     }
 
+    /// fail(), but at most one diagnostic per site and message
+    ///
+    /// For a fault that one bad declaration causes at every shape that reads it:
+    /// a city of four thousand lots reading one broken constant should say so
+    /// once per reading SITE, not four thousand times into a hundred-entry cap
+    /// that then hides everything else.
+    [[noreturn]] void fail_once(const SourceLoc& loc, std::string message) {
+        report_once(Severity::Error, loc, std::move(message));
+        throw AbandonShape{};
+    }
+
     /// Throw on behalf of a handler that asked to abandon the shape
     void check_abandon() {
         if (abandon_requested) {
@@ -228,6 +271,14 @@ struct Interpreter::State {
             return false;
         }
 
+        // Already tried and already reported, at its own declaration. Saying
+        // "division by zero" again here would point at the wrong line; saying
+        // which name the rule wanted points at both.
+        if (unresolvable.find(name) != unresolvable.end()) {
+            fail_once(use_loc, "'" + name +
+                                   "' could not be worked out; see the error on its declaration");
+        }
+
         if (!resolving.insert(name).second) {
             fail(use_loc, "'" + name + "' is defined in terms of itself");
         }
@@ -236,31 +287,44 @@ struct Interpreter::State {
         in_global = true;
 
         Value value;
-        if (attr != attr_decls.end()) {
-            const AttrDecl& decl = *attr->second;
-            const auto override_it = options.attributes.find(name);
-            bool used_override = false;
-            if (override_it != options.attributes.end()) {
-                if (type_matches(decl.type, override_it->second)) {
-                    value = override_it->second;
-                    used_override = true;
-                } else {
-                    report(Severity::Error, decl.loc,
-                           "the supplied value for attribute '" + name + "' is a " +
-                               override_it->second.type_name() + ", but it is declared " +
-                               type_text(decl.type) + "; the default was used instead");
+        try {
+            if (attr != attr_decls.end()) {
+                const AttrDecl& decl = *attr->second;
+                const auto override_it = options.attributes.find(name);
+                bool used_override = false;
+                if (override_it != options.attributes.end()) {
+                    if (type_matches(decl.type, override_it->second)) {
+                        value = override_it->second;
+                        used_override = true;
+                    } else {
+                        report(Severity::Error, decl.loc,
+                               "the supplied value for attribute '" + name + "' is a " +
+                                   override_it->second.type_name() + ", but it is declared " +
+                                   type_text(decl.type) + "; the default was used instead");
+                    }
                 }
-            }
-            if (!used_override) {
-                // Shape{} rather than the shape being evaluated: a file-level
-                // value must not depend on which shape happened to read it first,
-                // and eval() refuses `shape.*` while in_global is set anyway.
+                if (!used_override) {
+                    // Shape{} rather than the shape being evaluated: a file-level
+                    // value must not depend on which shape happened to read it
+                    // first, and eval() refuses `shape.*` while in_global is set.
+                    const Shape empty;
+                    value = eval(decl.default_value, empty);
+                }
+            } else {
                 const Shape empty;
-                value = eval(decl.default_value, empty);
+                value = eval(konst->second->value, empty);
             }
-        } else {
-            const Shape empty;
-            value = eval(konst->second->value, empty);
+        } catch (...) {
+            // The unwind used to leave `in_global` true and `name` in
+            // `resolving` for the rest of the run, because run() returned
+            // straight afterwards and nobody noticed. Now that one bad
+            // declaration no longer ends the generation, both would poison every
+            // later shape: `shape.sx` would be refused everywhere, and a second
+            // read of this name would be reported as a cycle it is not.
+            in_global = outer_in_global;
+            resolving.erase(name);
+            unresolvable.insert(name);
+            throw;
         }
 
         in_global = outer_in_global;
@@ -268,6 +332,29 @@ struct Interpreter::State {
         globals.emplace(name, value);
         out = std::move(value);
         return true;
+    }
+
+    /**
+     * @brief resolve_global() for the file-level pre-pass, which cannot abandon
+     *
+     * The pre-pass has no shape to abandon, so an AbandonShape out of one
+     * declaration is caught here and the name is left in `unresolvable`. The
+     * next declaration is still resolved, which is what makes the source-order
+     * promise above true for a file with more than one bad default.
+     */
+    void resolve_global_or_record(const std::string& name, const SourceLoc& loc, Value& out) {
+        // Already marked while an earlier declaration was being resolved -- it
+        // was reported there, and resolve_global() would only add a second
+        // diagnostic saying the same thing at the same line.
+        if (unresolvable.find(name) != unresolvable.end()) {
+            return;
+        }
+        try {
+            (void)resolve_global(name, loc, out);
+        } catch (const AbandonShape&) {
+            abandon_requested = false;
+            unresolvable.insert(name);
+        }
     }
 
     [[nodiscard]] Value lookup_name(const QualifiedName& name,
@@ -292,9 +379,15 @@ struct Interpreter::State {
                           "'; it has sx, sy, sz, depth and index");
         }
 
-        for (size_t i = locals.size(); i-- > 0;) {
-            if (locals[i].first == name.name) {
-                return locals[i].second;
+        // Down to frame_base, never to 0: see the note on State::frame_base. And
+        // not at all while a file-level value is being resolved, because an
+        // attribute default that could see whichever rule happened to read it
+        // first would not be a file-level value at all.
+        if (!in_global) {
+            for (size_t i = locals.size(); i-- > frame_base;) {
+                if (locals[i].first == name.name) {
+                    return locals[i].second;
+                }
             }
         }
 
@@ -483,7 +576,30 @@ struct Interpreter::State {
         uint32_t children = 0;
     };
 
+    /**
+     * @brief Run one statement
+     *
+     * The switch below has no `default:` so that -Wswitch names a StmtKind that
+     * was added without a case here. A WARNING is not a guarantee: nothing in
+     * this tree sets -Werror, so a missing case builds, and the fallthrough past
+     * the switch would then be a silent no-op -- exactly the failure that the
+     * `split` and `select` arms go out of their way to reject. Two things close
+     * that:
+     *
+     *   - the static_assert below, which is a hard compile error the moment
+     *     ast.hpp's StmtNode grows an alternative, and which says what to do;
+     *   - the report past the switch, so that even a build which somehow got
+     *     past both says so at the line that asked, once per site, instead of
+     *     quietly producing a building with no floors in it.
+     */
     Flow exec(StmtId id, Shape& shape, Frame& frame) {
+        // D3 and D4 add StmtKinds. When one is added this assert fires, and the
+        // fix is to give the switch below a case for it -- not to widen the
+        // number. A statement with no case is a rule that silently does nothing.
+        static_assert(std::variant_size_v<StmtNode> == 9,
+                      "ast.hpp gained a statement kind. Add its case to State::exec() "
+                      "and then update this count.");
+
         const Stmt& stmt = file.stmt(id);
         switch (stmt_kind(stmt)) {
             case StmtKind::Block: {
@@ -562,6 +678,13 @@ struct Interpreter::State {
             case StmtKind::Discard:
                 return Flow::Discard;
         }
+        // Unreachable while every StmtKind above has a case, and reported rather
+        // than ignored for the build in which one does not. `split` and `select`
+        // already refuse to be quiet about being unimplemented; a statement kind
+        // nobody wired up at all has no better claim to silence. Evaluation
+        // continues so the rest of the rule still produces its geometry.
+        report_once(Severity::Error, stmt.loc,
+                    "this statement is not implemented in this build");
         return Flow::Continue;
     }
 
@@ -693,11 +816,20 @@ struct Interpreter::State {
         // determinism note in interpreter.hpp.
         child.seed_key =
             seed_mix2(shape.seed_key, seed_mix2(kSaltChild, child.index));
-        ++frame.children;
 
         if (!allocate_shape(child, stmt.loc)) {
+            // The child does NOT count against the parent, so a parent whose
+            // every child the cap refused is still a terminal and still emits
+            // its own geometry. Counting it would turn "the output is
+            // truncated" into "there is no output", which is the empty viewport
+            // the depth cap goes out of its way to avoid.
+            //
+            // No surviving shape's seed moves because of this: shapes_created
+            // never decreases, so once one child is refused every later one is
+            // too, and no shape that exists ever gets a different index.
             return;
         }
+        ++frame.children;
 
         if (child.depth > options.limits.max_depth) {
             if (!depth_reported) {
@@ -754,6 +886,11 @@ struct Interpreter::State {
         frame.rule = rule_id;
         frame.locals_base = locals.size();
 
+        // The callee's bindings start here, and nothing it evaluates may look
+        // below this line. Restored on both paths out of the try below.
+        const size_t outer_frame_base = frame_base;
+        frame_base = frame.locals_base;
+
         try {
             if (args.size() > rule.params.size()) {
                 fail(call_loc, "'" + rule.name + "' takes " +
@@ -793,6 +930,7 @@ struct Interpreter::State {
             locals.resize(frame.locals_base);
             abandon_requested = false;
         }
+        frame_base = outer_frame_base;
     }
 
     // ---- entry ----
@@ -824,21 +962,24 @@ struct Interpreter::State {
             return;
         }
 
-        try {
-            // Forced in declaration order so the diagnostics of a file with
-            // several bad defaults come out in source order rather than in
-            // whatever order a rule happened to read them.
-            Value ignored;
-            for (const AttrDecl& decl : file.attributes) {
-                (void)resolve_global(decl.name, decl.loc, ignored);
-            }
-            for (const ConstDecl& decl : file.constants) {
-                (void)resolve_global(decl.name, decl.loc, ignored);
-            }
-        } catch (const AbandonShape&) {
-            // A cycle or a bad default in a file-level value. Nothing can run.
-            abandon_requested = false;
-            return;
+        // Forced in declaration order so the diagnostics of a file with several
+        // bad defaults come out in source order rather than in whatever order a
+        // rule happened to read them.
+        //
+        // The catch is INSIDE the loop, per declaration. With one try around the
+        // whole loop the first bad default ended the pre-pass, so the second one
+        // was never reached and the promise of source order above was a promise
+        // about a list of length one. Worse, it returned before the start rule
+        // ran at all: a `const junk : float = 1.0 / 0.0` that no rule reads cost
+        // the entire generation and the author got zero terminals for a value
+        // nothing wanted. A declaration that fails is recorded as unresolvable
+        // and only the shapes that READ it are abandoned.
+        Value ignored;
+        for (const AttrDecl& decl : file.attributes) {
+            resolve_global_or_record(decl.name, decl.loc, ignored);
+        }
+        for (const ConstDecl& decl : file.constants) {
+            resolve_global_or_record(decl.name, decl.loc, ignored);
         }
 
         Shape root = seed;
@@ -889,6 +1030,10 @@ void Interpreter::report(Severity severity, const SourceLoc& loc, std::string me
 
 void Interpreter::report_once(Severity severity, const SourceLoc& loc, std::string message) {
     state_->report_once(severity, loc, std::move(message));
+}
+
+bool Interpreter::has_current_shape() const {
+    return !state_->in_global;
 }
 
 void Interpreter::fail_shape(const SourceLoc& loc, std::string message) {
@@ -1391,19 +1536,52 @@ Value fn_str(const FunctionArgs& context) {
     return Value::text(context.args[0].to_text());
 }
 
+/**
+ * @brief Refuse a geometry query that has no shape to query
+ *
+ * `FunctionArgs::shape` is a default-constructed Shape while an attribute
+ * default or a constant is being resolved, and every geometry query over it
+ * answers zero. Zero is a plausible number, so it does not look like a fault --
+ * it looks like an empty lot, and the building comes out wrong with nothing
+ * pointing at the declaration that asked. The interpreter already refuses
+ * `shape.sx` there for the same reason; a registered function has to ask.
+ */
+[[nodiscard]] bool fn_needs_shape(const FunctionArgs& context) {
+    if (context.interpreter.has_current_shape()) {
+        return true;
+    }
+    context.interpreter.fail_shape(
+        context.loc, "'" + std::string{context.name} +
+                         "' reads the current shape, which an attribute default or a "
+                         "constant does not have");
+    return false;
+}
+
 Value fn_geometry_area(const FunctionArgs& context) {
+    if (!fn_needs_shape(context)) {
+        return Value::number(0.0);
+    }
     return Value::number(geometry_area(context.shape.geometry));
 }
 
 Value fn_geometry_volume(const FunctionArgs& context) {
+    if (!fn_needs_shape(context)) {
+        return Value::number(0.0);
+    }
     return Value::number(geometry_volume(context.shape.geometry));
 }
 
 Value fn_geometry_face_count(const FunctionArgs& context) {
+    if (!fn_needs_shape(context)) {
+        return Value::number(0.0);
+    }
     return Value::number(static_cast<double>(context.shape.geometry.faces.size()));
 }
 
 Value fn_geometry_face_area(const FunctionArgs& context) {
+    if (!fn_needs_shape(context)) {
+        return Value::number(0.0);
+    }
     double raw = 0.0;
     if (!fn_number(context, 0, raw)) {
         return Value::number(0.0);

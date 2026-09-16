@@ -201,6 +201,43 @@ namespace fs = std::filesystem;
     throw py::error_already_set();
 }
 
+/**
+ * @brief Raise StratumError carrying the numbers the refused export DID produce
+ *
+ * A destination that refused the write has to raise -- see module.hpp -- but
+ * throwing the SceneExportStats away with it costs the caller six of its eight
+ * counts. scene_export.hpp is explicit that a PARTIALLY written export still
+ * counts what reached disk: `chunks`, `objects`, `vertices`, `triangles`,
+ * `files` and `written_files` describe the half of a city that was written, and
+ * a headless job that stopped halfway has nothing else to report with. Text in
+ * a message is not that: a script cannot act on it without parsing English.
+ *
+ * So the whole stats object rides on the exception INSTANCE as `.stats`, and the
+ * message stays the summary it already was. `except stratum.StratumError as e:
+ * e.stats.written_files` is then a real recovery path.
+ *
+ * Built by hand rather than by throwing StratumError, because pybind11's
+ * exception translator constructs the Python instance itself and never hands it
+ * back, so there is no instance to attach anything to.
+ *
+ * The type is looked up on the module at raise time rather than cached: a
+ * `py::object` with static storage duration is decref'd after the interpreter
+ * that owns it has been finalised, which is a crash during exit rather than a
+ * failure anybody can read. This is the error path, so one dict lookup in
+ * sys.modules costs nothing.
+ */
+[[noreturn]] void raise_export_refused(const std::string& message,
+                                       const osm::SceneExportStats& stats) {
+    py::object error_type =
+        py::module_::import(stratum::python::kModuleName).attr("StratumError");
+    py::object error = error_type(message);
+    // COPY, explicitly: `stats` is a local of the caller and is gone by the time
+    // the script reads the attribute off the exception it caught.
+    error.attr("stats") = py::cast(stats, py::return_value_policy::copy);
+    PyErr_SetObject(error_type.ptr(), error.ptr());
+    throw py::error_already_set();
+}
+
 /// Turn a negative Python index sentinel into LayerTree's kAppend.
 ///
 /// kAppend is `size_t(-1)`, which as a Python default argument renders as
@@ -226,11 +263,14 @@ namespace fs = std::filesystem;
  * on a choice the script never made.
  */
 [[nodiscard]] scene::AttributeValue value_from_python(const py::handle& value) {
-    if (py::isinstance<py::float_>(value) || py::isinstance<py::int_>(value)) {
-        return scene::AttributeValue::from_double(value.cast<double>());
-    }
+    // bool BEFORE int/float, and not the other way round. `isinstance(True, int)`
+    // is true in Python, so the number test matches a bool and the value is
+    // stored as the double 1.0. The first run of this file caught exactly that.
     if (py::isinstance<py::bool_>(value)) {
         return scene::AttributeValue::from_bool(value.cast<bool>());
+    }
+    if (py::isinstance<py::float_>(value) || py::isinstance<py::int_>(value)) {
+        return scene::AttributeValue::from_double(value.cast<double>());
     }
     if (py::isinstance<py::str>(value)) {
         return scene::AttributeValue::from_string(value.cast<std::string>());
@@ -382,7 +422,17 @@ void register_errors(py::module_& m) {
     // register_exception installs the translator as well as the type, so a
     // StratumError thrown from anywhere inside a bound call -- including from
     // J3/J4 code that is not itself a lambda in this file -- arrives typed.
-    py::register_exception<StratumError>(m, "StratumError", PyExc_RuntimeError);
+    py::exception<StratumError> error = py::register_exception<StratumError>(
+        m, "StratumError", PyExc_RuntimeError);
+
+    // register_exception takes no docstring, and a type with none is a type that
+    // `help()` and every doc generator report as undocumented. Set it by hand
+    // rather than leaving the one exception a script is told to catch as the one
+    // name in the module with nothing to say about itself.
+    error.attr("__doc__") =
+        "Every refusal Stratum reports. Derives from RuntimeError, so an existing "
+        "`except RuntimeError` catches it. A refused export also carries the "
+        "SceneExportStats for whatever it managed to write, as `.stats`.";
 }
 
 // ============================================================================
@@ -726,7 +776,31 @@ void register_scene(py::module_& m) {
         .def_readonly("own_visible", &scene::Layer::own_visible)
         .def_readonly("own_locked", &scene::Layer::own_locked)
         .def_readonly("own_colour", &scene::Layer::own_colour)
-        .def_readonly("own_transform", &scene::Layer::own_transform)
+        // A COPY, and NOT `def_readonly`, for the reason module.hpp gives about
+        // OwnedSceneObject::mesh. pybind11 gives a data member of BOUND CLASS
+        // type `return_value_policy::reference_internal`: the read hands back a
+        // live Python LayerTransform wrapping THIS snapshot's own storage, and
+        // pybind11 does not carry constness across, so
+        //
+        //     own = snapshot.own_transform
+        //     own.translation = (99, 99, 99)
+        //
+        // rewrote the snapshot that the class docstring calls read-only. Worse,
+        // a member borrow only reads correctly while its keep_alive holds, and
+        // LayerTransform is three dvec3s of plain data: a lost keep_alive reads
+        // freed bytes and still returns the right numbers, so no test of the
+        // VALUE can ever catch it. Handing out a copy removes both problems at
+        // once -- there is no borrow to lose a leash on, and there is nothing
+        // to write through. The round trip a script actually wants still works:
+        // read the copy, edit it, pass it to Document.set_layer_transform().
+        //
+        // A LayerTransform is 72 bytes of POD. The copy is not worth a property
+        // that costs O(n), so unlike `SceneObject.mesh()` this one stays a
+        // property rather than becoming a method.
+        .def_property_readonly("own_transform",
+                               [](const scene::Layer& l) { return l.own_transform; },
+                               "A COPY of this snapshot's transform. Edit it and pass it to "
+                               "Document.set_layer_transform() to apply it.")
         .def("__repr__", [](const scene::Layer& l) {
             return "<stratum.Layer " + std::to_string(l.id) + " "
                    + scene::layer_kind_name(l.kind) + " '" + l.name + "'>";
@@ -1040,10 +1114,27 @@ later restoring state that was never current.)doc")
                  d.history().begin_transaction(label);
              },
              py::arg("label"), "Group the edits until commit into one undo step. Nestable.")
+        // Both raise when nothing is open. CommandStack logs a warning and
+        // returns, which is right for the editor -- a stray commit on mouse-up
+        // must not take the application down -- and wrong here. A script's
+        // transactions are balanced by hand, usually in a try/finally, and an
+        // unbalanced pair means the edits the author thought were grouped are
+        // not. The C++ symptom is one line in a log nobody reads; the Python
+        // symptom is an undo that takes back a third of a change.
         .def("commit_transaction",
-             [](scene::Document& d) { d.history().commit_transaction(); })
+             [](scene::Document& d) {
+                 if (!d.history().in_transaction()) {
+                     throw StratumError("commit_transaction: no transaction is open");
+                 }
+                 d.history().commit_transaction();
+             })
         .def("abort_transaction",
-             [](scene::Document& d) { d.history().abort_transaction(); },
+             [](scene::Document& d) {
+                 if (!d.history().in_transaction()) {
+                     throw StratumError("abort_transaction: no transaction is open");
+                 }
+                 d.history().abort_transaction();
+             },
              "Revert whatever the innermost group applied, in reverse order.")
         .def_property_readonly("in_transaction",
                                [](const scene::Document& d) { return d.history().in_transaction(); })
@@ -1233,7 +1324,16 @@ void register_road(py::module_& m) {
     py::class_<road::BlockExtraction>(m, "BlockExtraction")
         .def_property_readonly("block_count",
                                [](const road::BlockExtraction& e) { return e.blocks.size(); })
-        .def_readonly("stats", &road::BlockExtraction::stats)
+        // A COPY. See the note on Layer.own_transform: `def_readonly` on a
+        // member of BOUND CLASS type is a borrow into the container with a
+        // keep_alive holding it up, and BlockStats is twelve counters of plain
+        // data -- freed POD bytes read back correctly, so a lost keep_alive is
+        // invisible to every assertion about the VALUE and shows up later as a
+        // use-after-free with no diagnostic. 96 bytes copied per read removes
+        // the whole question.
+        .def_property_readonly("stats",
+                               [](const road::BlockExtraction& e) { return e.stats; },
+                               "A COPY of the traversal counts, independent of this extraction.")
         .def("blocks", [](const road::BlockExtraction& e) { return e.blocks; },
              "Snapshot copy of every block. O(n) per call.")
         .def(
@@ -1294,7 +1394,10 @@ void register_road(py::module_& m) {
     py::class_<road::LotSubdivision>(m, "LotSubdivision")
         .def_property_readonly("lot_count",
                                [](const road::LotSubdivision& s) { return s.lots.size(); })
-        .def_readonly("stats", &road::LotSubdivision::stats)
+        // A COPY, for the same reason as BlockExtraction.stats above.
+        .def_property_readonly("stats",
+                               [](const road::LotSubdivision& s) { return s.stats; },
+                               "A COPY of the subdivision counts, independent of this subdivision.")
         .def("lots", [](const road::LotSubdivision& s) { return s.lots; },
              "Snapshot copy of every lot. O(n) per call.");
 
@@ -1389,7 +1492,7 @@ void register_export(py::module_& m) {
             py::gil_scoped_release release;
             return osm::MeshBuilder::build_area_mesh(area);
         },
-        py::arg("area"));
+        py::arg("area"), "Triangulate a landuse or natural area into a flat mesh Python owns.");
 
     // See module.hpp: this is OwnedSceneObject, and the Python name is
     // SceneObject because it is the only scene object Python ever sees. The
@@ -1407,7 +1510,11 @@ Owns its mesh. The constructor COPIES the mesh you pass, so
 
 is correct. The C++ export type holds a borrowed mesh pointer; this one does
 not, because a Python script has no way to guarantee the lifetime that borrow
-needs.)doc")
+needs.
+
+`mesh()` hands back a COPY, so the geometry really is fixed at construction.
+Use `triangle_count` and `vertex_count` when all you want is the size; they read
+the owned mesh in place and copy nothing.)doc")
         .def(py::init([](const stratum::Mesh& mesh, osm::SceneObjectKind kind, std::string name,
                          int64_t osm_id, std::string layer) {
                  OwnedSceneObject obj;
@@ -1421,10 +1528,30 @@ needs.)doc")
              py::arg("mesh"), py::arg("kind") = osm::SceneObjectKind::Unknown,
              py::arg("name") = std::string{}, py::arg("osm_id") = 0,
              py::arg("layer") = std::string{})
-        // Read-only: reassignment would let a script hold the Mesh object
-        // returned by `obj.mesh` and then see it change content under it. The
-        // geometry is fixed at construction; the labels are not.
-        .def_readonly("mesh", &OwnedSceneObject::mesh)
+        // A METHOD returning a COPY, and both halves of that are deliberate.
+        //
+        // `def_readonly` was the obvious thing and is wrong here. pybind11 gives
+        // a data member `return_value_policy::reference_internal`, which stops a
+        // script REBINDING the field but hands back a live Python Mesh wrapping
+        // the object's own storage -- and pybind11 does not carry constness into
+        // Python, so `obj.mesh.clear()` emptied the mesh the exporter was about
+        // to write. The first run of the probe suite did exactly that: ten
+        // triangles before, zero after, no error anywhere, and an export that
+        // silently produced an empty file. "The geometry is fixed at
+        // construction" has to be enforced, not asserted in a comment.
+        //
+        // A copy costs one Mesh per read, which is why it is a method and not a
+        // property: module.hpp's naming rule is that a read costing O(n) must
+        // look like it costs O(n), or `for o in objs: o.mesh.triangle_count`
+        // becomes a hidden deep copy per iteration. The two counts below are the
+        // cheap answers to the question that loop was really asking.
+        .def("mesh", [](const OwnedSceneObject& o) { return o.mesh; },
+             "A COPY of the owned mesh. O(n) per call -- mutating it cannot reach the "
+             "SceneObject, and `triangle_count` answers the common question for free.")
+        .def_property_readonly("vertex_count",
+                               [](const OwnedSceneObject& o) { return o.mesh.vertices.size(); })
+        .def_property_readonly("triangle_count",
+                               [](const OwnedSceneObject& o) { return o.mesh.indices.size() / 3; })
         .def_readwrite("kind", &OwnedSceneObject::kind)
         .def_readwrite("name", &OwnedSceneObject::name)
         .def_readwrite("osm_id", &OwnedSceneObject::osm_id)
@@ -1544,15 +1671,74 @@ needs.)doc")
                 py::gil_scoped_release release;
                 stats = osm::export_scene(handles, out_dir, config);
             }
+
+            // scene_export.hpp says "a completely failed export comes back with
+            // files == 0 rather than throwing". That is the right C++ contract
+            // -- a partial export is still worth its stats -- and the wrong
+            // Python one. A headless run that cannot write its output directory
+            // would otherwise get a stats object full of zeroes, no exception
+            // and exit status 0, which is precisely the silent failure this
+            // module exists to prevent.
+            //
+            // unwritten_triangles is the unambiguous signal and the exporter
+            // documents it as such: non-zero ONLY when a chunk's file could not
+            // be opened. Geometry the exporter rejected lands in
+            // dropped_triangles instead and is NOT a destination failure, so it
+            // does not raise. An export of nothing writes nothing and is not an
+            // error either -- unwritten_triangles stays 0 -- which keeps
+            // `export_scene([], d)` the no-op it reads as.
+            //
+            // The stats go WITH the exception rather than being lost with it: a
+            // half-written export is exactly the case the C++ contract was
+            // shaped for, and "which files did I manage to write" is not
+            // answerable from a sentence. See raise_export_refused().
+            if (stats.unwritten_triangles > 0) {
+                raise_export_refused("export_scene: could not write "
+                                         + std::to_string(stats.unwritten_triangles)
+                                         + " triangles into " + out_dir.string() + "; wrote "
+                                         + std::to_string(stats.files)
+                                         + " files. The destination refused the write -- check "
+                                           "permissions, free space, and that the path is not a "
+                                           "file. The full SceneExportStats is on this "
+                                           "exception as `.stats`.",
+                                     stats);
+            }
             return stats;
         },
         py::arg("objects"), py::arg("out_dir"), py::arg("config") = osm::SceneExportConfig{},
-        "Write every object to out_dir, chunked by config.chunk_size. Creates out_dir.");
+        R"doc(Write every object to out_dir, chunked by config.chunk_size. Creates out_dir.
+
+Raises StratumError when the destination refused any of the geometry -- see
+SceneExportStats.unwritten_triangles. Geometry the exporter itself rejected is
+reported in stats.dropped_triangles and does NOT raise: that is a complaint
+about the input, and the caller is given the numbers to judge it by.
+
+The refusal carries the numbers too. A partial export raises, and the
+SceneExportStats for everything that DID reach disk is on the exception as
+`.stats`, so
+
+    try:
+        stratum.export_scene(objects, out_dir)
+    except stratum.StratumError as exc:
+        print(exc.stats.files, "files written before the refusal")
+        print(exc.stats.written_files)
+
+still reports what the job managed to do.)doc");
 
     m.def(
         "export_scene_object",
         [](const OwnedSceneObject& object, const fs::path& out_path,
            const osm::SceneExportConfig& config) {
+            // Separated from the write failure below on purpose. C++ returns one
+            // bool for "empty mesh" and "could not open the file", and reporting
+            // both as "could not write <path>" sends a script author to check
+            // permissions on a path that was never the problem.
+            if (object.mesh.indices.size() < 3) {
+                throw StratumError("export_scene_object: '" + object.name
+                                   + "' holds no triangles, so there is nothing to write to "
+                                   + out_path.string());
+            }
+
             osm::SceneObject handle;
             handle.mesh = &object.mesh;
             handle.kind = object.kind;
@@ -1567,12 +1753,14 @@ needs.)doc")
                 ok = osm::export_scene_object(handle, out_path, config);
             }
             if (!ok) {
-                throw StratumError("export_scene_object: could not write "
-                                   + out_path.string());
+                throw StratumError("export_scene_object: could not write " + out_path.string()
+                                   + "; check permissions, free space, and that the parent "
+                                     "path is not a file.");
             }
         },
         py::arg("object"), py::arg("out_path"), py::arg("config") = osm::SceneExportConfig{},
-        "Write one object to one named file, unchunked.");
+        "Write one object to one named file, unchunked. Raises StratumError when the object "
+        "has no triangles or the file could not be written.");
 }
 
 // ============================================================================
@@ -1650,14 +1838,24 @@ void register_module(py::module_& m) {
     m.doc() =
         "Stratum: OpenStreetMap to game-ready 3D city, driven from Python with no window open.";
 
-#ifdef STRATUM_VERSION_STRING
-    m.attr("__version__") = STRATUM_VERSION_STRING;
-#else
-    // Not fatal, and deliberately not a build error: the version define is a
+    // `version_from_build` exists so that a TEST of `__version__` has something
+    // to assert in EITHER build. Without it the only honest check is "it is a
+    // str, and if it is not the sentinel then it is dotted", whose second half
+    // is dead code in every tree where CMake has not passed the define -- which
+    // is every tree today. The flag makes both branches assertable: a build that
+    // supplied a version must not report the sentinel, and a build that did not
+    // must report it in exactly the documented words and nothing else.
+    //
+    // A missing define is deliberately not a build error: the version is a
     // convenience the CMake side may or may not pass, and a module that refuses
     // to build over its own version string would be worse than one that says it
     // does not know.
+#ifdef STRATUM_VERSION_STRING
+    m.attr("__version__") = STRATUM_VERSION_STRING;
+    m.attr("version_from_build") = true;
+#else
     m.attr("__version__") = "0.0.0+unknown";
+    m.attr("version_from_build") = false;
 #endif
 
     // Order matters. pybind11 resolves a type in a signature at def() time, so a
