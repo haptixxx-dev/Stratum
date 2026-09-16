@@ -62,6 +62,20 @@ void report_failure(const char* file, int line, const char* expr, const std::str
     std::cout.flush();
 }
 
+namespace {
+
+/// Registered teardowns, run in reverse at the end of run_all().
+std::vector<void (*)()>& teardowns() {
+    static std::vector<void (*)()> t;
+    return t;
+}
+
+} // namespace
+
+void register_teardown(void (*fn)()) {
+    if (fn != nullptr) teardowns().push_back(fn);
+}
+
 int run_all(int argc, char** argv) {
     const char* suite_filter = (argc > 1) ? argv[1] : nullptr;
 
@@ -120,6 +134,13 @@ int run_all(int argc, char** argv) {
                       << (g_current_failures == 1 ? " check)" : " checks)") << '\n';
         }
     }
+
+    // Before the summary, and before main() returns: see register_teardown().
+    // Reverse order, so a resource registered after its dependency goes first.
+    for (auto it = teardowns().rbegin(); it != teardowns().rend(); ++it) {
+        (*it)();
+    }
+    teardowns().clear();
 
     std::cout << '\n' << passed << " passed, " << failed << " failed";
     if (g_total_failures > 0) {

@@ -114,6 +114,26 @@ void report_failure(const char* file, int line, const char* expr, const std::str
 int run_all(int argc, char** argv);
 
 /**
+ * @brief Register a function to run after the last test, before run_all returns
+ *
+ * For state that must be torn down while main() is still on the stack.
+ *
+ * The GPU suites are why this exists. Each kept its device in a function-local
+ * static and let the destructor release it, which runs during exit() -- after
+ * main() has returned, in an order nothing controls, and potentially after the
+ * Vulkan loader and its ICD have already unloaded. All 123 tests passed and the
+ * process then died in VULKAN_Wait inside VULKAN_DestroyDevice, called from a
+ * static destructor. Destroying a GPU device at static-destruction time is
+ * simply not safe, however carefully the destructor is written.
+ *
+ * Teardowns run in REVERSE registration order, so a resource registered after
+ * the thing it depends on is released first.
+ *
+ * @param fn Function to run. Must not throw and must tolerate running once.
+ */
+void register_teardown(void (*fn)());
+
+/**
  * @brief Static-initialisation helper that registers one test case
  *
  * Not used directly; the TEST macro instantiates it.

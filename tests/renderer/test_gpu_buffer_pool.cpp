@@ -82,39 +82,30 @@ struct DeviceHolder {
     bool attempted = false;
     bool video_ready = false;
 
-    ~DeviceHolder() {
-        if (device != nullptr) {
-            SDL_DestroyGPUDevice(device);
-            device = nullptr;
-        }
-            // SDL is NOT shut down here, and that is deliberate.
-            //
-            // Four GPU suites each keep their own function-local static
-            // DeviceHolder, so at exit() four destructors run in reverse
-            // construction order. Each owns its own SDL_GPUDevice, which is
-            // fine -- but SDL_Quit() is PROGRAM-global. The first holder to
-            // destruct unloaded the Vulkan backend out from under the other
-            // three, and the next SDL_DestroyGPUDevice() call then jumped
-            // through a driver that was no longer mapped:
-            //
-            //     Thread 1 received signal SIGSEGV
-            //     #1  VULKAN_DestroyDevice ()
-            //     #2  DeviceHolder::~DeviceHolder ()
-            //     #4  exit ()
-            //
-            // All 123 GPU tests passed first; the crash was purely in teardown,
-            // which is why it never showed up as a failing test. It also never
-            // showed up in CI at all, because these suites skip themselves with
-            // no GPU present and CI has none.
-            //
-            // Letting the process exit without SDL_Quit() is safe: the OS
-            // reclaims the device, and nothing runs after this that needs SDL.
-    }
+    // Deliberately empty. The device is released by a teardown registered with
+    // the test framework, which runs at the end of run_all() while main() is
+    // still on the stack. Doing it here instead means doing it during static
+    // destruction, after main() has returned and possibly after the Vulkan
+    // loader has unloaded -- which segfaulted in VULKAN_Wait with all 123 tests
+    // already passed. See register_teardown() in tests/framework.hpp.
+    ~DeviceHolder() = default;
 };
+
+/// Release the shared device. Registered with the framework, not called from a
+/// destructor; see the note on ~DeviceHolder above.
+void release_shared_device();
 
 DeviceHolder& holder() {
     static DeviceHolder h;
     return h;
+}
+
+void release_shared_device() {
+    DeviceHolder& h = holder();
+    if (h.device != nullptr) {
+        SDL_DestroyGPUDevice(h.device);
+        h.device = nullptr;
+    }
 }
 
 /**
@@ -137,6 +128,13 @@ SDL_GPUDevice* device() {
     h.video_ready = true;
 
     h.device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, false, nullptr);
+
+
+    if (h.device != nullptr) {
+
+        ::stratum::test::register_teardown(&release_shared_device);
+
+    }
     if (h.device == nullptr) {
         std::fprintf(stderr, "[GPUBufferPool] SKIPPED: no SDL_GPU device: %s\n", SDL_GetError());
     }
