@@ -203,6 +203,9 @@ add_library(stratum_core STATIC
     src/procgen/rules/parser.cpp
     src/procgen/rules/shape.cpp
     src/procgen/rules/interpreter.cpp
+    src/procgen/rules/op_split.cpp
+    src/procgen/rules/op_comp.cpp
+    src/procgen/rules/op_control.cpp
     src/procgen/terrain_generator.cpp
     src/procgen/terrain_carve.cpp
     src/procgen/terrain_mesh_builder.cpp
