@@ -121,6 +121,7 @@ add_library(stratum_core STATIC
     src/osm/coordinates.cpp
     src/osm/mesh_builder.cpp
     src/osm/quadtree.cpp
+    src/osm/scene_export.cpp
     src/osm/attribute_palette.cpp
     src/osm/building_collision.cpp
 
@@ -137,6 +138,8 @@ add_library(stratum_core STATIC
     src/osm/road/junction_curb.cpp
     src/osm/road/junction_special.cpp
     src/osm/road/junction_builder.cpp
+    src/osm/road/blocks.cpp
+    src/osm/road/graph_edit.cpp
 
     # P5 detail features
     src/osm/road/sidewalk_dedup.cpp
@@ -176,9 +179,12 @@ add_library(stratum_core STATIC
     src/scene/attributes.cpp
     src/scene/selection.cpp
     src/scene/georeference.cpp
+    src/scene/document.cpp
+    src/scene/map_layer.cpp
 
     # Procedural Generation
     src/procgen/noise.cpp
+    src/procgen/heightmap_io.cpp
     src/procgen/terrain_generator.cpp
     src/procgen/terrain_carve.cpp
     src/procgen/terrain_mesh_builder.cpp
@@ -222,6 +228,11 @@ target_link_libraries(stratum_core PUBLIC
 
     # Threading
     enkiTS
+
+    # Images. Q2 (#13) decided stratum_core may read and write pixel data, so
+    # that heightmap import and, later, facade texturing and atlas packing all
+    # work with no window open. SDL, ImGui and the renderer stay excluded.
+    stb
 
     # Data & Utils
     spdlog::spdlog

@@ -84,6 +84,10 @@ set(STRATUM_TEST_SOURCES
 
     # roof:shape=* reaching geometry for all five roof families (E1).
     osm/test_roof_shapes.cpp
+    osm/test_scene_export.cpp
+    road/test_blocks.cpp
+    road/test_graph_edit.cpp
+    procgen/test_heightmap_io.cpp
 
     # Attribute-mode colour tables: totality, determinism and separation.
     osm/test_attribute_palette.cpp
@@ -100,6 +104,8 @@ set(STRATUM_TEST_SOURCES
     scene/test_attributes.cpp
     scene/test_selection.cpp
     scene/test_georeference.cpp
+    scene/test_document.cpp
+    scene/test_map_layer.cpp
 )
 
 # Suite names registered with ctest so each can be run and reported separately.
@@ -110,6 +116,12 @@ set(STRATUM_TEST_SUITES
     Attributes
     Selection
     Georeference
+    Document
+    MapLayer
+    Blocks
+    GraphEdit
+    HeightmapIO
+    SceneExport
     WaySemantics
     RoadGraph
     Centerline
