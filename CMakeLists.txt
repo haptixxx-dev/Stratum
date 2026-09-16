@@ -139,6 +139,10 @@ add_library(stratum_core STATIC
     src/osm/road/junction_special.cpp
     src/osm/road/junction_builder.cpp
     src/osm/road/blocks.cpp
+    src/osm/road/lots.cpp
+    src/osm/road/lot_edges.cpp
+    src/osm/road/zoning.cpp
+    src/osm/road/segment_attrs.cpp
     src/osm/road/graph_edit.cpp
 
     # P5 detail features
@@ -185,6 +189,11 @@ add_library(stratum_core STATIC
     # Procedural Generation
     src/procgen/noise.cpp
     src/procgen/heightmap_io.cpp
+
+    # The rule language. D1 is the lexer, AST and parser; the interpreter
+    # (D2-D6) lands alongside them here.
+    src/procgen/rules/lexer.cpp
+    src/procgen/rules/parser.cpp
     src/procgen/terrain_generator.cpp
     src/procgen/terrain_carve.cpp
     src/procgen/terrain_mesh_builder.cpp
