@@ -62,7 +62,6 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -176,9 +175,47 @@ constexpr const char* kDefaultNamePrefix = "scene";
     return out;
 }
 
+/**
+ * @brief Reduce a name to something that can only ever be ONE file inside a directory
+ *
+ * sanitize_token() does a different job: it makes a string safe as an OBJ token, so
+ * it replaces whitespace and control bytes and passes '/', '\\' and '.' straight
+ * through. A stem is concatenated into `out_dir / (stem + ext)`, and those are
+ * exactly the bytes that let it leave the directory it was supposed to name.
+ *
+ * Both halves of that were reachable from the editor's text box, because
+ * SceneExportConfig::name_prefix is a config field:
+ *
+ *  - "../escaped" wrote `out_dir/../escaped.obj`, i.e. one level ABOVE out_dir,
+ *    while reporting success and listing a path the caller never asked for.
+ *  - "sub/thing" named a subdirectory ensure_directory() never created, so every
+ *    open failed and the export returned files = 0 having written nothing.
+ *
+ * ':' goes too: on Windows "c:name" is a drive-relative path and not a file name.
+ *
+ * @param in Raw stem
+ * @return @p in with every separator mapped to '_', and every LEADING '.' mapped to
+ *         '_' so neither "." nor ".." can survive as a path component. A '.' anywhere
+ *         else is kept, because "my.export" is a perfectly good stem and stays one
+ *         file inside out_dir.
+ */
+[[nodiscard]] std::string sanitize_path_stem(std::string_view in) {
+    std::string out = sanitize_token(in);
+    for (char& c : out) {
+        if (c == '/' || c == '\\' || c == ':') {
+            c = '_';
+        }
+    }
+    for (char& c : out) {
+        if (c != '.') break;
+        c = '_';
+    }
+    return out;
+}
+
 /// SceneExportConfig::name_prefix, or "scene" when it is empty or all whitespace
 [[nodiscard]] std::string effective_prefix(const SceneExportConfig& cfg) {
-    const std::string token = sanitize_token(cfg.name_prefix);
+    const std::string token = sanitize_path_stem(cfg.name_prefix);
     const bool usable = std::any_of(token.begin(), token.end(),
                                     [](char c) { return c != '_'; });
     return usable ? token : std::string{ kDefaultNamePrefix };
@@ -319,16 +356,107 @@ struct ChunkMesh {
     return (static_cast<uint64_t>(object_index) << 32) | static_cast<uint64_t>(vertex);
 }
 
-/// Cell a world-space point falls in. Everything lands in (0, 0) when unchunked.
-[[nodiscard]] ChunkKey cell_of(const glm::vec3& point, float chunk_size) {
+/**
+ * @brief Lowest and highest grid index a ChunkKey can hold
+ *
+ * Spelled as doubles because the range test below is done in double, before the
+ * cast. Both bounds are exactly representable there, so the test is exact rather
+ * than an approximation that lets a value one off the end through.
+ */
+constexpr double kCellIndexMin = -2147483648.0;   // INT32_MIN
+constexpr double kCellIndexMax = 2147483647.0;    // INT32_MAX
+
+/**
+ * @brief One axis of the grid index, refusing anything int32_t cannot hold
+ *
+ * `static_cast<int32_t>(std::floor(coord / size))` is UNDEFINED for every quotient
+ * outside the int32 range, and on x86 it yields INT32_MIN. So a coordinate of 1e20,
+ * or an ordinary coordinate with a very small chunk_size, used to collapse into the
+ * single cell (INT32_MIN, INT32_MIN): two unrelated regions merged into one file,
+ * and every triangle in it was in a chunk whose name claimed somewhere else.
+ *
+ * A finite centroid is NOT enough to prevent that, which is why this test is here
+ * and not folded into the isfinite() guard in accumulate_object(). The thing that
+ * has to fit is the QUOTIENT, and it depends on chunk_size just as much as on the
+ * coordinate -- 2e7 metres of raw Mercator (what wgs84_to_local() returns when
+ * set_origin() was never called) against a 0.005 m cell overflows from two values
+ * that are each perfectly ordinary.
+ *
+ * @param coord World coordinate on this axis
+ * @param size  Cell size, already known to be greater than 0
+ * @param out   Grid index, written only when it is representable
+ * @return false when the quotient does not fit
+ */
+[[nodiscard]] bool cell_index(double coord, double size, int32_t& out) {
+    const double cell = std::floor(coord / size);
+    // Written as a positive test on purpose: a NaN quotient compares false against
+    // everything, so this form rejects it here instead of letting it reach the cast.
+    if (!(cell >= kCellIndexMin && cell <= kCellIndexMax)) {
+        return false;
+    }
+    out = static_cast<int32_t>(cell);
+    return true;
+}
+
+/**
+ * @brief Cell a world-space point falls in. Everything lands in (0, 0) when unchunked.
+ *
+ * @param point      World-space centroid
+ * @param chunk_size Cell size; 0 or less puts everything in one chunk
+ * @param out        Cell, written only when the point can be indexed
+ * @return false when the point cannot be indexed on this grid. The caller must then
+ *         DROP and COUNT the triangle rather than write it somewhere arbitrary:
+ *         "every triangle lands in the chunk its name claims" can only stay true for
+ *         every input if the assignment is allowed to refuse one.
+ */
+[[nodiscard]] bool cell_of(const glm::vec3& point, float chunk_size, ChunkKey& out) {
     if (!(chunk_size > 0.0f)) {
-        return ChunkKey{ 0, 0 };
+        out = ChunkKey{ 0, 0 };
+        return true;
     }
     const double size = static_cast<double>(chunk_size);
-    return ChunkKey{
-        static_cast<int32_t>(std::floor(static_cast<double>(point.x) / size)),
-        static_cast<int32_t>(std::floor(static_cast<double>(point.z) / size))
+    return cell_index(static_cast<double>(point.x), size, out.x)
+        && cell_index(static_cast<double>(point.z), size, out.z);
+}
+
+/**
+ * @brief A copy of @p v with every non-finite component replaced
+ *
+ * The centroid guard in accumulate_object() rejects a triangle whose POSITION is
+ * non-finite, and that is ALL it rejects. A vertex whose position is finite but
+ * whose normal, uv, tangent or colour holds a NaN sailed straight past it, and both
+ * writers then emitted it verbatim: the OBJ got `vt nan` and `vn nan` lines that
+ * strict importers refuse, and the glTF `.bin` got NaN floats, which the glTF
+ * validator reports as ACCESSOR_INVALID_FLOAT in NORMAL, TEXCOORD_0, COLOR_0 and
+ * TANGENT alike. One bad vertex cost a whole file its validity.
+ *
+ * road_export.cpp scrubs per component for exactly this reason before handing
+ * vertices to Draco, and documents the same hole. This is that rule applied at the
+ * one point BOTH writers share -- the moment a vertex is copied into the chunk --
+ * rather than twice, once in each writer, where the two copies could disagree about
+ * what they emitted for the same input vertex.
+ *
+ * The position is scrubbed too, although the centroid guard means a non-finite one
+ * cannot reach here: a partial scrub would make the function's name a lie, and the
+ * guard is upstream code this one should not have to assume anything about.
+ */
+[[nodiscard]] Vertex scrubbed_vertex(const Vertex& v) {
+    Vertex out = v;
+    const auto fix = [](float& value) {
+        if (!std::isfinite(value)) value = 0.0f;
     };
+    fix(out.position.x); fix(out.position.y); fix(out.position.z);
+    fix(out.normal.x);   fix(out.normal.y);   fix(out.normal.z);
+    fix(out.uv.x);       fix(out.uv.y);
+    fix(out.color.r);    fix(out.color.g);    fix(out.color.b);    fix(out.color.a);
+    fix(out.tangent.x);  fix(out.tangent.y);  fix(out.tangent.z);  fix(out.tangent.w);
+    // A zero normal is not a normal, and after a scrub it is zero exactly when every
+    // component had to go. Nothing else here has a meaningful identity to fall back
+    // on; this one does, and road_export.cpp picks the same one.
+    if (out.normal.x == 0.0f && out.normal.y == 0.0f && out.normal.z == 0.0f) {
+        out.normal = { 0.0f, 1.0f, 0.0f };
+    }
+    return out;
 }
 
 /**
@@ -414,8 +542,18 @@ size_t accumulate_object(ChunkMap& chunks, const SceneObject& object, uint32_t o
             continue;
         }
 
+        // A finite centroid can still produce a grid index int32_t cannot hold; see
+        // cell_of(). Such a triangle is dropped and counted exactly like a
+        // non-finite one, because the alternative is writing it into a chunk whose
+        // name claims a different part of the world.
+        ChunkKey cell;
+        if (!cell_of(centroid, chunk_size, cell)) {
+            ++dropped;
+            continue;
+        }
+
         const uint32_t material = tri_material[t];
-        ChunkAccum& chunk = chunks[cell_of(centroid, chunk_size)];
+        ChunkAccum& chunk = chunks[cell];
         std::vector<uint32_t>& target = chunk.by_group[GroupKey{ object_index, material }];
 
         for (const uint32_t vi : corner) {
@@ -423,7 +561,10 @@ size_t accumulate_object(ChunkMap& chunks, const SceneObject& object, uint32_t o
             const auto [it, inserted] =
                 chunk.vertex_map.emplace(vertex_key, static_cast<uint32_t>(chunk.vertices.size()));
             if (inserted) {
-                chunk.vertices.push_back(mesh.vertices[vi]);
+                // Scrubbed once, here, rather than in each writer: this is the only
+                // point both of them share, so it is the only place the two cannot
+                // disagree about what they wrote for one input vertex.
+                chunk.vertices.push_back(scrubbed_vertex(mesh.vertices[vi]));
             }
             target.push_back(it->second);
         }
@@ -725,9 +866,12 @@ private:
 
         const uint32_t owner_index =
             r < chunk.range_object.size() ? chunk.range_object[r] : 0u;
+        // Named once and reused by both the `o` record and the `g` line below, which
+        // are required to agree: a reader keys the group back to its object by this
+        // string, so two independent spellings of it are two chances to drift.
+        const SceneObject& owner = range_owner(objects, chunk, r);
+        const std::string record = object_record_name(owner, owner_index, prefix);
         if (!has_open || owner_index != open_object) {
-            const SceneObject& owner = range_owner(objects, chunk, r);
-            const std::string record = object_record_name(owner, owner_index, prefix);
             out.put(obj_object_block(owner, owner_index, record, cfg));
             has_open = true;
             open_object = owner_index;
@@ -738,8 +882,8 @@ private:
         // Unbounded for the same reason the header lines are: this one carries both
         // the material prefix, whose documented job is to namespace materials into
         // another project, and the frozen material name.
-        out.put("g " + object_record_name(range_owner(objects, chunk, r), owner_index, prefix)
-                + "_" + road::material_key_name(key) + "\nusemtl " + name + "\n");
+        out.put("g " + record + "_" + road::material_key_name(key)
+                + "\nusemtl " + name + "\n");
 
         const size_t first = range.index_offset;
         const size_t last = std::min<size_t>(mesh.indices.size(),
@@ -836,8 +980,9 @@ private:
  * costs nothing there because a chunk holds a handful of ranges; here a chunk holds
  * one range per object per material and the difference is thousands of entries.
  *
- * glTF 2.0 requires Y up, so SceneExportConfig::y_up is ignored here; the caller
- * warns.
+ * glTF 2.0 requires Y up. effective_config() has already forced SceneExportConfig::y_up
+ * true for this format and warned, so the frame conversion below is always the
+ * identity -- see the comment on it for why it is still spelled out.
  */
 [[nodiscard]] bool write_gltf_file(const ChunkMesh& chunk, const std::vector<SceneObject>& objects,
                                    const MaterialTable& materials, const fs::path& gltf_path,
@@ -862,15 +1007,29 @@ private:
 
     for (size_t i = 0; i < vertex_count; ++i) {
         const Vertex& v = mesh.vertices[i];
-        positions[i * 3u + 0u] = v.position.x;
-        positions[i * 3u + 1u] = v.position.y;
-        positions[i * 3u + 2u] = v.position.z;
-        min_pos = glm::min(min_pos, v.position);
-        max_pos = glm::max(max_pos, v.position);
 
-        normals[i * 3u + 0u] = v.normal.x;
-        normals[i * 3u + 1u] = v.normal.y;
-        normals[i * 3u + 2u] = v.normal.z;
+        // cfg.y_up is ALWAYS true by the time a chunk reaches this writer:
+        // effective_config() forces it, because glTF 2.0 defines +Y as up and a
+        // rotated file is valid and wrong in every viewer.
+        //
+        // It is READ here rather than assumed. Assuming it would leave that fixup
+        // with no observable effect anywhere in the output, and a rule nothing can
+        // observe is a rule that can be deleted without a single test noticing.
+        // Reading it gives the "glTF is Y up" guarantee exactly one enforcement
+        // point, which is also the one the OBJ writer uses.
+        const glm::vec3 position = to_export_frame(v.position, cfg.y_up);
+        const glm::vec3 normal = to_export_frame(v.normal, cfg.y_up);
+        const glm::vec3 tangent = to_export_frame(glm::vec3(v.tangent), cfg.y_up);
+
+        positions[i * 3u + 0u] = position.x;
+        positions[i * 3u + 1u] = position.y;
+        positions[i * 3u + 2u] = position.z;
+        min_pos = glm::min(min_pos, position);
+        max_pos = glm::max(max_pos, position);
+
+        normals[i * 3u + 0u] = normal.x;
+        normals[i * 3u + 1u] = normal.y;
+        normals[i * 3u + 2u] = normal.z;
 
         uvs[i * 2u + 0u] = v.uv.x;
         uvs[i * 2u + 1u] = v.uv.y;
@@ -880,12 +1039,12 @@ private:
         colors[i * 4u + 2u] = v.color.b;
         colors[i * 4u + 3u] = v.color.a;
 
-        tangents[i * 4u + 0u] = v.tangent.x;
-        tangents[i * 4u + 1u] = v.tangent.y;
-        tangents[i * 4u + 2u] = v.tangent.z;
+        tangents[i * 4u + 0u] = tangent.x;
+        tangents[i * 4u + 1u] = tangent.y;
+        tangents[i * 4u + 2u] = tangent.z;
         // The bitangent sign is one of exactly two values; a 0 left by a producer
         // that never computed tangents is neither, and a shader reading it gets a
-        // flat black normal map.
+        // flat black normal map. Not rotated: it is a handedness flag, not an axis.
         tangents[i * 4u + 3u] = v.tangent.w < 0.0f ? -1.0f : 1.0f;
     }
 
@@ -1147,7 +1306,13 @@ SceneExportStats export_scene(const std::vector<SceneObject>& objects,
     const auto start = std::chrono::steady_clock::now();
     SceneExportStats stats;
 
-    const auto finish = [&stats, start]() -> SceneExportStats& {
+    // Triangles that reached a chunk, whether or not that chunk's file was ever
+    // opened. stats.triangles counts only the ones that made it to disk, so the
+    // difference is what SceneExportStats::unwritten_triangles reports.
+    size_t routed_total = 0;
+
+    const auto finish = [&stats, &routed_total, start]() -> SceneExportStats& {
+        stats.unwritten_triangles = routed_total - stats.triangles;
         const auto end = std::chrono::steady_clock::now();
         stats.export_ms = std::chrono::duration<double, std::milli>(end - start).count();
         return stats;
@@ -1172,7 +1337,7 @@ SceneExportStats export_scene(const std::vector<SceneObject>& objects,
                                                     stats.dropped_triangles);
             if (routed > 0) {
                 ++stats.objects;
-                stats.triangles += routed;
+                routed_total += routed;
             }
         }
 
@@ -1201,6 +1366,13 @@ SceneExportStats export_scene(const std::vector<SceneObject>& objects,
             }
             ++stats.chunks;
             stats.vertices += chunk.mesh.vertices.size();
+            // Credited HERE and not where the triangle was routed, for the same
+            // reason stats.chunks and stats.vertices are: a chunk whose file could
+            // not be opened contributes nothing a consumer can load. Counting it at
+            // routing time made stats.triangles equal the input even when a whole
+            // chunk was missing from disk, so a caller checking the conservation
+            // invariant was told the export conserved everything.
+            stats.triangles += accum.triangles;
 
             // The MTL is shared by every OBJ of the export, so it is written once,
             // as the first successful chunk's sidecar. Written after that chunk and
@@ -1221,10 +1393,10 @@ SceneExportStats export_scene(const std::vector<SceneObject>& objects,
     }
 
     finish();
-    spdlog::info("export_scene: {} chunks, {} objects, {} triangles ({} dropped), "
-                 "{} files in {:.1f} ms",
+    spdlog::info("export_scene: {} chunks, {} objects, {} triangles "
+                 "({} dropped, {} unwritten), {} files in {:.1f} ms",
                  stats.chunks, stats.objects, stats.triangles, stats.dropped_triangles,
-                 stats.files, stats.export_ms);
+                 stats.unwritten_triangles, stats.files, stats.export_ms);
     return stats;
 }
 

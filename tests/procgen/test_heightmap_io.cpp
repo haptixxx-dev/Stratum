@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -181,7 +182,10 @@ Bytes zlib_stored(const Bytes& raw) {
  *
  * @param width        Image width
  * @param height       Image height
- * @param bit_depth    8 or 16
+ * @param bit_depth    1, 2, 4, 8 or 16. Greyscale PNG allows all five; the
+ *                     sub-byte ones are what catch a decoder that reports the
+ *                     depth stb hands the pixels back at rather than the depth
+ *                     the file was written in.
  * @param colour_type  0 for greyscale, 2 for truecolour RGB
  * @param samples      width * height values for greyscale, width * height * 3 for RGB,
  *                     in file row order
@@ -194,6 +198,31 @@ Bytes make_png(int width, int height, int bit_depth, int colour_type,
     Bytes raw;
     for (int y = 0; y < height; ++y) {
         raw.push_back(0x00); // filter type 0 (None)
+        if (bit_depth < 8) {
+            // Sub-byte samples are packed MOST SIGNIFICANT BITS FIRST and each
+            // ROW is padded out to a whole byte -- rows never share one. Only
+            // greyscale reaches here, so there is one channel.
+            std::uint8_t accumulator = 0;
+            int bits_filled = 0;
+            for (int x = 0; x < width; ++x) {
+                const std::uint16_t value =
+                    samples[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                            static_cast<std::size_t>(x)];
+                const unsigned int mask = (1u << bit_depth) - 1u;
+                accumulator = static_cast<std::uint8_t>((accumulator << bit_depth) |
+                                                        (static_cast<unsigned int>(value) & mask));
+                bits_filled += bit_depth;
+                if (bits_filled == 8) {
+                    raw.push_back(accumulator);
+                    accumulator = 0;
+                    bits_filled = 0;
+                }
+            }
+            if (bits_filled != 0) {
+                raw.push_back(static_cast<std::uint8_t>(accumulator << (8 - bits_filled)));
+            }
+            continue;
+        }
         for (int x = 0; x < width * channels; ++x) {
             const std::uint16_t value =
                 samples[static_cast<std::size_t>(y) * static_cast<std::size_t>(width * channels) +
@@ -243,6 +272,30 @@ std::string status_of(const HeightmapImportResult& result) {
 }
 
 std::string ok_status() { return std::string{"Ok"}; }
+
+/**
+ * @brief Whether any warning contains @p fragment
+ *
+ * Warnings are asserted by their TEXT here, not merely counted. A warning whose
+ * wording nothing checks can be replaced with the literal "ignore me" and every
+ * `CHECK_FALSE(warnings.empty())` in the file still passes -- so "a warning was
+ * produced" is not the thing worth asserting. What the user is told is.
+ */
+bool warning_says(const HeightmapImportResult& result, const std::string& fragment) {
+    for (const std::string& warning : result.warnings) {
+        if (warning.find(fragment) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether @p result's message contains @p fragment. Several distinct guards
+/// return the same status, so the message is the only thing that says WHICH one
+/// fired, and a test that checks only the status cannot tell them apart.
+bool message_says(const HeightmapImportResult& result, const std::string& fragment) {
+    return result.message.find(fragment) != std::string::npos;
+}
 
 /// Bounds over Dublin. Latitude and longitude are far apart in value and in
 /// sign, so every ordering mistake in this file produces an obviously wrong
@@ -456,8 +509,16 @@ TEST(HeightmapIO, vertical_quantum_reports_the_cost_of_eight_bits) {
     CHECK_NEAR(fine.vertical_quantum_metres, 1200.0 / 65535.0, 1e-9);
     // 4.7 m per step is coarse enough to terrace and must be said out loud;
     // 1.8 cm is not worth a word.
-    CHECK_FALSE(coarse.warnings.empty());
-    CHECK_TRUE(fine.warnings.empty());
+    //
+    // Asserted by its TEXT and by its count, not by "there is at least one
+    // warning". The whole body of this message can be replaced with the word
+    // "nothing" and a `warnings.empty()` check still passes, so the check that
+    // only counts warnings tests nothing about what the user is told.
+    CHECK_EQ(coarse.warnings.size(), std::size_t{1});
+    CHECK_TRUE(warning_says(coarse, "8-bit source over a 1200.00 m range"));
+    CHECK_TRUE(warning_says(coarse, "resolves only 4.706 m per sample step"));
+    CHECK_TRUE(warning_says(coarse, "16-bit source over the same range resolves 0.0183 m"));
+    CHECK_EQ(fine.warnings.size(), std::size_t{0});
 }
 
 TEST(HeightmapIO, an_unusable_elevation_range_is_refused) {
@@ -544,6 +605,50 @@ TEST(HeightmapIO, upsampling_interpolates_between_the_four_neighbours) {
     CHECK_NEAR(result.heightmap.at(1, 1), (0.0 + 100.0 + 200.0 + 255.0) / 4.0, 1e-3);
 }
 
+TEST(HeightmapIO, upsampling_an_asymmetric_source_pins_every_edge_sample) {
+    // The other resample fixtures are square (2x2, 4x4, 8x8) and symmetric, so a
+    // clamp that bounds x against the HEIGHT, or an interpolation that swaps the
+    // two axes, reproduces them exactly. This one is 5 wide and 2 tall with no
+    // symmetry in either axis, and every one of the 27 output samples is stated.
+    //
+    // It also lands destination samples exactly on the far right and top edges of
+    // the source, which is where the second bilinear tap addresses one column and
+    // one row past the end. That tap is weighted zero there, so its value never
+    // reaches an assertion -- these checks pin what the edge samples ARE, and the
+    // read itself is made harmless in resample() rather than merely unlikely.
+    //
+    //   file row 0 (north):   0  40  80 120 160
+    //   file row 1 (south): 200 210 220 230 240
+    const Bytes pgm = make_pgm_binary(5, 2, 240,
+                                      {0, 40, 80, 120, 160,
+                                       200, 210, 220, 230, 240});
+
+    HeightmapImportOptions options;
+    options.target_width = 9;
+    options.target_height = 3;
+    const HeightmapImportResult result =
+        import_bytes(pgm, ElevationRange::metres(0.0, 240.0), unit_local(), options);
+
+    CHECK_EQ(status_of(result), ok_status());
+    CHECK_EQ(result.heightmap.width, 9);
+    CHECK_EQ(result.heightmap.height, 3);
+    if (result.heightmap.data.size() != 27) {
+        return;
+    }
+
+    // Heightmap row 0 is SOUTH: file row 1, upsampled 5 -> 9.
+    const double south[9] = {200, 205, 210, 215, 220, 225, 230, 235, 240};
+    // Heightmap row 2 is NORTH: file row 0.
+    const double north[9] = {0, 20, 40, 60, 80, 100, 120, 140, 160};
+    for (int x = 0; x < 9; ++x) {
+        CHECK_NEAR(result.heightmap.at(x, 0), south[x], 1e-3);
+        CHECK_NEAR(result.heightmap.at(x, 2), north[x], 1e-3);
+        // The middle row is halfway between the two, which pins the vertical
+        // weight: at fy 0 or 1 it would equal one of the rows above.
+        CHECK_NEAR(result.heightmap.at(x, 1), (south[x] + north[x]) / 2.0, 1e-3);
+    }
+}
+
 TEST(HeightmapIO, heavy_downsampling_warns_that_bilinear_does_not_area_average) {
     std::vector<std::uint16_t> samples(64, 0);
     samples[27] = 255; // a one-cell spike that a 2x2 output cannot represent
@@ -558,11 +663,51 @@ TEST(HeightmapIO, heavy_downsampling_warns_that_bilinear_does_not_area_average) 
     CHECK_EQ(status_of(result), ok_status());
     CHECK_EQ(result.heightmap.width, 2);
     CHECK_EQ(result.heightmap.height, 2);
-    CHECK_FALSE(result.warnings.empty());
+    CHECK_EQ(result.warnings.size(), std::size_t{1});
+    CHECK_TRUE(warning_says(result, "downsampling 8x8 to 2x2 by more than 2x per axis"));
     // And the warning is not idle: the spike really is gone, because a 2x2
     // output samples only the four source corners.
     CHECK_NEAR(result.heightmap.at(0, 0), 0.0, 1e-6);
     CHECK_NEAR(result.heightmap.at(1, 1), 0.0, 1e-6);
+}
+
+TEST(HeightmapIO, the_downsampling_warning_starts_past_2x_and_not_at_1x) {
+    // The 8x8 -> 2x2 fixture above is a 4x reduction, which is true of
+    // "more than 2x" and equally true of "any downsample at all". The threshold
+    // itself needs a case on each side of it, or the rule the comment states is
+    // not the rule the code implements and nothing notices.
+    //
+    // A 0-100 m range at 8 bits quantises to 0.39 m, below
+    // kCoarseVerticalQuantumMetres, so the coarse-quantum warning stays out of
+    // the way and `warnings` here is only ever about downsampling.
+    const ElevationRange vertical = ElevationRange::metres(0.0, 100.0);
+
+    const Bytes eight = make_pgm_binary(8, 8, 255, std::vector<std::uint16_t>(64, 40));
+    HeightmapImportOptions exactly_two;
+    exactly_two.target_width = 4;
+    exactly_two.target_height = 4;
+    const HeightmapImportResult at_2x = import_bytes(eight, vertical, unit_local(), exactly_two);
+    CHECK_EQ(status_of(at_2x), ok_status());
+    // Exactly 2x is what bilinear handles honestly: each destination sample has
+    // a source sample under it. No warning.
+    CHECK_EQ(at_2x.warnings.size(), std::size_t{0});
+
+    const Bytes nine = make_pgm_binary(9, 9, 255, std::vector<std::uint16_t>(81, 40));
+    HeightmapImportOptions just_past_two;
+    just_past_two.target_width = 4;
+    just_past_two.target_height = 4;
+    const HeightmapImportResult past_2x = import_bytes(nine, vertical, unit_local(), just_past_two);
+    CHECK_EQ(status_of(past_2x), ok_status());
+    CHECK_EQ(past_2x.warnings.size(), std::size_t{1});
+    CHECK_TRUE(warning_says(past_2x, "downsampling 9x9 to 4x4 by more than 2x per axis"));
+
+    // Upsampling is never worth a word.
+    HeightmapImportOptions upsample;
+    upsample.target_width = 16;
+    upsample.target_height = 16;
+    const HeightmapImportResult up = import_bytes(eight, vertical, unit_local(), upsample);
+    CHECK_EQ(status_of(up), ok_status());
+    CHECK_EQ(up.warnings.size(), std::size_t{0});
 }
 
 TEST(HeightmapIO, a_degenerate_target_grid_is_refused) {
@@ -580,6 +725,45 @@ TEST(HeightmapIO, a_degenerate_target_grid_is_refused) {
     CHECK_EQ(
         status_of(import_bytes(pgm, ElevationRange::metres(0.0, 100.0), unit_local(), negative)),
         std::string{"InvalidOptions"});
+}
+
+TEST(HeightmapIO, a_target_grid_is_capped_by_the_same_guards_as_the_source) {
+    // target_width and target_height size the OUTPUT allocation directly, so
+    // they are an allocation guard in exactly the way the source dimensions are
+    // -- and they come from the caller, which in the editor means a spin box.
+    // Only the "at least two samples" end of that is covered anywhere else, so a
+    // check narrowed to `dst_w < 2 || dst_h < 2` would pass the rest of the file.
+    const Bytes pgm = make_pgm_binary(4, 4, 255, std::vector<std::uint16_t>(16, 128));
+    const ElevationRange vertical = ElevationRange::metres(0.0, 100.0);
+
+    // Past the per-axis cap. 70000 x 4 is only 280,000 samples, well inside
+    // max_samples, so this is the axis cap and nothing else.
+    HeightmapImportOptions past_axis;
+    past_axis.target_width = 70000;
+    past_axis.target_height = 4;
+    const HeightmapImportResult wide = import_bytes(pgm, vertical, unit_local(), past_axis);
+    CHECK_EQ(status_of(wide), std::string{"InvalidOptions"});
+    CHECK_TRUE(message_says(wide, "target grid rejected"));
+    CHECK_TRUE(message_says(wide, "per-axis limit"));
+
+    // Past max_samples, with a source that is comfortably inside it.
+    HeightmapImportOptions past_total;
+    past_total.target_width = 4096;
+    past_total.target_height = 4096;
+    past_total.max_samples = 1000;
+    const HeightmapImportResult huge = import_bytes(pgm, vertical, unit_local(), past_total);
+    CHECK_EQ(status_of(huge), std::string{"InvalidOptions"});
+    CHECK_TRUE(message_says(huge, "16777216 samples"));
+    CHECK_TRUE(message_says(huge, "max_samples is 1000"));
+    CHECK_TRUE(huge.heightmap.data.empty());
+
+    // Control: a target inside both caps resamples.
+    HeightmapImportOptions fine;
+    fine.target_width = 8;
+    fine.target_height = 8;
+    const HeightmapImportResult ok = import_bytes(pgm, vertical, unit_local(), fine);
+    CHECK_EQ(status_of(ok), ok_status());
+    CHECK_EQ(ok.heightmap.width, 8);
 }
 
 // ============================================================================
@@ -698,9 +882,15 @@ TEST(HeightmapIO, degenerate_or_out_of_domain_bounds_are_refused) {
     // Default-constructed: deliberately inverted, meaning "never set".
     const stratum::osm::BoundingBox never_set;
     CHECK_FALSE(never_set.is_valid());
-    CHECK_EQ(status_of(import_bytes(pgm, vertical,
-                                    HeightmapPlacement::geographic(never_set, converter))),
-             std::string{"InvalidPlacement"});
+    const HeightmapImportResult unset =
+        import_bytes(pgm, vertical, HeightmapPlacement::geographic(never_set, converter));
+    CHECK_EQ(status_of(unset), std::string{"InvalidPlacement"});
+    // Three different guards return InvalidPlacement here, and an inverted box
+    // falls through to the degenerate-span one and yields the same status from
+    // the wrong check -- so the status alone cannot tell them apart and the
+    // is_valid() guard could be deleted without any of these three noticing.
+    // The message can tell them apart.
+    CHECK_TRUE(message_says(unset, "reads as 'never set'"));
 
     // Valid but with no area: every cell size would be zero.
     stratum::osm::BoundingBox sliver;
@@ -709,9 +899,10 @@ TEST(HeightmapIO, degenerate_or_out_of_domain_bounds_are_refused) {
     sliver.min_lon = -6.25;
     sliver.max_lon = -6.25;
     CHECK_TRUE(sliver.is_valid());
-    CHECK_EQ(
-        status_of(import_bytes(pgm, vertical, HeightmapPlacement::geographic(sliver, converter))),
-        std::string{"InvalidPlacement"});
+    const HeightmapImportResult flat =
+        import_bytes(pgm, vertical, HeightmapPlacement::geographic(sliver, converter));
+    CHECK_EQ(status_of(flat), std::string{"InvalidPlacement"});
+    CHECK_TRUE(message_says(flat, "degenerate extent"));
 
     // Past the Mercator latitude limit, where wgs84_to_mercator() clamps in
     // silence and would hand back a squashed extent.
@@ -720,9 +911,62 @@ TEST(HeightmapIO, degenerate_or_out_of_domain_bounds_are_refused) {
     polar.max_lat = 89.0;
     polar.min_lon = -6.30;
     polar.max_lon = -6.20;
-    CHECK_EQ(
-        status_of(import_bytes(pgm, vertical, HeightmapPlacement::geographic(polar, converter))),
-        std::string{"InvalidPlacement"});
+    const HeightmapImportResult arctic =
+        import_bytes(pgm, vertical, HeightmapPlacement::geographic(polar, converter));
+    CHECK_EQ(status_of(arctic), std::string{"InvalidPlacement"});
+    CHECK_TRUE(message_says(arctic, "outside the Web Mercator domain"));
+}
+
+TEST(HeightmapIO, local_placement_refuses_a_cell_size_that_is_not_positive_and_finite) {
+    // A cell size of zero is the one that looks harmless: it produces a grid
+    // whose every sample sits at the same point, and every distance measured off
+    // it afterwards is zero. Nothing else in the suite passes anything but
+    // 1.0 x 1.0 or 2.5 x 4.0, so this guard could be `if (false)` and the rest of
+    // the file would not care.
+    const Bytes pgm = make_pgm_binary(2, 2, 255, {0, 100, 200, 255});
+    const ElevationRange vertical = ElevationRange::metres(0.0, 100.0);
+    const float not_a_number = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+    const glm::vec2 somewhere{7.0f, 9.0f};
+
+    const HeightmapImportResult zero =
+        import_bytes(pgm, vertical, HeightmapPlacement::local(somewhere, 0.0f, 1.0f));
+    CHECK_EQ(status_of(zero), std::string{"InvalidPlacement"});
+    CHECK_TRUE(message_says(zero, "strictly positive, finite cell sizes"));
+
+    // A failed placement must leave the grid untouched rather than half-written.
+    // Nothing clears it afterwards, so this asserts that nothing wrote to it
+    // before deciding to fail: empty data, the default one-metre cells, and an
+    // origin at zero rather than the (7, 9) that was asked for.
+    CHECK_TRUE(zero.heightmap.data.empty());
+    CHECK_EQ(zero.heightmap.width, 0);
+    CHECK_NEAR(zero.heightmap.origin.x, 0.0, 1e-12);
+    CHECK_NEAR(zero.heightmap.origin.y, 0.0, 1e-12);
+    CHECK_NEAR(zero.heightmap.cell_size_x, 1.0, 1e-12);
+
+    CHECK_EQ(status_of(import_bytes(pgm, vertical,
+                                    HeightmapPlacement::local(somewhere, -2.0f, 1.0f))),
+             std::string{"InvalidPlacement"});
+    CHECK_EQ(status_of(import_bytes(pgm, vertical,
+                                    HeightmapPlacement::local(somewhere, 1.0f, 0.0f))),
+             std::string{"InvalidPlacement"});
+    CHECK_EQ(status_of(import_bytes(pgm, vertical,
+                                    HeightmapPlacement::local(somewhere, not_a_number, 1.0f))),
+             std::string{"InvalidPlacement"});
+    CHECK_EQ(status_of(import_bytes(pgm, vertical,
+                                    HeightmapPlacement::local(somewhere, infinity, 1.0f))),
+             std::string{"InvalidPlacement"});
+
+    const HeightmapImportResult bad_origin = import_bytes(
+        pgm, vertical, HeightmapPlacement::local(glm::vec2{not_a_number, 0.0f}, 1.0f, 1.0f));
+    CHECK_EQ(status_of(bad_origin), std::string{"InvalidPlacement"});
+    CHECK_TRUE(message_says(bad_origin, "origin is not finite"));
+
+    // Control: the same bytes with a usable placement load, so the refusals are
+    // about the placement and not about the fixture.
+    CHECK_EQ(status_of(import_bytes(pgm, vertical,
+                                    HeightmapPlacement::local(somewhere, 2.0f, 3.0f))),
+             ok_status());
 }
 
 // ============================================================================
@@ -741,6 +985,53 @@ TEST(HeightmapIO, a_truncated_binary_pgm_is_refused) {
     CHECK_EQ(result.heightmap.width, 0);
     // The message has to say what was claimed, or it cannot be acted on.
     CHECK((result.message.find("100x100")) != (std::string::npos));
+    // And the header block has to survive the refusal for the same reason: a
+    // batch log that says "truncated" without saying how big the tile claimed to
+    // be cannot be acted on either.
+    CHECK_EQ(result.source.width, 100);
+    CHECK_EQ(result.source.height, 100);
+    CHECK_EQ(result.source.bits_per_sample, 8);
+    CHECK_EQ(result.source.max_sample_value, std::uint32_t{255});
+}
+
+TEST(HeightmapIO, a_binary_pgm_short_by_exactly_one_byte_is_refused) {
+    // Every other truncation fixture in this file is GROSSLY short -- 100x100
+    // with ten bytes, 64x64 with three. A bound that is wrong by one or two
+    // bytes refuses all of those just as happily as the correct bound does, so
+    // none of them can tell a correct bound from a loose one. These can: a loose
+    // bound accepts them, and then reads past the end of the buffer.
+    const ElevationRange vertical = ElevationRange::metres(0.0, 100.0);
+
+    // 2x2 at 8 bits needs 4 raster bytes. Three is short by exactly one.
+    Bytes one_byte_short = make_pgm_binary(2, 2, 255, {1, 2, 3, 4});
+    one_byte_short.pop_back();
+    const HeightmapImportResult short_8 = import_bytes(one_byte_short, vertical, unit_local());
+    CHECK_EQ(status_of(short_8), std::string{"Truncated"});
+    CHECK_TRUE(short_8.heightmap.data.empty());
+    CHECK_TRUE(message_says(short_8, "needing 4 raster bytes, but only 3 remain"));
+
+    // 2x2 at 16 bits needs 8. Seven is short by one BYTE -- half a sample, which
+    // is the case a bound counting samples rather than bytes lets through.
+    Bytes half_a_sample_short = make_pgm_binary(2, 2, 65535, {1, 2, 3, 4});
+    half_a_sample_short.pop_back();
+    CHECK_EQ(status_of(import_bytes(half_a_sample_short, vertical, unit_local())),
+             std::string{"Truncated"});
+
+    // Six is short by exactly one whole sample.
+    const Bytes one_sample_short = make_pgm_binary(2, 2, 65535, {1, 2, 3});
+    const HeightmapImportResult short_16 = import_bytes(one_sample_short, vertical, unit_local());
+    CHECK_EQ(status_of(short_16), std::string{"Truncated"});
+    CHECK_TRUE(message_says(short_16, "needing 8 raster bytes, but only 6 remain"));
+
+    // Controls: exactly enough raster loads, at both depths. Without these the
+    // three refusals above are equally consistent with a bound that refuses
+    // everything.
+    CHECK_EQ(status_of(import_bytes(make_pgm_binary(2, 2, 255, {1, 2, 3, 4}), vertical,
+                                    unit_local())),
+             ok_status());
+    CHECK_EQ(status_of(import_bytes(make_pgm_binary(2, 2, 65535, {1, 2, 3, 4}), vertical,
+                                    unit_local())),
+             ok_status());
 }
 
 TEST(HeightmapIO, a_truncated_ascii_pgm_is_refused) {
@@ -753,7 +1044,63 @@ TEST(HeightmapIO, a_truncated_ascii_pgm_is_refused) {
     CHECK_TRUE(result.heightmap.data.empty());
 }
 
-TEST(HeightmapIO, absurd_dimensions_are_refused_before_any_allocation) {
+TEST(HeightmapIO, an_ascii_pgm_missing_only_its_last_sample_is_refused) {
+    // Three samples where four were declared. The file is long enough to pass
+    // the up-front byte bound, so this is the per-sample guard at the bottom of
+    // the parse loop, and it has to count to four rather than "enough".
+    const ElevationRange vertical = ElevationRange::metres(0.0, 100.0);
+    const HeightmapImportResult result =
+        import_bytes(make_pgm_ascii(2, 2, 255, {1, 2, 3}), vertical, unit_local());
+
+    CHECK_EQ(status_of(result), std::string{"Truncated"});
+    CHECK_TRUE(result.heightmap.data.empty());
+    // Named to the sample, so it says WHERE the file stopped.
+    CHECK_TRUE(message_says(result, "ran out after 3"));
+
+    // Control: the fourth sample makes the identical file load.
+    CHECK_EQ(status_of(import_bytes(make_pgm_ascii(2, 2, 255, {1, 2, 3, 4}), vertical,
+                                    unit_local())),
+             ok_status());
+}
+
+TEST(HeightmapIO, an_ascii_pgm_header_cannot_size_a_buffer_the_file_could_never_fill) {
+    // Seventeen bytes of header and no raster at all. Sizing the sample vector
+    // from 8192x8192 before parsing anything costs 128 MB of resident memory --
+    // about eight million times the input -- on the thread drawing the editor,
+    // and it is reached from a file a stranger sent. An ASCII sample is at least
+    // one digit and needs a separator between it and the next, so 67 million
+    // samples cannot be encoded in one byte, and that is knowable before the
+    // allocation rather than after it.
+    //
+    // This asserts the MESSAGE, not just the status: the late per-sample guard
+    // also returns Truncated for this file, after the allocation, so the status
+    // alone cannot tell which guard fired.
+    Bytes header_only;
+    append_ascii(header_only, "P2\n8192 8192\n255\n");
+
+    const HeightmapImportResult result =
+        import_bytes(header_only, ElevationRange::metres(0.0, 100.0), unit_local());
+
+    CHECK_EQ(status_of(result), std::string{"Truncated"});
+    CHECK_TRUE(result.heightmap.data.empty());
+    CHECK_TRUE(message_says(result, "67108864 ASCII samples, which need at least"));
+    CHECK_TRUE(message_says(result, "134217727 bytes, but only 1 remain"));
+
+    // The bound must not refuse anything legal. This is the DENSEST a P2 raster
+    // can legally be -- one digit per sample, one separator between them -- and
+    // it has to load.
+    Bytes dense;
+    append_ascii(dense, "P2\n2 2\n9\n1 2 3 4");
+    const HeightmapImportResult tight = import_bytes(dense, ElevationRange::metres(0.0, 9.0),
+                                                     unit_local());
+    CHECK_EQ(status_of(tight), ok_status());
+    if (tight.heightmap.data.size() == 4) {
+        CHECK_NEAR(tight.heightmap.at(0, 1), 1.0, 1e-4); // north-west, the first sample
+        CHECK_NEAR(tight.heightmap.at(1, 0), 4.0, 1e-4); // south-east, the last
+    }
+}
+
+TEST(HeightmapIO, absurd_dimensions_are_refused_by_the_caps_that_run_first) {
     // Four billion by four billion. Nothing may be sized from these numbers, and
     // nothing may overflow while checking them.
     Bytes pgm;
@@ -803,12 +1150,35 @@ TEST(HeightmapIO, max_samples_caps_the_image_before_it_is_decoded) {
 
     HeightmapImportOptions tight;
     tight.max_samples = 100;
-    CHECK_EQ(status_of(import_bytes(pgm, ElevationRange::metres(0.0, 100.0), unit_local(), tight)),
-             std::string{"DimensionsOutOfRange"});
+    const HeightmapImportResult refused =
+        import_bytes(pgm, ElevationRange::metres(0.0, 100.0), unit_local(), tight);
+    CHECK_EQ(status_of(refused), std::string{"DimensionsOutOfRange"});
+    // The refusal names the claim and the limit, and the header block survives
+    // it. Both are what makes a failed batch import diagnosable.
+    CHECK_TRUE(message_says(refused, "claims 256 samples"));
+    CHECK_TRUE(message_says(refused, "max_samples is 100"));
+    CHECK_EQ(refused.source.width, 16);
+    CHECK_EQ(refused.source.height, 16);
 
     // Control: the identical bytes load under the default cap.
     CHECK_EQ(status_of(import_bytes(pgm, ElevationRange::metres(0.0, 100.0), unit_local())),
              ok_status());
+}
+
+TEST(HeightmapIO, a_max_samples_of_zero_is_refused_as_an_option_not_as_a_dimension) {
+    // A cap of zero refuses every image that could ever exist, so it is a
+    // mistake in the CALL and not a property of the file. Reporting it as
+    // DimensionsOutOfRange would send the user looking at their heightmap.
+    const Bytes pgm = make_pgm_binary(2, 2, 255, {0, 100, 200, 255});
+
+    HeightmapImportOptions none;
+    none.max_samples = 0;
+    const HeightmapImportResult result =
+        import_bytes(pgm, ElevationRange::metres(0.0, 100.0), unit_local(), none);
+
+    CHECK_EQ(status_of(result), std::string{"InvalidOptions"});
+    CHECK_TRUE(message_says(result, "max_samples is 0"));
+    CHECK_TRUE(result.heightmap.data.empty());
 }
 
 TEST(HeightmapIO, a_sample_above_the_declared_maxval_is_refused) {
@@ -845,8 +1215,13 @@ TEST(HeightmapIO, a_file_that_is_not_a_heightmap_is_refused_by_name) {
     append_ascii(prose, "this is not an image at all");
     CHECK_EQ(status_of(import_bytes(prose, vertical, unit_local())), std::string{"UnknownFormat"});
 
-    CHECK_EQ(status_of(import_bytes(Bytes{}, vertical, unit_local())),
-             std::string{"UnknownFormat"});
+    // An empty buffer is refused by its OWN guard, before any decoder runs.
+    // decode_pgm() would also return UnknownFormat for zero bytes, so the status
+    // alone cannot distinguish the two and the early return could be deleted
+    // without any test in this file noticing. The wording distinguishes them.
+    const HeightmapImportResult empty = import_bytes(Bytes{}, vertical, unit_local());
+    CHECK_EQ(status_of(empty), std::string{"UnknownFormat"});
+    CHECK_TRUE(message_says(empty, "the file is empty"));
 }
 
 TEST(HeightmapIO, a_pgm_header_that_stops_early_is_refused) {
@@ -930,11 +1305,44 @@ TEST(HeightmapIO, bytes_beyond_the_declared_raster_warn_but_still_load) {
         import_bytes(pgm, ElevationRange::metres(0.0, 255.0), unit_local());
 
     CHECK_EQ(status_of(result), ok_status());
-    CHECK_FALSE(result.warnings.empty());
+    CHECK_EQ(result.warnings.size(), std::size_t{1});
+    CHECK_TRUE(warning_says(result, "PGM has 32 bytes after the raster"));
     // The extra bytes must not have been read as data.
     if (result.heightmap.data.size() == 4) {
         CHECK_NEAR(result.heightmap.at(1, 0), 255.0, 1e-3);
     }
+}
+
+TEST(HeightmapIO, one_trailing_byte_is_a_final_newline_and_is_not_worth_a_warning) {
+    // Almost every PGM a real tool writes ends with a newline. Warning about it
+    // would put a spurious line in the import dialog for ordinary files, so the
+    // rule is "more than one trailing byte", and that boundary needs a case on
+    // each side of it or the rule is untested: widening it to "any trailing
+    // byte" changes nothing any other test in this file can see.
+    //
+    // 0-255 m at 8 bits is exactly 1.00 m per step, which is not ABOVE
+    // kCoarseVerticalQuantumMetres, so nothing else contributes a warning here.
+    const ElevationRange vertical = ElevationRange::metres(0.0, 255.0);
+
+    Bytes one_newline = make_pgm_binary(2, 2, 255, {0, 100, 200, 255});
+    one_newline.push_back('\n');
+    const HeightmapImportResult tidy = import_bytes(one_newline, vertical, unit_local());
+    CHECK_EQ(status_of(tidy), ok_status());
+    CHECK_EQ(tidy.warnings.size(), std::size_t{0});
+
+    Bytes two_extra = make_pgm_binary(2, 2, 255, {0, 100, 200, 255});
+    two_extra.push_back('\n');
+    two_extra.push_back('\n');
+    const HeightmapImportResult chatty = import_bytes(two_extra, vertical, unit_local());
+    CHECK_EQ(status_of(chatty), ok_status());
+    CHECK_EQ(chatty.warnings.size(), std::size_t{1});
+    CHECK_TRUE(warning_says(chatty, "PGM has 2 bytes after the raster"));
+
+    // And an exact fit says nothing either.
+    const HeightmapImportResult exact =
+        import_bytes(make_pgm_binary(2, 2, 255, {0, 100, 200, 255}), vertical, unit_local());
+    CHECK_EQ(status_of(exact), ok_status());
+    CHECK_EQ(exact.warnings.size(), std::size_t{0});
 }
 
 TEST(HeightmapIO, ascii_and_binary_pgm_agree) {
@@ -1013,6 +1421,108 @@ TEST(HeightmapIO, png_8bit_loads_and_is_reported_as_eight_bit) {
     }
 }
 
+TEST(HeightmapIO, a_one_bit_png_reports_one_bit_and_a_200_metre_quantum) {
+    // PNG greyscale is legally 1, 2, 4, 8 or 16 bits. Asking the decoder "is
+    // this 16-bit?" answers no for all four of the others, and stb SCALES a
+    // 1-bit sample up to fill 0..255, so the heights come out right and the
+    // depth report is wrong in total silence: 8 bits and a full scale of 255
+    // against a file with two levels in it.
+    //
+    // That single number is the one the caller is meant to act on. Over a
+    // 0-200 m range the truth is 200 m per step -- terrain that can only be sea
+    // level or hilltop -- and the 8-bit lie reports 0.78 m, which is not only
+    // 255 times too small but falls BELOW kCoarseVerticalQuantumMetres, so the
+    // warning written to catch exactly this case is suppressed by it.
+    const Bytes png = make_png(4, 2, 1, 0,
+                               {0, 1, 0, 1,
+                                1, 1, 0, 0});
+
+    const HeightmapImportResult result =
+        import_bytes(png, ElevationRange::metres(0.0, 200.0), unit_local());
+
+    CHECK_EQ(status_of(result), ok_status());
+    CHECK_EQ(result.source.bits_per_sample, 1);
+    CHECK_EQ(result.source.max_sample_value, std::uint32_t{1});
+    CHECK_NEAR(result.vertical_quantum_metres, 200.0, 1e-9);
+    CHECK_EQ(result.warnings.size(), std::size_t{1});
+    CHECK_TRUE(warning_says(result, "1-bit source over a 200.00 m range"));
+    CHECK_TRUE(warning_says(result, "resolves only 200.000 m per sample step"));
+
+    if (result.heightmap.data.size() != 8) {
+        return;
+    }
+    // The heights themselves are unaffected -- which is why the wrong depth was
+    // invisible. Heightmap row 0 is SOUTH, from file row 1.
+    CHECK_NEAR(result.heightmap.at(0, 0), 200.0, 1e-3);
+    CHECK_NEAR(result.heightmap.at(1, 0), 200.0, 1e-3);
+    CHECK_NEAR(result.heightmap.at(2, 0), 0.0, 1e-3);
+    CHECK_NEAR(result.heightmap.at(3, 0), 0.0, 1e-3);
+    CHECK_NEAR(result.heightmap.at(0, 1), 0.0, 1e-3);
+    CHECK_NEAR(result.heightmap.at(1, 1), 200.0, 1e-3);
+    CHECK_NEAR(result.heightmap.at(2, 1), 0.0, 1e-3);
+    CHECK_NEAR(result.heightmap.at(3, 1), 200.0, 1e-3);
+    // Two levels and no third: the file really is one bit deep, so the reported
+    // depth above is describing this and not a 255-level image that happens to
+    // use two of them.
+    for (float value : result.heightmap.data) {
+        CHECK_TRUE(value == 0.0f || value == 200.0f);
+    }
+}
+
+TEST(HeightmapIO, two_and_four_bit_pngs_report_their_own_full_scale) {
+    // 3 and 15, not 255. The samples stb hands back are scaled to fill 0..255 by
+    // a factor of 85 and 17, and dividing that back out is exact -- so these
+    // assert the RAW values as well as the reported scale, which is what
+    // separates "read the depth from the file" from "read the depth from the
+    // file and then forget to undo the expansion", where every sample would come
+    // back at 85 or 17 times full scale.
+    const ElevationRange vertical = ElevationRange::metres(0.0, 200.0);
+
+    const Bytes two_bit = make_png(4, 2, 2, 0,
+                                   {0, 1, 2, 3,
+                                    3, 2, 1, 0});
+    const HeightmapImportResult two = import_bytes(two_bit, vertical, unit_local());
+    CHECK_EQ(status_of(two), ok_status());
+    CHECK_EQ(two.source.bits_per_sample, 2);
+    CHECK_EQ(two.source.max_sample_value, std::uint32_t{3});
+    CHECK_NEAR(two.vertical_quantum_metres, 200.0 / 3.0, 1e-9);
+    CHECK_TRUE(warning_says(two, "2-bit source over a 200.00 m range"));
+    if (two.heightmap.data.size() == 8) {
+        CHECK_NEAR(two.heightmap.at(0, 1), 0.0, 1e-3);                  // north, raw 0
+        CHECK_NEAR(two.heightmap.at(3, 1), 200.0, 1e-3);                // north, raw 3
+        CHECK_NEAR(two.heightmap.at(0, 0), 200.0, 1e-3);                // south, raw 3
+        CHECK_NEAR(two.heightmap.at(2, 0), (1.0 / 3.0) * 200.0, 1e-3);  // south, raw 1
+    }
+
+    const Bytes four_bit = make_png(4, 2, 4, 0,
+                                    {0, 5, 10, 15,
+                                     15, 10, 5, 0});
+    const HeightmapImportResult four = import_bytes(four_bit, vertical, unit_local());
+    CHECK_EQ(status_of(four), ok_status());
+    CHECK_EQ(four.source.bits_per_sample, 4);
+    CHECK_EQ(four.source.max_sample_value, std::uint32_t{15});
+    CHECK_NEAR(four.vertical_quantum_metres, 200.0 / 15.0, 1e-9);
+    CHECK_TRUE(warning_says(four, "4-bit source over a 200.00 m range"));
+    if (four.heightmap.data.size() == 8) {
+        CHECK_NEAR(four.heightmap.at(0, 1), 0.0, 1e-3);                   // north, raw 0
+        CHECK_NEAR(four.heightmap.at(3, 1), 200.0, 1e-3);                 // north, raw 15
+        CHECK_NEAR(four.heightmap.at(1, 0), (10.0 / 15.0) * 200.0, 1e-3); // south, raw 10
+        CHECK_NEAR(four.heightmap.at(3, 0), 0.0, 1e-3);                   // south, raw 0
+    }
+
+    // Control at the depth above them: 8-bit still reports 8 and 255, so the
+    // three reports above are the file's depth and not a fixed table indexed by
+    // something that happens to line up.
+    const Bytes eight_bit = make_png(4, 2, 8, 0, {0, 85, 170, 255, 255, 170, 85, 0});
+    const HeightmapImportResult eight = import_bytes(eight_bit, vertical, unit_local());
+    CHECK_EQ(status_of(eight), ok_status());
+    CHECK_EQ(eight.source.bits_per_sample, 8);
+    CHECK_EQ(eight.source.max_sample_value, std::uint32_t{255});
+    if (eight.heightmap.data.size() == 8) {
+        CHECK_NEAR(eight.heightmap.at(1, 1), (85.0 / 255.0) * 200.0, 1e-3);
+    }
+}
+
 TEST(HeightmapIO, a_colour_png_is_refused_rather_than_averaged_to_grey) {
     // A packed colour DEM -- Mapbox Terrain-RGB and friends -- is a 24-bit
     // integer split across three channels. Collapsing it to luminance produces a
@@ -1047,6 +1557,13 @@ TEST(HeightmapIO, a_truncated_png_is_refused) {
         import_bytes(cut_raster, ElevationRange::metres(0.0, 65535.0), unit_local());
     CHECK_FALSE(short_raster.ok());
     CHECK_TRUE(short_raster.heightmap.data.empty());
+    // The header block is filled in as far as the parse got, which for a cut
+    // raster is all of it: the depth comes out of IHDR, so it is known even
+    // though not one sample was decoded.
+    CHECK_EQ(short_raster.source.width, 8);
+    CHECK_EQ(short_raster.source.height, 8);
+    CHECK_EQ(short_raster.source.bits_per_sample, 16);
+    CHECK_EQ(short_raster.source.max_sample_value, std::uint32_t{65535});
 
     // Cut inside IHDR: nothing is knowable about the image at all.
     Bytes cut_header(whole.begin(), whole.begin() + 20);
@@ -1064,6 +1581,22 @@ TEST(HeightmapIO, a_png_is_recognised_by_its_signature_not_its_extension) {
         import_bytes(png, ElevationRange::metres(0.0, 255.0), unit_local());
     CHECK_EQ(status_of(result), ok_status());
     CHECK_EQ(std::string{stratum::procgen::to_string(result.source.format)}, std::string{"PNG"});
+
+    // All EIGHT bytes, not the four that spell "\x89PNG". The last four exist to
+    // catch a file mangled by a transfer that translated line endings or stripped
+    // the high bit, and nothing else here feeds a file with a correct prefix and
+    // a broken tail -- so a comparison shortened to four bytes would pass.
+    Bytes prefix_only = png;
+    prefix_only[4] = 0x00;
+    prefix_only[5] = 0x00;
+    prefix_only[6] = 0x00;
+    prefix_only[7] = 0x00;
+    const HeightmapImportResult mangled =
+        import_bytes(prefix_only, ElevationRange::metres(0.0, 255.0), unit_local());
+    // Not MalformedHeader: it never reached the PNG decoder. It is refused as
+    // "this is not a format I read", which is the honest answer.
+    CHECK_EQ(status_of(mangled), std::string{"UnknownFormat"});
+    CHECK_TRUE(message_says(mangled, "not a Netpbm file"));
 }
 
 TEST(HeightmapIO, png_and_pgm_of_the_same_data_agree) {
@@ -1132,6 +1665,14 @@ TEST(HeightmapIO, a_pgm_written_to_disk_reads_back_identically) {
 
     CHECK_EQ(status_of(from_disk), ok_status());
     CHECK_TRUE(from_disk.heightmap.data == from_memory.heightmap.data);
+    // NOT covered here, and deliberately: the short-read guard in
+    // import_heightmap(), which compares gcount() against the size the stat
+    // reported. Reaching it needs the file to SHRINK between the stat and the
+    // read, which no portable test can arrange -- the only lever on Linux is a
+    // sysfs attribute whose declared size exceeds what a read returns, and
+    // pinning the suite to sysfs layout buys less than it costs. The guard is
+    // fail-closed, so an untested regression there refuses a good file rather
+    // than accepting a bad one.
     // Absolute values as well, so "both empty" cannot pass.
     CHECK_EQ(from_disk.heightmap.data.size(), std::size_t{12});
     if (from_disk.heightmap.data.size() == 12) {
@@ -1150,6 +1691,21 @@ TEST(HeightmapIO, a_missing_file_is_reported_as_missing) {
         import_heightmap(path, ElevationRange::metres(0.0, 100.0), unit_local());
 
     CHECK_EQ(status_of(result), std::string{"FileNotFound"});
+    CHECK_TRUE(result.heightmap.data.empty());
+}
+
+TEST(HeightmapIO, a_path_that_is_not_a_regular_file_is_refused_as_unreadable) {
+    // A directory exists, so the FileNotFound guard lets it through, and
+    // file_size() then fails on it with the SAME status this returns -- which is
+    // why the is_regular_file() check could be deleted and the status assertion
+    // would not move. The message is what says which guard stopped it, and
+    // "not a regular file" is the one a user can act on.
+    const std::filesystem::path directory = std::filesystem::temp_directory_path();
+    const HeightmapImportResult result =
+        import_heightmap(directory, ElevationRange::metres(0.0, 100.0), unit_local());
+
+    CHECK_EQ(status_of(result), std::string{"FileUnreadable"});
+    CHECK_TRUE(message_says(result, "not a regular file"));
     CHECK_TRUE(result.heightmap.data.empty());
 }
 

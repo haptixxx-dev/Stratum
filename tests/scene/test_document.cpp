@@ -38,6 +38,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
@@ -124,6 +125,11 @@ Scene build_scene(Document& doc) {
     // buildings deliberately keeps no colour of its own: it inherits World's.
 
     run(doc, std::make_unique<SetLayerLockedCommand>(doc.layers(), scene.roads, true));
+    // Locked, and with descendants UNDER it -- which Roads, a Graph, has not got.
+    // Without this every layer in the fixture has own_locked == effective_locked,
+    // and a writer that saved the EFFECTIVE flag in place of the layer's own one
+    // would round trip perfectly. Blocks does the same job for visibility.
+    run(doc, std::make_unique<SetLayerLockedCommand>(doc.layers(), scene.imported, true));
     run(doc, std::make_unique<SetLayerVisibleCommand>(doc.layers(), scene.blocks, false));
 
     LayerTransform moved;
@@ -137,6 +143,15 @@ Scene build_scene(Document& doc) {
     scene.doomed = make_layer(doc, LayerKind::Shape, "Doomed", scene.imported);
     const AttributeObject orphan = doc.create_object(scene.doomed);
     scene.orphan_object = orphan;
+    // A value parked on the layer that is about to stop existing. It is reachable
+    // ONLY through the orphan's membership -- the layer is not in the tree
+    // afterwards -- so without it the layer-value leg of compare_attributes()
+    // compares two empty lists and a writer that dropped these values entirely
+    // would pass every test in this file.
+    set_attribute(stack, store,
+                  AttributeTarget::layer(static_cast<LayerRef>(scene.doomed),
+                                         store.intern("height")),
+                  AttributeValue::from_double(7.5));
     run(doc, std::make_unique<DeleteLayerCommand>(doc.layers(), scene.doomed));
 
     // ── Attributes ──────────────────────────────────────────────────────────
@@ -421,6 +436,21 @@ std::filesystem::path scratch_path(const char* name) {
     return std::filesystem::temp_directory_path() / name;
 }
 
+/// Whole file, verbatim. Empty for a file that is not there.
+std::string file_bytes(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+/// Highest layer id in one nested `roots` entry and everything under it.
+LayerId highest_layer_id(const json& node) {
+    LayerId highest = node.at("id").get<LayerId>();
+    for (const json& child : node.at("children")) {
+        highest = std::max(highest, highest_layer_id(child));
+    }
+    return highest;
+}
+
 } // namespace
 
 // ============================================================================
@@ -447,6 +477,14 @@ TEST(Document, round_trip_reproduces_the_whole_layer_tree) {
     CHECK_FALSE(loaded.layers().effective_visible(scene.buildings));  // hidden group above it
     CHECK_TRUE(loaded.layers().effective_locked(scene.roads));
     CHECK_FALSE(loaded.layers().contains(scene.doomed));
+
+    // The two flags really do disagree somewhere in this tree, which is what lets
+    // the walk above tell "this layer is locked" from "an ancestor is". Models is
+    // unlocked under a locked Imported; Buildings is visible under a hidden Blocks.
+    CHECK_FALSE(loaded.layers().find(scene.models)->own_locked);
+    CHECK_TRUE(loaded.layers().effective_locked(scene.models));
+    CHECK_TRUE(loaded.layers().find(scene.buildings)->own_visible);
+    CHECK_FALSE(loaded.layers().effective_visible(scene.buildings));
 }
 
 TEST(Document, round_trip_reproduces_every_attribute) {
@@ -466,6 +504,18 @@ TEST(Document, round_trip_reproduces_every_attribute) {
     const AttributeObject next = loaded.create_object();
     CHECK_EQ(next.index, scene.dead_slot.index);
     CHECK_EQ(next.generation, scene.dead_slot.generation + 1u);
+
+    // The value on the layer that was deleted before the save. Nothing in the
+    // tree names that layer any more, so the only thing keeping it in the file is
+    // the orphan's membership -- and it still resolves, from the layer rung.
+    const AttributeStore& store = loaded.attributes();
+    const AttributeQuery orphan_height = store.resolve(
+        scene.orphan_object, store.find_key("height"),
+        loaded.object_layer_ref(scene.orphan_object));
+    CHECK_EQ(std::string(attribute_source_name(orphan_height.source)), std::string("Layer"));
+    CHECK_EQ(orphan_height.layer, static_cast<LayerRef>(scene.doomed));
+    CHECK_TRUE(orphan_height.value != nullptr);
+    if (orphan_height.value != nullptr) CHECK_NEAR(*orphan_height.value->as_double(), 7.5, 0.0);
 }
 
 TEST(Document, sibling_order_is_file_order_not_id_order) {
@@ -830,6 +880,14 @@ TEST(Document, refuses_a_newer_format_version) {
     expect_refusal(result, "newer version");
 }
 
+TEST(Document, refuses_a_version_that_is_not_a_format_version) {
+    // 0 is not "version 1 with the member left out": it is a writer that never
+    // filled the field in, and reading it hopefully as 1 is guessing at a file
+    // that never said what it was.
+    expect_refusal(load_mutated([](json& document) { document["version"] = 0; }),
+                   "version 0 is not a format version");
+}
+
 TEST(Document, refuses_a_file_that_is_not_a_stratum_document) {
     expect_refusal(load_mutated([](json& document) { document["format"] = "blender"; }),
                    "not a Stratum document");
@@ -907,6 +965,36 @@ TEST(Document, refuses_a_self_contradictory_file) {
     // A counter at or below an id already in the file would reissue that id.
     expect_refusal(load_mutated([](json& document) { document["layers"]["next_id"] = 1; }),
                    "not above the highest layer id");
+
+    // And at the boundary, which is the value that actually causes the reuse: a
+    // counter EQUAL to an id in the file hands that id out again on the next
+    // create. A check spelled `<` instead of `<=` passes the case above and lets
+    // this one through, so the far-below case on its own pins nothing.
+    expect_refusal(load_mutated([](json& document) {
+                       LayerId highest = 0;
+                       for (const json& root : document["layers"]["roots"]) {
+                           highest = std::max(highest, highest_layer_id(root));
+                       }
+                       document["layers"]["next_id"] = highest;
+                   }),
+                   "not above the highest layer id");
+
+    // The same contradiction in the ATTRIBUTE section, where nothing else can
+    // catch it: an object's membership and a layer's parked values are both
+    // allowed to name a layer that has been deleted, so absence from the tree is
+    // not evidence. Left alone, the first layer the user creates after the load is
+    // handed that id, and a dangling membership silently becomes a live one with
+    // the file's values inherited through it.
+    expect_refusal(load_mutated([](json& document) {
+                       document["attributes"]["objects"][0]["layer"] =
+                           document["layers"]["next_id"];
+                   }),
+                   "has not been issued yet");
+    expect_refusal(load_mutated([](json& document) {
+                       document["attributes"]["layer_values"][0]["layer"] =
+                           document["layers"]["next_id"];
+                   }),
+                   "has not been issued yet");
 
     // An object table whose entries do not match their positions.
     expect_refusal(load_mutated([](json& document) {
@@ -997,6 +1085,208 @@ TEST(Document, refuses_layer_nesting_deep_enough_to_overflow_the_stack) {
     Document doc;
     expect_refusal(doc.load_from_json(text), "layer nesting is deeper than");
     CHECK_TRUE(doc.layers().empty());
+}
+
+TEST(Document, refuses_to_save_a_tree_too_deep_to_load_back) {
+    // The reader refuses past kMaxDocumentLayerDepth because it recurses over the
+    // nesting. The writer has to refuse at the SAME depth, and this is the test
+    // that says so: without it, a deep enough tree saves cleanly and then cannot
+    // be opened -- discovered, like every failure of this shape, only once the
+    // session that held the scene is gone.
+    const auto chain = [](Document& doc, size_t layers) {
+        LayerId parent = kInvalidLayer;
+        for (size_t i = 0; i < layers; ++i) {
+            parent = make_layer(doc, LayerKind::Group, "L", parent);
+        }
+    };
+
+    // A chain of N layers puts the deepest one N-1 levels below the root, so
+    // kMaxDocumentLayerDepth + 1 layers is exactly the deepest the format holds.
+    Document deepest;
+    chain(deepest, kMaxDocumentLayerDepth + 1);
+    std::string text;
+    const DocumentIoResult written = deepest.save_to_json(text);
+    CHECK_TRUE(written.ok);
+    CHECK_EQ(written.error, std::string{});
+
+    // And the reader takes it back. This is the whole point of the writer having
+    // a limit at all: one that stopped a level short would refuse documents that
+    // open perfectly, and one that stopped a level late writes documents that do
+    // not.
+    Document reopened;
+    const DocumentIoResult read = reopened.load_from_json(text);
+    CHECK_TRUE(read.ok);
+    CHECK_EQ(read.error, std::string{});
+    CHECK_EQ(reopened.layers().size(), kMaxDocumentLayerDepth + 1);
+
+    Document too_deep;
+    chain(too_deep, kMaxDocumentLayerDepth + 2);
+    std::string out = "untouched";
+    expect_refusal(too_deep.save_to_json(out), "layer nesting is deeper than");
+    CHECK_EQ(out, std::string("untouched"));
+}
+
+TEST(Document, refuses_to_save_a_generation_the_loader_could_not_restore) {
+    // The loader rebuilds a generation by replaying that many destroy/create pairs
+    // and caps what it will accept. The writer has to cap the same number: past
+    // it, the save still reports success and the file is unopenable for ever.
+    //
+    // The store's free list is LIFO, so creating and destroying one object in a
+    // loop drives the SAME slot's generation up -- which is what an importer
+    // re-run, a rule re-evaluation or tile churn does all session without anyone
+    // deciding to.
+    const auto recycle = [](Document& doc, uint32_t times) {
+        AttributeObject object = doc.create_object();
+        for (uint32_t round = 0; round < times; ++round) {
+            if (!doc.destroy_object(object)) break;
+            object = doc.create_object();
+        }
+        return object;
+    };
+
+    // At the limit exactly, both halves still work -- the boundary is `above the
+    // limit`, not `at` it, and a writer that refused one early would refuse
+    // documents the loader restores happily.
+    Document at_limit;
+    const AttributeObject last = recycle(at_limit, kMaxRestorableGeneration);
+    CHECK_EQ(last.generation, kMaxRestorableGeneration);
+    std::string text;
+    const DocumentIoResult written = at_limit.save_to_json(text);
+    CHECK_TRUE(written.ok);
+    CHECK_EQ(written.error, std::string{});
+    Document reopened;
+    const DocumentIoResult read = reopened.load_from_json(text);
+    CHECK_TRUE(read.ok);
+    CHECK_EQ(read.error, std::string{});
+    CHECK_TRUE(reopened.attributes().is_valid(last));
+
+    // One recycle further and the file would be one this build writes and refuses.
+    Document past_limit;
+    const AttributeObject beyond = recycle(past_limit, kMaxRestorableGeneration + 1u);
+    CHECK_EQ(beyond.generation, kMaxRestorableGeneration + 1u);
+    std::string out = "untouched";
+    const DocumentIoResult refused = past_limit.save_to_json(out);
+    CHECK_FALSE(refused.ok);
+    CHECK_TRUE(refused.error.find("never load again") != std::string::npos);
+    if (refused.error.find("never load again") == std::string::npos) {
+        std::printf("    message was: %s\n", refused.error.c_str());
+    }
+    // Nothing is rendered, so a caller cannot write the unopenable file anyway.
+    CHECK_EQ(out, std::string("untouched"));
+}
+
+TEST(Document, refuses_to_save_text_that_is_not_utf8) {
+    // Every string in a document is free user text: a name someone typed, a value
+    // pasted out of a Latin-1 export, a key the importer took from an OSM tag.
+    // JSON is a UTF-8 format and nlohmann's writer ENDS THE PROCESS on a string
+    // that is not -- it throws rather than returning -- so each of the four places
+    // a string reaches the file has to refuse before the render.
+    const std::string latin1 = "Caf\xe9";        // A lone 0xE9 where UTF-8 wants two bytes
+    const std::string truncated = "Ren\xc3";     // A lead byte with nothing following it
+    const std::string surrogate = "\xed\xa0\x80";  // U+D800, which UTF-8 excludes outright
+
+    const auto refuses = [](Document& doc, const char* field) {
+        std::string text = "untouched";
+        const DocumentIoResult result = doc.save_to_json(text);
+        CHECK_FALSE(result.ok);
+        CHECK_TRUE(result.error.find("not valid UTF-8") != std::string::npos);
+        // The message names the field, because "save failed" leaves a user with
+        // nowhere to look in a scene of ten thousand objects.
+        CHECK_TRUE(result.error.find(field) != std::string::npos);
+        if (result.error.find(field) == std::string::npos) {
+            std::printf("    message was: %s\n", result.error.c_str());
+        }
+        CHECK_EQ(text, std::string("untouched"));
+    };
+
+    Document named;
+    CHECK_TRUE((make_layer(named, LayerKind::Group, latin1) != kInvalidLayer));
+    refuses(named, "name");
+
+    Document valued;
+    const AttributeObject object = valued.create_object();
+    set_attribute(valued.history(), valued.attributes(),
+                  AttributeTarget::object(object, valued.attributes().intern("street")),
+                  AttributeValue::from_string("Rue " + truncated));
+    refuses(valued, "value");
+
+    Document listed;
+    const AttributeObject tagged = listed.create_object();
+    set_attribute(listed.history(), listed.attributes(),
+                  AttributeTarget::object(tagged, listed.attributes().intern("tags")),
+                  AttributeValue::from_strings({"fine", surrogate}));
+    refuses(listed, "value");
+
+    Document keyed;
+    const AttributeObject any = keyed.create_object();
+    set_attribute(keyed.history(), keyed.attributes(),
+                  AttributeTarget::object(any, keyed.attributes().intern("h\xf8yde")),
+                  AttributeValue::from_double(3.0));
+    refuses(keyed, "key");
+
+    // And on the real save path, which is the one the editor calls: a refusal,
+    // and no file -- not an empty one, and not a temporary left behind.
+    const std::filesystem::path path = scratch_path("stratum_document_bad_utf8.stratum");
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    Document to_disk;
+    CHECK_TRUE((make_layer(to_disk, LayerKind::Group, latin1) != kInvalidLayer));
+    expect_refusal(to_disk.save_to_file(path), "not valid UTF-8");
+    CHECK_TRUE(to_disk.dirty());
+    CHECK_FALSE(std::filesystem::exists(path));
+    CHECK_FALSE(std::filesystem::exists(std::filesystem::path(path).concat(".tmp")));
+
+    // Text that IS valid UTF-8 goes through untouched, so the guard is a check on
+    // well-formedness and not a ban on anything above ASCII.
+    Document accented;
+    CHECK_TRUE((make_layer(accented, LayerKind::Group, "Caf\u00e9 \u2014 \u5efa\u7269 \U0001F600")
+                != kInvalidLayer));
+    std::string good;
+    CHECK_TRUE(accented.save_to_json(good).ok);
+    Document back;
+    CHECK_TRUE(back.load_from_json(good).ok);
+    CHECK_EQ(back.layers().roots().size(), size_t{1});
+    if (!back.layers().roots().empty()) {
+        CHECK_EQ(back.layers().find(back.layers().roots()[0])->name,
+                 std::string("Caf\u00e9 \u2014 \u5efa\u7269 \U0001F600"));
+    }
+}
+
+TEST(Document, a_handle_the_document_did_not_create_is_treated_as_stale) {
+    // Document::attributes() hands out a mutable store, so
+    // `doc.attributes().create_object()` compiles and mints a handle the STORE
+    // calls valid while this document's slot mirror has never been sized for it.
+    // All three readers below index that mirror and one of them writes, so
+    // without a bounds check this is an out-of-bounds write on a user's machine
+    // reached by one plausible line of calling code.
+    Document doc;
+    const AttributeObject rogue = doc.attributes().create_object();
+    CHECK_TRUE(doc.attributes().is_valid(rogue));
+    CHECK_EQ(doc.slot_count(), size_t{0});
+
+    CHECK_EQ(doc.object_layer(rogue), kInvalidLayer);
+    CHECK_EQ(doc.object_layer_ref(rogue), kNoLayer);
+    CHECK_FALSE(doc.set_object_layer(rogue, LayerId{1}));
+    CHECK_FALSE(doc.destroy_object(rogue));
+
+    // Refused, not half-done: the store still holds the record it was asked to
+    // destroy, so the store and the mirror are no further apart than they were.
+    CHECK_TRUE(doc.attributes().is_valid(rogue));
+    CHECK_EQ(doc.slot_count(), size_t{0});
+
+    // A mirror that is merely SHORTER than the handle is the same hole one index
+    // along, so the document is given a slot of its own first.
+    Document mixed;
+    const AttributeObject mine = mixed.create_object(LayerId{7});
+    const AttributeObject theirs = mixed.attributes().create_object();
+    CHECK_EQ(mixed.slot_count(), size_t{1});
+    CHECK_EQ(mixed.object_layer(mine), LayerId{7});
+    CHECK_EQ(mixed.object_layer(theirs), kInvalidLayer);
+    CHECK_FALSE(mixed.set_object_layer(theirs, LayerId{7}));
+    CHECK_FALSE(mixed.destroy_object(theirs));
+    // And the document's own object is untouched by any of it.
+    CHECK_EQ(mixed.object_layer(mine), LayerId{7});
+    CHECK_TRUE(mixed.attributes().is_valid(mine));
 }
 
 TEST(Document, refuses_a_document_that_references_blobs_it_cannot_load) {
@@ -1182,14 +1472,19 @@ TEST(Document, a_document_round_trips_through_a_file) {
 
 TEST(Document, a_failed_save_leaves_the_file_that_was_there_alone) {
     const std::filesystem::path path = scratch_path("stratum_document_failed_save.stratum");
+    const std::filesystem::path temporary = std::filesystem::path(path).concat(".tmp");
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
+    std::filesystem::remove(temporary, ignored);
 
     Document doc;
     const LayerId layer = make_layer(doc, LayerKind::Group, "Good");
     CHECK_TRUE(doc.save_to_file(path).ok);
-    const std::string good = saved(doc);
+    const std::string good = file_bytes(path);
+    CHECK_TRUE(good.size() > 0);
 
+    // ── A save that fails before any file is opened ─────────────────────────
+    //
     // Poison the scene so rendering the JSON fails, then save over the same path.
     LayerTransform poisoned;
     poisoned.translation = glm::dvec3(0.0, std::numeric_limits<double>::infinity(), 0.0);
@@ -1198,6 +1493,7 @@ TEST(Document, a_failed_save_leaves_the_file_that_was_there_alone) {
     const DocumentIoResult result = doc.save_to_file(path);
     CHECK_FALSE(result.ok);
     CHECK_TRUE(doc.dirty());  // A failed save must not claim the document is saved.
+    CHECK_EQ(file_bytes(path), good);
 
     // The good file is still there and still loads.
     Document loaded;
@@ -1205,10 +1501,133 @@ TEST(Document, a_failed_save_leaves_the_file_that_was_there_alone) {
     CHECK_TRUE(read.ok);
     CHECK_EQ(loaded.layers().size(), size_t{1});
     CHECK_TRUE(loaded.layers().contains(layer));
-    CHECK_TRUE(good.size() > 0);
+
+    // ── A save that fails once files are involved ───────────────────────────
+    //
+    // The leg above never opens anything: the render fails first, so it passes
+    // just as well against a save_to_file() that writes STRAIGHT into the user's
+    // document. This one blocks the temporary specifically, by putting a
+    // directory where the writer wants to create it. A build that skipped the
+    // temporary would open the real file instead, truncate it, and report
+    // success -- and the bytes below would be the new document, not the old one.
+    Document second;
+    CHECK_TRUE((make_layer(second, LayerKind::Group, "Replacement") != kInvalidLayer));
+    CHECK_TRUE((make_layer(second, LayerKind::Group, "Another") != kInvalidLayer));
+    std::filesystem::create_directory(temporary, ignored);
+    CHECK_TRUE(std::filesystem::is_directory(temporary));
+
+    const DocumentIoResult blocked = second.save_to_file(path);
+    CHECK_FALSE(blocked.ok);
+    CHECK_FALSE(blocked.error.empty());
+    CHECK_TRUE(second.dirty());
+    // The assertion that matters: what was on disk is still exactly what is on
+    // disk, byte for byte.
+    CHECK_EQ(file_bytes(path), good);
+
+    Document again;
+    CHECK_TRUE(again.load_from_file(path).ok);
+    CHECK_EQ(again.layers().size(), size_t{1});
+    CHECK_TRUE(again.layers().contains(layer));
+
+    std::filesystem::remove(temporary, ignored);
+    std::filesystem::remove(path, ignored);
+}
+
+TEST(Document, refuses_a_file_larger_than_it_will_read) {
+    // The cap bounds the allocation a hostile path can cause BEFORE any parsing
+    // starts, so it is answered from the file's size and never from its contents.
+    // Which is what makes it testable for nothing: the file below is a hole.
+    const std::filesystem::path path = scratch_path("stratum_document_too_large.stratum");
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    {
+        std::ofstream create(path, std::ios::binary | std::ios::trunc);
+        CHECK_TRUE(create.good());
+    }
+
+    std::error_code ec;
+    std::filesystem::resize_file(path, kMaxDocumentFileBytes + 1u, ec);
+    if (ec) {
+        // Nothing here can grow a file cheaply, so there is nothing to test
+        // cheaply either. Reported rather than silently skipped.
+        std::printf("    could not create a sparse file: %s\n", ec.message().c_str());
+        std::filesystem::remove(path, ignored);
+        return;
+    }
+    CHECK_EQ(std::filesystem::file_size(path), kMaxDocumentFileBytes + 1u);
+
+    Document doc;
+    expect_refusal(doc.load_from_file(path), "above the limit of");
+    // Refused at the size, so the document is untouched and nothing was read.
+    CHECK_TRUE(doc.layers().empty());
+
+    std::filesystem::resize_file(path, kMaxDocumentFileBytes, ec);
+    if (!ec) {
+        // One byte under, and the size guard has nothing to say: the refusal now
+        // comes from the parser. A cap spelled `>=` would refuse here too.
+        Document edge;
+        const DocumentIoResult result = edge.load_from_file(path);
+        CHECK_FALSE(result.ok);
+        CHECK_TRUE(result.error.find("above the limit of") == std::string::npos);
+    }
 
     std::filesystem::remove(path, ignored);
-    std::filesystem::remove(std::filesystem::path(path).concat(".tmp"), ignored);
+}
+
+TEST(Document, an_over_reported_file_size_does_not_change_what_the_parser_sees) {
+    // A regular file whose reported size is larger than what a read returns is
+    // not hypothetical: every sysfs attribute reports one page and yields a few
+    // bytes, and a document truncated between the size call and the read does the
+    // same. This pins that load_from_file() gives the parser the bytes that
+    // ARRIVED -- it answers exactly as load_from_json() does on those same bytes.
+    //
+    // It does NOT pin the resize() that trims the unread tail, and it cannot:
+    // nlohmann's lexer treats a NUL byte as end of input, so trailing NUL padding
+    // is invisible to every parse this loader can reach. The one shape that could
+    // tell the two apart is content ending inside an unterminated JSON string,
+    // and no real file both over-reports its size and holds that. The resize
+    // stays because `text` should mean "what arrived", not because a test can see
+    // it.
+    //
+    // Skipped where no such file exists: there is no portable way to make a
+    // regular file over-report its size, and inventing one would test the
+    // invention instead of the loader.
+    std::filesystem::path path;
+    std::string yielded;
+    for (const char* candidate : {"/sys/devices/system/cpu/kernel_max",
+                                  "/sys/devices/system/cpu/cpu0/topology/core_id",
+                                  "/sys/kernel/mm/transparent_hugepage/hpage_pmd_size"}) {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(candidate, ec) || ec) continue;
+        const uintmax_t size = std::filesystem::file_size(candidate, ec);
+        if (ec || size == 0) continue;
+
+        std::string text(static_cast<size_t>(size), '\0');
+        std::ifstream in(candidate, std::ios::binary);
+        in.read(text.data(), static_cast<std::streamsize>(size));
+        text.resize(static_cast<size_t>(in.gcount()));
+        if (text.size() >= size) continue;  // Not a short read; no use here.
+        // The bytes that arrive must PARSE, so that a build which kept the NUL
+        // padding gives up earlier and says something different. A candidate
+        // whose content is not JSON at all cannot tell the two apart.
+        if (!json::accept(text)) continue;
+
+        path = candidate;
+        yielded = text;
+        break;
+    }
+    if (path.empty()) return;
+
+    Document from_file;
+    const DocumentIoResult file_result = from_file.load_from_file(path);
+    Document from_text;
+    const DocumentIoResult text_result = from_text.load_from_json(yielded);
+
+    CHECK_FALSE(file_result.ok);
+    CHECK_FALSE(text_result.ok);
+    // Same bytes in, so the same refusal out. With the unread tail kept, the
+    // parser trips over a NUL and these two disagree.
+    CHECK_EQ(file_result.error, text_result.error);
 }
 
 TEST(Document, refuses_a_file_that_is_not_there_or_is_not_a_file) {

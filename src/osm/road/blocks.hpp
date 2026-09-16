@@ -31,10 +31,10 @@
  *     next(h) = the arm CLOCKWISE of h's own arm at the node h arrives at
  *
  * In full: arrive at node `v` along half-edge `h`; find `h`'s own arm at `v`
- * (the one pointing back the way you came); step to the arm before it in
- * `GraphNode::arms`, which is sorted by ASCENDING bearing and therefore runs
- * anticlockwise, so the previous arm is the next one clockwise; leave along that
- * arm. Repeat until you arrive back at the half-edge you started on.
+ * (the one pointing back the way you came); step to the arm before it in the
+ * rotation at `v`, which runs anticlockwise, so the previous arm is the next one
+ * clockwise; leave along that arm. Repeat until you arrive back at the half-edge
+ * you started on.
  *
  * **The convention is clockwise-next, and it is what makes the orientation
  * predictable.** Bounded faces come out ANTICLOCKWISE (positive signed area);
@@ -43,14 +43,25 @@
  * outer-face test below would have the opposite sign. Pick the other convention
  * and every sign in this file and in C2 flips with it.
  *
+ * The rotation at a node is `GraphNode::arms` sorted ascending by bearing, with
+ * one correction this file makes for itself: RoadGraph sorts arms by bearing
+ * alone, with a non-stable sort, so two arms that leave a node on the SAME
+ * bearing come out in an arbitrary relative order. An arbitrary order is not an
+ * embedding -- the orbit decomposition of a non-embedding loses whole faces
+ * silently -- so ties are re-broken here by where the two arms first diverge.
+ * See BlockStats::duplicate_edges for the case where they never diverge at all.
+ *
  * Two properties follow, and both are load-bearing:
  *
  *   - **Every directed half-edge belongs to exactly one face.** `next` is a
  *     bijection -- reversing a half-edge is a bijection, and rotating within a
  *     node's arm list is a cyclic shift -- so the half-edges decompose into
  *     disjoint cycles. The traversal cannot loop forever and cannot visit a
- *     half-edge twice. `BlockStats::half_edges_walked` is exactly twice the
- *     number of edges walked, and a test asserts it.
+ *     half-edge twice. The evidence that the decomposition is the RIGHT one is
+ *     Euler's formula: see BlockStats::expected_faces, which a test asserts
+ *     against BlockStats::faces. `half_edges_walked` cannot carry that evidence,
+ *     because the seed loop visits every half-edge of every usable edge whatever
+ *     `next` does.
  *   - **A block lies to the LEFT of each of its bounding half-edges.** That is
  *     what anticlockwise means, and it is the whole reason C4 can classify a lot
  *     frontage: given a bounding half-edge, the block is the left side of that
@@ -63,12 +74,24 @@
  *     an extract with two disconnected street networks has two outer faces, and
  *     the small network's outer face is smaller than the large network's blocks,
  *     so "discard the biggest face" discards the wrong thing.
- *   - **Dangling ways.** A cul-de-sac is walked out and back inside the face it
- *     hangs in. The face is still correct; the spur is an antenna of zero width
- *     that contributes exactly nothing to the signed area. It is pruned out of
- *     `Block::ring` (an antenna is not a polygon anyone can offset or triangulate)
- *     but every half-edge of it stays in `Block::edges`, in both directions,
- *     because a cul-de-sac still fronts the block it dead-ends into.
+ *   - **Cut edges.** An edge whose two half-edges land in the SAME face is a cut
+ *     edge: the land is continuous across it, so it bounds nothing. A cul-de-sac
+ *     spur is the familiar one, walked out and back inside the face it hangs in.
+ *     The general one is any street that joins a sub-network to the rest at a
+ *     single node -- a turning bulb mapped as a closed way, a housing estate off
+ *     one access road -- and there the two traversals are NOT adjacent in the
+ *     walk, because the whole sub-network is walked between them. Cut edges are
+ *     removed from the boundary TOPOLOGICALLY, by that same-face test, and never
+ *     by looking for a point that repeats. Every half-edge of them stays in
+ *     `Block::edges`, in both directions, because a cul-de-sac still fronts the
+ *     block it dead-ends into.
+ *   - **Cut vertices.** The same sub-network can hang off a single NODE with no
+ *     street between -- a turning bulb or an estate loop whose closed way shares
+ *     one node with the road it serves. There is no cut edge to find, and the face
+ *     walks out round the loop and back through that one node, so its boundary
+ *     pinches to a point there. Area and perimeter survive a pinch; the shape does
+ *     not, so the curve is split at the repeated vertex into a boundary and a
+ *     `Block::holes` entry.
  *   - **Multiple components.** Handled for free: the traversal enumerates orbits,
  *     not components, and each component contributes its own outer face.
  *   - **Bridges and tunnels.** NO intersection is ever invented from geometry.
@@ -76,21 +99,32 @@
  *     do not divide a block -- which is also physically true, since the land under
  *     a flyover is continuous. The cost is that the planar-face assumption is only
  *     as planar as the data: a grade-separated edge that DOES bound a face can
- *     make that face's ring self-intersect. Such blocks are flagged rather than
- *     silently trusted; see Block::has_grade_separated_edge.
- *   - **Degenerate faces.** Two ways between the same pair of nodes enclose a
- *     sliver, and a component that is a tree (an isolated dead-end road) walks one
- *     face of zero area. Both are rejected; see BlockConfig::min_area.
+ *     make that face's ring self-intersect, and can cost the traversal a face
+ *     outright. Such blocks are flagged rather than silently trusted (see
+ *     Block::has_grade_separated_edge), and the count that says a face went
+ *     missing is BlockStats::expected_faces against BlockStats::faces.
+ *   - **Duplicate ways.** Two ways mapped between the same pair of nodes with the
+ *     same geometry are a mapping artefact, not topology. They give their arms
+ *     identical bearings at both ends, which no tie-break can turn into an
+ *     embedding, so the later one is dropped before the traversal and counted in
+ *     BlockStats::duplicate_edges. Two ways that merely run CLOSE together still
+ *     enclose a real sliver, and that is rejected by BlockConfig::min_area.
+ *   - **Degenerate faces.** A component that is a tree walks one face that
+ *     encloses nothing, and a cycle whose nodes are collinear walks a face of
+ *     exactly zero area. They are counted apart, as BlockStats::tree_faces and
+ *     BlockStats::zero_area_faces, and apart again from
+ *     BlockStats::malformed_faces, which means the graph itself was inconsistent.
  *
  * ### What this does NOT do
  *
  *   - **No lot subdivision.** That is C2 and it reads this output.
- *   - **No holes.** A block ring is an outer boundary. A disconnected street
- *     network sitting entirely inside another network's face is not subtracted
- *     from it, because a face traversal has no way to learn about a component it
- *     never touches. Islands are rare enough, and expensive enough to detect (a
- *     point-in-polygon test of every component against every face), that C2 gets
- *     to decide whether it cares.
+ *   - **No island holes.** A disconnected street network sitting entirely inside
+ *     another network's face is not subtracted from it, because a face traversal
+ *     has no way to learn about a component it never touches. Islands are rare
+ *     enough, and expensive enough to detect (a point-in-polygon test of every
+ *     component against every face), that C2 gets to decide whether it cares.
+ *     `Block::holes` is only ever the holes the traversal WALKED -- a loop the
+ *     face reaches across a cut edge -- which it knows about exactly.
  *   - **No merging across a tunnel.** A tunnel whose two portals both attach to
  *     the surface network splits the land above it into two faces, which is wrong
  *     at ground level. `has_grade_separated_edge` marks both halves so a caller
@@ -131,9 +165,10 @@ using BlockId = uint32_t;
  * the right side of that street's centreline.
  *
  * The same EdgeId may appear TWICE in one block, once each way, when the edge has
- * the same face on both sides: a cul-de-sac spur hanging inside the block, or any
- * cut edge of the graph. That is not a duplicate to be filtered out -- both sides
- * of that street really do front this block.
+ * the same face on both sides: a cul-de-sac spur hanging inside the block, the
+ * access road of an estate inside it, or any other cut edge of the graph. That is
+ * not a duplicate to be filtered out -- both sides of that street really do front
+ * this block.
  */
 struct BlockEdge {
     /// Edge in the source RoadGraph
@@ -154,15 +189,15 @@ struct Block {
     BlockId id = 0;
 
     /**
-     * @brief Boundary as a closed anticlockwise ring, first point NOT repeated
+     * @brief Outer boundary as a closed anticlockwise ring, first point NOT repeated
      *
      * Same convention as Corridor::outline, so the two can be handed to the same
      * clipping and triangulation code without a special case.
      *
      * Carries every polyline vertex of every bounding edge, not just the graph
-     * nodes, so a curved street stays curved. Consecutive duplicates and zero-width
-     * antennae (see the file header) are removed, so the ring has at least three
-     * points and encloses real area.
+     * nodes, so a curved street stays curved. Cut edges never reach it and a curve
+     * that pinches at a repeated vertex is split before it does, so the ring has at
+     * least three points, repeats no point, and encloses real area.
      */
     std::vector<glm::dvec2> ring;
 
@@ -181,22 +216,49 @@ struct Block {
     std::vector<uint32_t> ring_edges;
 
     /**
+     * @brief Land the ring encloses but the block does not own, each ring CLOCKWISE
+     *
+     * A hole is a loop of street the face reaches and walks all the way round: the
+     * turning bulb of a cul-de-sac, the loop road of an estate. It gets there
+     * across a cut edge (the access road) or through a single shared node, and the
+     * land inside it is its own block, so this block does not own it and `area`
+     * already has it subtracted.
+     *
+     * Each hole is closed, its first point is not repeated, and it runs CLOCKWISE
+     * -- the opposite of `ring` -- which is the orientation Clipper2 and earcut
+     * both take to mean a hole, so C2 can hand ring and holes straight to either.
+     *
+     * Empty for the overwhelming majority of blocks. It is NOT the islands of
+     * disconnected networks; see "What this does NOT do" in the file header.
+     */
+    std::vector<std::vector<glm::dvec2>> holes;
+
+    /// Owning half-edge per hole vertex; `hole_edges[h]` is parallel to `holes[h]`,
+    /// and indexes `edges` exactly as `ring_edges` does.
+    std::vector<std::vector<uint32_t>> hole_edges;
+
+    /**
      * @brief Every half-edge walked, in traversal order
      *
-     * Includes the spur half-edges that `ring` had pruned away, so this is a
+     * Includes the cut-edge half-edges that never reach `ring`, so this is a
      * complete list of the streets that front the block and `edges.size()` is
      * generally larger than the number of distinct ring segments.
      */
     std::vector<BlockEdge> edges;
 
-    /// Enclosed area in square metres. Always strictly positive; see BlockConfig::min_area.
+    /**
+     * @brief Enclosed area in square metres, holes already subtracted
+     *
+     * Always strictly positive; see BlockConfig::min_area.
+     */
     double area = 0.0;
 
     /**
-     * @brief Length of `ring` in metres
+     * @brief Length of `ring` plus every hole, in metres
      *
-     * Of the PRUNED ring, so it is the length of the land boundary and not the
-     * distance walked. Carried because it is the cheap half of a compactness test
+     * The length of the land boundary, not the distance walked: a cut edge is
+     * walked twice and contributes nothing here, because no land stops at it.
+     * Carried because it is the cheap half of a compactness test
      * (4*pi*area / perimeter^2), which is the only way to tell a genuine long thin
      * block -- the median strip of a dual carriageway -- from a city block, and
      * BlockConfig::min_area cannot do it. Recomputing it downstream means walking
@@ -228,8 +290,8 @@ struct BlockConfig {
      *
      * A degeneracy filter and nothing more. It exists for the sliver two ways
      * enclose when they run between the same pair of nodes a metre or two apart --
-     * a divided way, a mapping duplicate, a service road drawn twice -- and for the
-     * zero-area face of a component that is a tree.
+     * a divided way, a mapping duplicate, a service road drawn twice -- and for any
+     * other face too small to be land.
      *
      * It is deliberately far below the size of a real block. A terrace block is
      * 800 m^2 and there is no floor that kills a dual carriageway's median strip
@@ -262,6 +324,17 @@ struct BlockConfig {
      * these edges merges.
      */
     bool include_grade_separated = true;
+
+    /**
+     * @brief Drop an edge whose geometry duplicates another between the same nodes
+     *
+     * Default ON, and off is for diagnostics only. Two coincident ways have equal
+     * arm bearings at both ends, and equal bearings are not an embedding: the orbit
+     * decomposition collapses and the surrounding block is the thing that vanishes,
+     * not the sliver. Turn it off to see how many edges that is; see
+     * BlockStats::duplicate_edges.
+     */
+    bool drop_duplicate_edges = true;
 };
 
 // ============================================================================
@@ -276,14 +349,37 @@ struct BlockConfig {
  * be five looks exactly like a correct one. These counts are how a test proves the
  * traversal covered the graph, and how a caller notices that half the extract was
  * filtered away.
+ *
+ * The three ways a face can come to nothing are counted APART. Merging them would
+ * put the one count that means "the graph is inconsistent" in the same bucket as
+ * the most common benign case -- a dead-end road that encloses nothing -- and then
+ * nothing in the output says the difference.
  */
 struct BlockStats {
     size_t edges_considered = 0;    ///< Edges in the source graph
-    size_t edges_used = 0;          ///< Edges that passed the class and layer filters
-    size_t half_edges_walked = 0;   ///< Must equal 2 * edges_used; see the file header
+    size_t edges_used = 0;          ///< Edges that passed the class, layer and duplicate filters
+    size_t duplicate_edges = 0;     ///< Edges dropped as geometric duplicates; see BlockConfig
+    size_t half_edges_walked = 0;   ///< Half-edges seeded or stepped on. Equals 2 * edges_used.
     size_t faces = 0;               ///< Orbits found, outer and degenerate faces included
+
+    /**
+     * @brief Faces a planar embedding of the usable subgraph must have
+     *
+     * Euler's formula: edges_used - nodes_used + 2 * components, over the usable
+     * edges and the nodes that carry at least one usable arm.
+     *
+     * This is the only cheap signal that the embedding was NOT planar. Two ways
+     * that cross where the data shares no node are not a junction, so the traversal
+     * is right to walk straight past them -- but the orbits it then finds can be
+     * fewer than the faces the drawing has, and the missing face is a block that
+     * silently does not exist. `faces < expected_faces` says so; nothing else does.
+     */
+    size_t expected_faces = 0;
+
     size_t outer_faces = 0;         ///< Faces discarded for having negative signed area
-    size_t degenerate_faces = 0;    ///< Faces that pruned down to under three points or zero area
+    size_t tree_faces = 0;          ///< Faces with no boundary left once cut edges are removed
+    size_t zero_area_faces = 0;     ///< Faces with a boundary but no interior, e.g. a collinear cycle
+    size_t malformed_faces = 0;     ///< Faces abandoned: the graph or the embedding is inconsistent
     size_t rejected_small = 0;      ///< Bounded faces discarded by BlockConfig::min_area
     size_t blocks = 0;              ///< Faces kept. Equals BlockExtraction::blocks.size().
 };

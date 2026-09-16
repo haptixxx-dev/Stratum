@@ -121,6 +121,31 @@ inline double distance_sq(const glm::dvec2& a, const glm::dvec2& b) {
     return d.x * d.x + d.y * d.y;
 }
 
+/**
+ * @brief Has @p candidate a better claim to a shared OSM id than @p holder?
+ *
+ * Several GraphNodes can carry one osm_id -- that is what the per-layer split at
+ * a grade separation produces -- and exactly one of them can keep it here,
+ * because identity in this file is the id alone. The answer has to come off the
+ * data and never off the order the edges happen to be visited in; see
+ * from_road_graph() for what order-dependence costs.
+ *
+ * Most arms wins: the id belongs to the grade that most of the network meets
+ * there, so a road passing through keeps it over a stub that merely ends on it.
+ * Ties go to the lowest layer=*, because an OSM node id carrying no layer of its
+ * own means the ground. The last tie-break on the handle is unreachable from a
+ * built RoadGraph -- nodes sharing an osm_id were split BY layer, so they cannot
+ * also agree on it -- and exists so the rule is total rather than nearly total.
+ */
+bool better_claim(const GraphNode& candidate, GraphNodeId candidate_handle,
+                  const GraphNode& holder, GraphNodeId holder_handle) {
+    if (candidate.arms.size() != holder.arms.size()) {
+        return candidate.arms.size() > holder.arms.size();
+    }
+    if (candidate.layer != holder.layer) return candidate.layer < holder.layer;
+    return candidate_handle < holder_handle;
+}
+
 /// The ids of @p ids with every occurrence of @p drop removed and every
 /// consecutive duplicate that leaves behind collapsed
 std::vector<NodeId> without_node(const std::vector<NodeId>& ids, NodeId drop) {
@@ -292,12 +317,12 @@ bool EditableGraph::insert_node(EditableNode node) {
     if (node.id == kInvalidNode) return false;
     if (contains_node(node.id)) return false;
 
-    // Keep the allocator strictly below anything already present, so a graph
-    // seeded from an extract that has been through an editor -- and therefore
-    // already contains negative ids -- cannot have a later authored node collide
-    // with one of them.
-    if (node.id <= m_next_node_id) m_next_node_id = node.id - 1;
-
+    // No allocator priming here, deliberately. Every id that reaches this
+    // function came either from reserve_node_id() -- already below the counter --
+    // or from from_road_graph(), which primes below the whole extract before it
+    // creates a single node. A second copy of the rule here would be a branch no
+    // caller can reach, so no test could hold it to anything; it read as a safety
+    // net and was one only for as long as nobody leaned on it.
     const NodeId id = node.id;
     m_nodes.emplace(id, std::move(node));
     mark_node_dirty(id);
@@ -331,9 +356,10 @@ bool EditableGraph::insert_segment(EditableSegment segment) {
     if (contains_segment(segment.id)) return false;
     if (!valid_nodes(segment.node_ids)) return false;
 
-    if (segment.source_way <= m_next_way_id) m_next_way_id = segment.source_way - 1;
-    if (segment.id >= m_next_segment_id) m_next_segment_id = segment.id + 1;
-
+    // Neither allocator is primed here; see insert_node() for why. A way id
+    // arrives from reserve_way_id() or from an extract from_road_graph() has
+    // already primed against, and a segment handle only ever from
+    // reserve_segment_id().
     const SegmentId id = segment.id;
     const std::vector<NodeId> ids = segment.node_ids;
     m_segments.emplace(id, std::move(segment));
@@ -353,9 +379,16 @@ bool EditableGraph::erase_segment(SegmentId id) {
     m_segments.erase(it);
 
     mark_segment_dirty(id);
-    // Marked AFTER the erase, so the neighbours that remain at each node are
-    // marked and this segment is not re-added through them. Its own id is in the
-    // set either way, which is what tells B4 to drop it.
+    // Every node the segment let go of, and through mark_node_dirty() every
+    // segment still standing at one of them: their junctions each just lost an
+    // arm. The erased id stays in the set although the segment is gone, which is
+    // what tells B4 to drop what it had solved for it.
+    //
+    // Marking before rather than after the erase would give the identical two
+    // sets -- ahead of it, segments_at() still lists this segment and adds an id
+    // that mark_segment_dirty() puts there anyway -- so this order is for reading
+    // and not for behaviour. Do not read a guarantee into it that no test could
+    // hold it to.
     for (const NodeId node : ids) mark_node_dirty(node);
     return true;
 }
@@ -464,18 +497,65 @@ EditableGraph EditableGraph::from_road_graph(const RoadGraph& graph) {
     // handles copies that decision instead of re-deriving it from layer=*.
     std::vector<NodeId> node_of(graph.nodes().size(), kInvalidNode);
 
-    // OSM ids already spent. The second GraphNode carrying one is the layer
-    // split, and it has to get its own identity or the bridge rejoins the road
-    // beneath it.
+    // ------------------------------------------------------------------------
+    // Decide WHICH GraphNode keeps each OSM id, before a single node is created.
+    //
+    // Several GraphNodes can carry one osm_id and only one of them can keep it,
+    // because identity here is the id alone. The answer used to be "whoever asks
+    // first", which is the order of RoadGraph::edges() and therefore the order of
+    // ParsedOSMData::roads. List the same two ways the other way round and the
+    // OSM id moved to the other grade: a NodeId held by a selection, a rule or a
+    // saved document then named a different piece of road after a reload. That is
+    // a handle silently retargeting, on the load path, which is the one failure
+    // this whole file is built to make impossible. See better_claim() for the
+    // rule that replaces it.
+    // ------------------------------------------------------------------------
+    std::map<NodeId, GraphNodeId> keeper;
+    for (size_t i = 0; i < graph.nodes().size(); ++i) {
+        const auto handle = static_cast<GraphNodeId>(i);
+        const GraphNode& node = graph.node(handle);
+        if (node.osm_id == kInvalidNode) continue;
+
+        const auto [entry, inserted] = keeper.emplace(node.osm_id, handle);
+        if (!inserted
+            && better_claim(node, handle, graph.node(entry->second), entry->second)) {
+            entry->second = handle;
+        }
+    }
+
+    // OSM ids already spent. Every id a GraphNode keeps is spoken for before the
+    // edge walk starts, so an interior shape point cannot take one out from under
+    // the node that won it -- which would be the same order-dependence by another
+    // route.
     std::set<NodeId> claimed;
+    for (const auto& entry : keeper) claimed.insert(entry.first);
+
     size_t rekeyed = 0;
 
-    auto claim = [&](NodeId preferred) -> NodeId {
-        if (preferred != kInvalidNode && claimed.insert(preferred).second) return preferred;
+    /// A fresh local identity, for a node that does not keep an OSM id.
+    auto rekey = [&]() -> NodeId {
         ++rekeyed;
         const NodeId fresh = out.reserve_node_id();
         claimed.insert(fresh);
         return fresh;
+    };
+
+    /// Identity for an interior shape point, which has no GraphNode to speak for
+    /// it. A built RoadGraph gives a node that two ways reference a GraphNode of
+    /// its own, so a shape point's id belongs to nothing else; a duplicate here
+    /// is broken data and is given its own identity rather than joined to
+    /// anything.
+    auto claim = [&](NodeId preferred) -> NodeId {
+        if (preferred != kInvalidNode && claimed.insert(preferred).second) return preferred;
+        return rekey();
+    };
+
+    /// Identity for a GraphNode: its OSM id when it won the id, a fresh local one
+    /// when another grade did.
+    auto identity_of = [&](GraphNodeId handle, const GraphNode& source) -> NodeId {
+        const auto entry = keeper.find(source.osm_id);
+        if (entry != keeper.end() && entry->second == handle) return source.osm_id;
+        return rekey();
     };
 
     size_t skipped = 0;
@@ -497,7 +577,7 @@ EditableGraph EditableGraph::from_road_graph(const RoadGraph& graph) {
                 if (handle < node_of.size()) {
                     if (node_of[handle] == kInvalidNode) {
                         const GraphNode& source = graph.node(handle);
-                        id = claim(source.osm_id);
+                        id = identity_of(handle, source);
 
                         EditableNode node;
                         node.id = id;

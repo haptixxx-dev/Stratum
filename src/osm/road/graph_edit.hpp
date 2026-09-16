@@ -70,7 +70,10 @@
  *
  * Seeding from an import primes both counters below anything already present,
  * because an extract that has been through an editor can itself contain
- * negative ids. See `from_road_graph()`.
+ * negative ids. `from_road_graph()` is the one place that does it, and the only
+ * place that can: every other id in the file comes out of the allocators
+ * themselves, so a second copy of the rule further down would be a branch no
+ * caller could reach and no test could hold to anything.
  *
  * ### Every mutation is a Command
  *
@@ -185,8 +188,15 @@ struct SegmentAttributes {
     std::string name;       ///< Road name from name=*
 };
 
-/// Exact equality over EVERY field. This is what the split test asserts against,
-/// so a field added above without being added here weakens that test silently.
+/**
+ * @brief Exact equality over EVERY field
+ *
+ * `segment_attributes_compare_field_by_field` pins this one field at a time, and
+ * it has to: a test that asserts "the split copied the tags" through nothing but
+ * this operator cannot tell a dropped field from an operator that answers true to
+ * everything, and for a while none of them could. A field added to the struct
+ * above needs a line here AND a line in that test; neither alone is a check.
+ */
 [[nodiscard]] bool operator==(const SegmentAttributes& a, const SegmentAttributes& b);
 [[nodiscard]] bool operator!=(const SegmentAttributes& a, const SegmentAttributes& b);
 
@@ -291,11 +301,20 @@ public:
      *     its ramps. RoadGraph already made that call; this copies its answer
      *     rather than second-guessing it from the tags.
      *
-     * Where one osm_id has to become two nodes, the second and later ones are
-     * re-keyed to fresh negative ids. Re-keying rather than compound-keying is
-     * what keeps "two ways meet iff they share a node id" exceptionless: a
-     * (id, layer) key would mean identity was sometimes a pair, and every
-     * consumer would have to know which.
+     * Where one osm_id has to become two nodes, one of them keeps it and the
+     * others are re-keyed to fresh negative ids. Re-keying rather than
+     * compound-keying is what keeps "two ways meet iff they share a node id"
+     * exceptionless: a (id, layer) key would mean identity was sometimes a pair,
+     * and every consumer would have to know which.
+     *
+     * **Which one keeps it is decided by the data, not by the order of the
+     * ways.** The node with the most arms wins, ties go to the lowest layer=*.
+     * Deciding it by iteration order instead -- first edge to reach the id keeps
+     * it -- made the mapping from OSM node id to physical identity a property of
+     * ParsedOSMData::roads: re-list the same two ways the other way round and the
+     * id names the other grade. Every NodeId a selection, a rule or a saved
+     * document held would then address a different piece of road after a reload,
+     * which is the retargeting handle this file exists to prevent.
      *
      * Edges with fewer than two vertices, or whose node_ids are not parallel to
      * their polyline, are skipped; they carry no usable topology, which is the

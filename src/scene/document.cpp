@@ -230,6 +230,40 @@ public:
 }
 
 /**
+ * @brief Read a layer id the ATTRIBUTE section carries, bounded by the file's own counter
+ *
+ * load_layers() already refuses a file whose `next_id` is not above every id in
+ * the layer TREE, because a counter that has not passed an id would hand that id
+ * out a second time. The two ids the attribute section carries -- an object's
+ * membership, and the layer a parked value sits on -- need the same bound, and
+ * for a sharper reason: both are allowed to name a layer that no longer exists,
+ * so being absent from the tree is not evidence of anything and nothing else can
+ * catch them.
+ *
+ * An id at or above `next_id` is a file contradicting itself, and the damage is
+ * delayed rather than absent: the FIRST layer the user creates after such a load
+ * is handed that id, at which point a dangling membership silently becomes
+ * membership of a live layer and the file's parked values are inherited through
+ * it. That is invariant 2 in document.hpp -- a handle written in the file names
+ * the same thing after a load -- and this is the last place that could break it.
+ *
+ * kInvalidLayer is NOT refused here: an object in no layer writes 0, and 0 is
+ * below every legal `next_id`. The one caller for which 0 is wrong says so
+ * itself.
+ */
+[[nodiscard]] bool read_layer_ref_member(const json& parent, const char* name,
+                                         const std::string& where, uint64_t next_id, uint64_t& out,
+                                         std::string& error) {
+    if (!read_u64_member(parent, name, where, kMaxLayerId, out, error)) return false;
+    if (out >= next_id) {
+        return bad(error, at(where, name),
+                   "names layer " + std::to_string(out) + ", which " + at(kLayers, kNextId) + " ("
+                       + std::to_string(next_id) + ") says has not been issued yet");
+    }
+    return true;
+}
+
+/**
  * @brief Read a finite double
  *
  * JSON has no spelling for NaN or an infinity, so nlohmann writes them as null
@@ -282,6 +316,98 @@ template <typename Vec>
     return true;
 }
 
+/**
+ * @brief Index of the first byte that is not part of well-formed UTF-8, if any
+ *
+ * Well-formed here means exactly what nlohmann's dump() enforces, which is RFC
+ * 3629: no overlong encoding, no surrogate half (U+D800..U+DFFF), nothing above
+ * U+10FFFF. An embedded NUL is fine -- it is valid UTF-8, and JSON escapes it.
+ *
+ * Hand-written rather than borrowed from nlohmann because nlohmann's check lives
+ * inside dump() and reports by THROWING. This one has to answer before anything
+ * is written, and name the offending byte so the message is one a user can act
+ * on.
+ */
+[[nodiscard]] std::optional<size_t> first_invalid_utf8_byte(std::string_view text) {
+    size_t i = 0;
+    while (i < text.size()) {
+        const auto lead = static_cast<unsigned char>(text[i]);
+        if (lead < 0x80u) {
+            ++i;
+            continue;
+        }
+
+        size_t extra = 0;
+        uint32_t code = 0;
+        if (lead >= 0xC2u && lead <= 0xDFu) {
+            extra = 1;
+            code = lead & 0x1Fu;
+        } else if (lead >= 0xE0u && lead <= 0xEFu) {
+            extra = 2;
+            code = lead & 0x0Fu;
+        } else if (lead >= 0xF0u && lead <= 0xF4u) {
+            extra = 3;
+            code = lead & 0x07u;
+        } else {
+            // A continuation byte with no lead, 0xC0/0xC1 (which can only ever
+            // begin an overlong), or a lead above 0xF4 (above U+10FFFF).
+            return i;
+        }
+
+        if (extra >= text.size() - i) return i;  // Truncated at the end of the string.
+        for (size_t k = 1; k <= extra; ++k) {
+            const auto continuation = static_cast<unsigned char>(text[i + k]);
+            if (continuation < 0x80u || continuation > 0xBFu) return i + k;
+            code = (code << 6) | (continuation & 0x3Fu);
+        }
+        // The lead byte alone cannot rule out an overlong three- or four-byte
+        // sequence, nor a surrogate, so those are checked on the decoded value.
+        if (extra == 2 && (code < 0x800u || (code >= 0xD800u && code <= 0xDFFFu))) return i;
+        if (extra == 3 && (code < 0x10000u || code > 0x10FFFFu)) return i;
+        i += extra + 1u;
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] std::string hex_byte(unsigned char value) {
+    constexpr char kDigits[] = "0123456789ABCDEF";
+    return std::string{kDigits[value >> 4u], kDigits[value & 0x0Fu]};
+}
+
+/**
+ * @brief Refuse a string JSON cannot carry, instead of letting dump() end the process
+ *
+ * The counterpart of write_double(), and it exists for a sharper version of the
+ * same reason. nlohmann's dump() THROWS json::type_error on a string that is not
+ * well-formed UTF-8 -- it does not return a failure -- so an unguarded save turns
+ * "File > Save" into the editor dying at the exact moment the user asked for
+ * their work to be kept, which is the one moment this whole file exists to make
+ * safe.
+ *
+ * Every string in a document is free user text: a layer name someone typed or
+ * pasted out of a Latin-1 spreadsheet, and, once the importer starts filling the
+ * store, an OSM tag map straight off the internet. So the bytes are checked
+ * where they are written, with the field named, rather than being trusted as far
+ * as dump().
+ *
+ * Refusing is the only outcome that keeps the data. json::error_handler_t::replace
+ * would make the save succeed by writing U+FFFD over every byte it did not
+ * understand: the user would keep a file and lose the name inside it, and would
+ * not be told. A refusal leaves the document intact and in front of them.
+ */
+[[nodiscard]] bool write_string(std::string_view value, const std::string& where, json& out,
+                                std::string& error) {
+    const std::optional<size_t> offender = first_invalid_utf8_byte(value);
+    if (offender.has_value()) {
+        return bad(error, where,
+                   "is not valid UTF-8 -- byte " + std::to_string(*offender) + " is 0x"
+                       + hex_byte(static_cast<unsigned char>(value[*offender]))
+                       + " -- and a " + kDocumentFileExtension + " file is UTF-8 JSON");
+    }
+    out = std::string(value);
+    return true;
+}
+
 [[nodiscard]] bool write_attribute_value(const AttributeValue& value, const std::string& where,
                                          json& out, std::string& error) {
     // The type tag is written even where JSON could carry the type on its own,
@@ -300,9 +426,12 @@ template <typename Vec>
         out[kValue] = std::move(number);
         return true;
     }
-    case AttributeType::String:
-        out[kValue] = *value.as_string();
+    case AttributeType::String: {
+        json text;
+        if (!write_string(*value.as_string(), value_path, text, error)) return false;
+        out[kValue] = std::move(text);
         return true;
+    }
     case AttributeType::BoolArray: {
         json array = json::array();
         for (const bool element : *value.as_bool_array()) array.push_back(element);
@@ -322,7 +451,12 @@ template <typename Vec>
     }
     case AttributeType::StringArray: {
         json array = json::array();
-        for (const std::string& element : *value.as_string_array()) array.push_back(element);
+        const AttributeValue::StringArray& elements = *value.as_string_array();
+        for (size_t i = 0; i < elements.size(); ++i) {
+            json text;
+            if (!write_string(elements[i], at(value_path, i), text, error)) return false;
+            array.push_back(std::move(text));
+        }
         out[kValue] = std::move(array);
         return true;
     }
@@ -409,9 +543,17 @@ using ValuePair = std::pair<AttributeKey, AttributeValue>;
                                     json& out, std::string& error) {
     out = json::array();
     for (size_t i = 0; i < values.size(); ++i) {
+        const std::string record_path = at(where, i);
         json record = json::object();
-        record[kKey] = std::string(store.key_name(values[i].first));
-        if (!write_attribute_value(values[i].second, at(where, i), record, error)) return false;
+        // A key name is user text too: the importer interns whatever the OSM tag
+        // map calls a tag, and a rule language will intern whatever the rule says.
+        json key_name;
+        if (!write_string(store.key_name(values[i].first), at(record_path, kKey), key_name,
+                          error)) {
+            return false;
+        }
+        record[kKey] = std::move(key_name);
+        if (!write_attribute_value(values[i].second, record_path, record, error)) return false;
         out.push_back(std::move(record));
     }
     return true;
@@ -573,7 +715,9 @@ template <typename MakeTarget>
     out = json::object();
     out[kId] = layer->id;
     out[kKind] = layer_kind_name(layer->kind);
-    out[kName] = layer->name;
+    json name;
+    if (!write_string(layer->name, at(where, kName), name, error)) return false;
+    out[kName] = std::move(name);
     out[kOwnVisible] = layer->own_visible;
     out[kOwnLocked] = layer->own_locked;
 
@@ -669,8 +813,37 @@ AttributeObject Document::create_object(LayerId layer) {
     return handle;
 }
 
+/**
+ * @brief Does the slot mirror know about this handle?
+ *
+ * m_attributes.is_valid() is the STORE's answer, and the store is reachable
+ * without going through this class: attributes() hands out a mutable
+ * AttributeStore&, so `doc.attributes().create_object()` compiles, returns a
+ * handle the store calls valid, and leaves m_slots shorter than that handle's
+ * index. create_object() already reports that disagreement; the three functions
+ * below index the mirror, and one of them WRITES, so an index the mirror never
+ * sized for is an out-of-bounds write rather than a wrong answer.
+ *
+ * A handle the mirror has never heard of gets the same answers a stale one gets:
+ * this document does not know that object, because this document did not create
+ * it. Refusing is not the fix -- Document::attributes() being mutable is -- but
+ * narrowing that accessor is a change A2 has no business making, and an
+ * unchecked index is not something to leave lying around in the meantime.
+ */
+bool Document::has_slot(AttributeObject obj) const {
+    if (obj.index < m_slots.size()) return true;
+    spdlog::error("Document: object slot {} is valid in the store but outside this document's "
+                  "mirror of {} slot(s); object lifetime must go through "
+                  "Document::create_object()",
+                  obj.index, m_slots.size());
+    return false;
+}
+
 bool Document::destroy_object(AttributeObject obj) {
     if (!m_attributes.is_valid(obj)) return false;
+    // Before the store is touched, not after: destroying the record and then
+    // failing to update the mirror would leave the two disagreeing for good.
+    if (!has_slot(obj)) return false;
 
     if (obj.generation == 0xFFFFFFFFu) {
         // One more destroy wraps the generation to 0, at which point a handle
@@ -699,6 +872,7 @@ bool Document::destroy_object(AttributeObject obj) {
 
 bool Document::set_object_layer(AttributeObject obj, LayerId layer) {
     if (!m_attributes.is_valid(obj)) return false;
+    if (!has_slot(obj)) return false;
     ObjectSlot& slot = m_slots[obj.index];
     if (slot.layer == layer) return true;
     slot.layer = layer;
@@ -708,6 +882,7 @@ bool Document::set_object_layer(AttributeObject obj, LayerId layer) {
 
 LayerId Document::object_layer(AttributeObject obj) const {
     if (!m_attributes.is_valid(obj)) return kInvalidLayer;
+    if (!has_slot(obj)) return kInvalidLayer;
     return m_slots[obj.index].layer;
 }
 
@@ -800,6 +975,38 @@ DocumentIoResult DocumentWriter::write(Document& doc, std::string& out) {
         layer_values.emplace_back(id, std::move(values));
     }
 
+    // Refused here, not only on the way back in. The loader rebuilds a slot's
+    // generation by replaying that many destroy/create pairs through
+    // AttributeStore's public API, so it caps what it will accept -- per slot, and
+    // in total. Without the same bound at SAVE time this build writes files it
+    // then refuses to open for ever, and the session that could still have
+    // exported the data is gone by the time anyone finds out.
+    //
+    // It is not a far-fetched number. The store's free list is LIFO, so anything
+    // that creates and destroys one object over and over -- an importer re-run, a
+    // rule re-evaluation, a procgen preview, tile churn -- drives the SAME slot's
+    // generation up all session. Saying so while the document is still on screen
+    // is the whole value of the check.
+    size_t replay_steps = 0;
+    for (size_t i = 0; i < doc.m_slots.size(); ++i) {
+        const uint32_t generation = doc.m_slots[i].generation;
+        const std::string path = at(at(kAttributes, kObjects), i);
+        if (generation > kMaxRestorableGeneration) {
+            return DocumentIoResult::failure(
+                at(path, kGeneration) + ": is " + std::to_string(generation) + ", above the "
+                + std::to_string(kMaxRestorableGeneration)
+                + " this build can restore, so the document would save and never load again");
+        }
+        replay_steps += static_cast<size_t>(generation);
+        if (replay_steps > kMaxGenerationReplaySteps) {
+            return DocumentIoResult::failure(
+                at(kAttributes, kObjects) + ": would need more than "
+                + std::to_string(kMaxGenerationReplaySteps)
+                + " steps to restore its object generations, so the document would save and never "
+                  "load again");
+        }
+    }
+
     std::vector<ObjectSnapshot> snapshots(doc.m_slots.size());
     for (size_t i = 0; i < doc.m_slots.size(); ++i) {
         if (!doc.m_slots[i].alive) continue;
@@ -846,7 +1053,14 @@ DocumentIoResult DocumentWriter::write(Document& doc, std::string& out) {
     json attributes = json::object();
 
     json keys = json::array();
-    for (const AttributeKey key : used_keys) keys.push_back(std::string(store.key_name(key)));
+    const std::string keys_path = at(kAttributes, kKeys);
+    for (size_t i = 0; i < used_keys.size(); ++i) {
+        json key_name;
+        if (!write_string(store.key_name(used_keys[i]), at(keys_path, i), key_name, error)) {
+            return DocumentIoResult::failure(std::move(error));
+        }
+        keys.push_back(std::move(key_name));
+    }
     attributes[kKeys] = std::move(keys);
 
     json defaults_json;
@@ -908,7 +1122,19 @@ DocumentIoResult DocumentWriter::write(Document& doc, std::string& out) {
     attributes[kObjects] = std::move(objects);
     root[kAttributes] = std::move(attributes);
 
-    out = root.dump(kJsonIndent);
+    // Belt and braces. Every string that got here went through write_string() and
+    // every double through write_double(), so this catch should be unreachable --
+    // but dump() reports by THROWING, and an exception escaping a save is the
+    // editor disappearing with the document still unsaved. Rendered into a local
+    // first, so a throw cannot leave `out` holding half a document either.
+    std::string rendered;
+    try {
+        rendered = root.dump(kJsonIndent);
+    } catch (const json::exception& e) {
+        return DocumentIoResult::failure(std::string("could not render the document as JSON: ")
+                                         + e.what());
+    }
+    out = std::move(rendered);
     return DocumentIoResult::success();
 }
 
@@ -927,15 +1153,20 @@ struct DocumentLoader {
     [[nodiscard]] static DocumentIoResult load(Document& doc, std::string_view text);
 
 private:
-    [[nodiscard]] static bool load_layers(const json& root, Document& staging, std::string& error);
-    [[nodiscard]] static bool load_attributes(const json& root, Document& staging,
+    /// @param next_id_out The layer id counter the file declares, already checked
+    ///                    against the tree. load_attributes() bounds its own layer
+    ///                    ids by it, which is why the two run in this order.
+    [[nodiscard]] static bool load_layers(const json& root, Document& staging, uint64_t& next_id_out,
+                                          std::string& error);
+    [[nodiscard]] static bool load_attributes(const json& root, Document& staging, uint64_t next_id,
                                               std::string& error);
     [[nodiscard]] static bool restore_slots(Document& staging,
                                             const std::vector<Document::ObjectSlot>& slots,
                                             std::string& error);
 };
 
-bool DocumentLoader::load_layers(const json& root, Document& staging, std::string& error) {
+bool DocumentLoader::load_layers(const json& root, Document& staging, uint64_t& next_id_out,
+                                 std::string& error) {
     const json* layers = nullptr;
     if (!require_member(root, kLayers, {}, layers, error)) return false;
     if (!layers->is_object()) return bad(error, kLayers, "expected an object");
@@ -986,6 +1217,8 @@ bool DocumentLoader::load_layers(const json& root, Document& staging, std::strin
         }
         loader.detach_subtree(next - 1u, nullptr, nullptr);
     }
+
+    next_id_out = next_id;
     return true;
 }
 
@@ -1044,7 +1277,8 @@ bool DocumentLoader::restore_slots(Document& staging,
     return true;
 }
 
-bool DocumentLoader::load_attributes(const json& root, Document& staging, std::string& error) {
+bool DocumentLoader::load_attributes(const json& root, Document& staging, uint64_t next_id,
+                                    std::string& error) {
     const json* attributes = nullptr;
     if (!require_member(root, kAttributes, {}, attributes, error)) return false;
     if (!attributes->is_object()) return bad(error, kAttributes, "expected an object");
@@ -1121,7 +1355,7 @@ bool DocumentLoader::load_attributes(const json& root, Document& staging, std::s
 
         if (slot.alive) {
             uint64_t layer = 0;
-            if (!read_u64_member(record, kLayer, path, kMaxLayerId, layer, error)) return false;
+            if (!read_layer_ref_member(record, kLayer, path, next_id, layer, error)) return false;
             slot.layer = static_cast<LayerId>(layer);
         } else {
             if (generation == 0) {
@@ -1194,7 +1428,7 @@ bool DocumentLoader::load_attributes(const json& root, Document& staging, std::s
         if (!record.is_object()) return bad(error, path, "expected an object");
 
         uint64_t layer = 0;
-        if (!read_u64_member(record, kLayer, path, kMaxLayerId, layer, error)) return false;
+        if (!read_layer_ref_member(record, kLayer, path, next_id, layer, error)) return false;
         if (layer == kInvalidLayer) {
             // kNoLayer is a reserved handle in A3 and a write to it is refused,
             // precisely so that unparented objects do not all share one bucket.
@@ -1278,8 +1512,14 @@ DocumentIoResult DocumentLoader::load(Document& doc, std::string_view text) {
     // Built into a staging document, so that a failure anywhere below leaves the
     // destination exactly as it was -- history, handles and all.
     Document staging;
-    if (!load_layers(root, staging, error)) return DocumentIoResult::failure(error);
-    if (!load_attributes(root, staging, error)) return DocumentIoResult::failure(error);
+    // In this order, and not only because the tree comes first in the file: the
+    // layer ids the attribute section carries are bounded by the counter
+    // load_layers() has just validated against the tree.
+    uint64_t next_layer_id = 0;
+    if (!load_layers(root, staging, next_layer_id, error)) return DocumentIoResult::failure(error);
+    if (!load_attributes(root, staging, next_layer_id, error)) {
+        return DocumentIoResult::failure(error);
+    }
 
     doc.adopt(staging);
     return DocumentIoResult::success();

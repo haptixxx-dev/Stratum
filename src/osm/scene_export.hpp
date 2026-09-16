@@ -281,8 +281,12 @@ struct SceneExportConfig {
      * terrain -- share one directory without colliding, which they otherwise would
      * because the chunk grid is the same for both.
      *
-     * Sanitised like any other name before it reaches a path: an empty or
-     * all-whitespace value falls back to "scene".
+     * Reduced to something that can only ever name ONE file directly inside `out_dir`:
+     * whitespace and control bytes, '/', '\\' and ':' all become '_', and so does any
+     * LEADING '.', so that neither "sub/thing" nor "../escaped" can move the output
+     * somewhere the caller did not ask for. A '.' elsewhere survives, because
+     * "my.export" is a perfectly good stem. An empty or all-whitespace value falls
+     * back to "scene".
      */
     std::string name_prefix = "scene";
 
@@ -320,29 +324,65 @@ struct SceneExportStats {
     size_t vertices = 0;
 
     /**
-     * @brief Triangles written across every chunk
+     * @brief Triangles written across every chunk, and ON DISK
      *
-     * INVARIANT, and the one the tests exist to check: this equals the input
-     * triangle count minus @ref dropped_triangles. Not more, which would mean a
-     * triangle was duplicated across chunks, and not less, which would mean one was
-     * dropped without being counted.
+     * Counted when a chunk's file has been written, exactly like @ref chunks and
+     * @ref vertices. A chunk whose file could not be opened contributes nothing here
+     * and is counted into @ref unwritten_triangles instead.
+     *
+     * That distinction is the whole value of the number. Credited at ROUTING time
+     * instead -- which is what this used to do -- it equalled the input even when a
+     * whole chunk was missing from disk, so a caller checking the invariant below was
+     * told the export had conserved everything while a file was simply absent.
+     *
+     * INVARIANT, and the one the tests exist to check:
+     *
+     * @code
+     *     triangles + dropped_triangles + unwritten_triangles == input triangles
+     * @endcode
+     *
+     * @ref triangles must not be more than the input, which would mean a triangle was
+     * duplicated across chunks, and the three together must not be less, which would
+     * mean one went missing without being counted anywhere.
      */
     size_t triangles = 0;
 
     /**
      * @brief Input triangles that reached no chunk, and why they are counted
      *
-     * A triangle is dropped when an index is out of range for its mesh, or when its
-     * centroid is not finite -- a NaN position cannot be assigned to a cell, and
-     * writing it would poison the chunk's bounding box.
+     * A triangle is dropped when:
      *
-     * Reported rather than swallowed. `triangles + dropped_triangles` is the input
-     * count exactly, so a caller can tell "the exporter conserved everything" from
-     * "the exporter conserved what it kept", which a single written-triangle count
-     * cannot. The road exporter drops the same geometry and does not say so, which
-     * is the one thing this generalisation changes about the accounting.
+     *  - an index is out of range for its mesh;
+     *  - its centroid is not finite -- a NaN position cannot be assigned to a cell,
+     *    and writing it would poison the chunk's bounding box;
+     *  - its cell index does not fit in the int32_t a grid coordinate is. A FINITE
+     *    centroid is not enough on its own: the quotient `centroid / chunk_size` is
+     *    what has to fit, so a coordinate of 1e20, or an ordinary coordinate with a
+     *    very small @ref SceneExportConfig::chunk_size, is refused here rather than
+     *    wrapping into a cell whose name claims somewhere else entirely.
+     *
+     * Reported rather than swallowed, so a caller can tell "the exporter conserved
+     * everything" from "the exporter conserved what it kept", which a single
+     * written-triangle count cannot. The road exporter drops the same geometry and
+     * does not say so, which is the one thing this generalisation changes about the
+     * accounting.
      */
     size_t dropped_triangles = 0;
+
+    /**
+     * @brief Triangles routed to a chunk whose file was never written
+     *
+     * Non-zero only when a chunk's file could not be opened -- a permission failure, a
+     * name already taken by a directory, a full disk. Those triangles were perfectly
+     * good; nothing was wrong with the geometry, and the export simply could not
+     * deliver them.
+     *
+     * A THIRD bucket rather than part of @ref dropped_triangles, because the two are
+     * different problems with different fixes: dropped geometry is a complaint about
+     * the input, unwritten geometry is a complaint about the destination. A caller
+     * that only wants to know whether anything went missing adds them.
+     */
+    size_t unwritten_triangles = 0;
 
     /// Files written, including MTL sidecars and glTF `.bin` buffers
     size_t files = 0;
@@ -391,6 +431,13 @@ struct SceneExportStats {
  * With `chunk_size` 0 the whole scene is one chunk at grid (0, 0), named without
  * coordinates.
  *
+ * A triangle whose cell index does not fit in an int32_t is REFUSED here and counted
+ * into SceneExportStats::dropped_triangles. The centroid being finite does not make
+ * the quotient representable -- 1e20 metres, or an ordinary coordinate against a
+ * millimetre `chunk_size`, overflows -- and a wrapped index would put the triangle in
+ * a file whose name claims a different part of the world, which is the one thing the
+ * chunk names are supposed to guarantee.
+ *
  * ### Grouping and order
  *
  * Inside a chunk, triangles are grouped by (object, MaterialKey) and the groups are
@@ -420,8 +467,10 @@ struct SceneExportStats {
  *
  * A file that cannot be opened is logged and skipped; the export continues with the
  * remaining chunks and the failed file does not appear in
- * SceneExportStats::written_files. A completely failed export comes back with
- * `files == 0` rather than throwing.
+ * SceneExportStats::written_files. That chunk's triangles are counted into
+ * SceneExportStats::unwritten_triangles and NOT into SceneExportStats::triangles, so
+ * the counts still add up to the input and still say what is on disk. A completely
+ * failed export comes back with `files == 0` rather than throwing.
  *
  * @param objects Things to write. Entries with a null or empty mesh are skipped
  *                and are not counted in SceneExportStats::objects. The INDEX of an

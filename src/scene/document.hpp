@@ -256,6 +256,21 @@ public:
     [[nodiscard]] LayerTree& layers() { return m_layers; }
     [[nodiscard]] const LayerTree& layers() const { return m_layers; }
 
+    /**
+     * @brief The attribute store
+     *
+     * @warning Values, keys and defaults are this store's business and may be
+     *          edited through it freely. Object LIFETIME is not: never call
+     *          AttributeStore::create_object() or destroy_object() on it.
+     *          This document keeps a mirror of the store's slots -- it is what
+     *          makes the file's object table writable, and it is the only thing
+     *          that knows which layer an object is in -- and the store does not
+     *          know the mirror exists. A slot minted behind the document's back
+     *          is a handle the store calls valid and this document has never
+     *          heard of; create_object() logs that, and the readers below treat
+     *          such a handle as stale. Go through Document::create_object() and
+     *          Document::destroy_object() instead.
+     */
     [[nodiscard]] AttributeStore& attributes() { return m_attributes; }
     [[nodiscard]] const AttributeStore& attributes() const { return m_attributes; }
 
@@ -285,7 +300,8 @@ public:
     /**
      * @brief Destroy an object, its attributes and its membership
      *
-     * @return false when the handle was already stale, or when destroying it
+     * @return false when the handle was already stale, when it names a slot this
+     *         document did not create (see attributes()), or when destroying it
      *         would wrap the slot's generation back to 0. A wrapped generation
      *         lets a handle from the slot's first life validate against its
      *         2^32-th, so the store retires such a slot; this document refuses
@@ -295,13 +311,16 @@ public:
      */
     bool destroy_object(AttributeObject obj);
 
-    /// Move an object to another layer. @return false when the handle is stale.
+    /// Move an object to another layer. @return false when the handle is stale or
+    /// names a slot this document did not create (see attributes()).
     bool set_object_layer(AttributeObject obj, LayerId layer);
 
     /**
      * @brief Which layer an object is in
      *
-     * @return kInvalidLayer for a stale handle or an object in no layer. The id
+     * @return kInvalidLayer for a stale handle, a handle naming a slot this
+     *         document did not create (see attributes()), or an object in no
+     *         layer. The id
      *         is returned verbatim even when that layer has since been deleted:
      *         A1 never reuses an id, so a dangling reference can never come to
      *         mean a different layer, and zeroing it would throw away
@@ -354,10 +373,23 @@ public:
      * @brief Render the document as `.stratum` JSON
      *
      * @param out Receives the JSON on success; untouched on failure.
-     * @return A failure when the document holds a double that JSON cannot
-     *         represent -- NaN or an infinity. nlohmann writes those as `null`,
-     *         which reads back as 0.0, so saving one would quietly move a layer
-     *         to the origin. The error names the field.
+     * @return A failure, naming the field, for any of three things the file
+     *         cannot carry honestly:
+     *
+     *   - **A double JSON cannot represent** -- NaN or an infinity. nlohmann
+     *     writes those as `null`, which reads back as 0.0, so saving one would
+     *     quietly move a layer to the origin.
+     *   - **A string that is not well-formed UTF-8** -- a layer name or an
+     *     attribute value pasted from a Latin-1 source, or an OSM tag. JSON is a
+     *     UTF-8 format and nlohmann's writer THROWS on one rather than returning,
+     *     so an unchecked string would end the process during a save. Substituting
+     *     U+FFFD would keep the file and lose the user's text, silently, which is
+     *     worse than being told.
+     *   - **An object slot whose generation is above kMaxRestorableGeneration**,
+     *     or a document whose slots need more than kMaxGenerationReplaySteps in
+     *     total. Those are the loader's limits; without the same ones here, this
+     *     build writes a file it will refuse to open for ever, and says so only
+     *     once the session that held the data is gone.
      *
      * @note Does NOT clear dirty(): a caller that renders the JSON has not
      *       necessarily written it anywhere. mark_saved() is the declaration.
@@ -439,6 +471,10 @@ private:
     /// Take over @p staging's contents. Clears the history FIRST, so commands
     /// pointing into the old tree and store are destroyed before either moves.
     void adopt(Document& staging);
+
+    /// Is @p obj's index inside m_slots? AttributeStore::is_valid() is not enough
+    /// on its own -- see the warning on attributes(). Reports the disagreement.
+    [[nodiscard]] bool has_slot(AttributeObject obj) const;
 
     LayerTree m_layers;
     AttributeStore m_attributes;

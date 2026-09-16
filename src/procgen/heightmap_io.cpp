@@ -206,6 +206,12 @@ HeightmapImportResult make_failure(HeightmapImportStatus status, std::string mes
  * geography and the flip lives in exactly one place.
  */
 struct DecodedImage {
+    /// Raw samples, in file row order. A decoder that returns false leaves this
+    /// in whatever state it had reached: the caller discards the whole
+    /// DecodedImage on failure and copies only the header fields out of it, so
+    /// no failure path clears this and none needs to. A clear that nothing can
+    /// observe is not a safeguard, it is a line that makes the next reader
+    /// believe there is something here to protect.
     std::vector<std::uint16_t> samples;
     int width = 0;
     int height = 0;
@@ -437,6 +443,31 @@ bool decode_pgm(std::span<const std::uint8_t> bytes, const HeightmapImportOption
             }
         }
     } else {
+        // Sized from what the remaining bytes COULD hold, not from what the
+        // header claims they hold. An ASCII sample is at least one digit and
+        // needs at least one separator between it and the next, so N samples
+        // cannot be encoded in fewer than 2N-1 bytes. Without this, the
+        // seventeen bytes "P2\n8192 8192\n255\n" resize this vector to 128 MB
+        // -- an amplification of about eight million to one, on the thread that
+        // is drawing the editor -- and only then discover there is no raster at
+        // all. That is the allocation the file comment promises never happens on
+        // the strength of a number that came out of the file, and the P5 path
+        // above already gets it right.
+        //
+        // The bound is deliberately loose: a real file spends four or five bytes
+        // per sample, so nothing legal is ever refused by it. Its job is to cap
+        // the allocation at roughly the size of the input, not to predict the
+        // raster.
+        const std::uint64_t minimum_bytes = static_cast<std::uint64_t>(count) * 2u - 1u;
+        const std::uint64_t available = cursor.remaining();
+        if (available < minimum_bytes) {
+            status = HeightmapImportStatus::Truncated;
+            message = "PGM header claims " + std::to_string(count) +
+                      " ASCII samples, which need at least " + std::to_string(minimum_bytes) +
+                      " bytes, but only " + std::to_string(available) + " remain in the file";
+            return false;
+        }
+
         image.samples.resize(count);
         for (std::size_t i = 0; i < count; ++i) {
             cursor.skip_gap();
@@ -445,14 +476,12 @@ bool decode_pgm(std::span<const std::uint8_t> bytes, const HeightmapImportOption
                 status = HeightmapImportStatus::Truncated;
                 message = "PGM header claims " + std::to_string(count) +
                           " ASCII samples but the file ran out after " + std::to_string(i);
-                image.samples.clear();
                 return false;
             }
             if (value > maxval) {
                 status = HeightmapImportStatus::SampleAboveMaxval;
                 message = "PGM sample " + std::to_string(i) + " is " + std::to_string(value) +
                           ", above the declared maxval " + std::to_string(maxval);
-                image.samples.clear();
                 return false;
             }
             image.samples[i] = static_cast<std::uint16_t>(value);
@@ -471,7 +500,6 @@ bool decode_pgm(std::span<const std::uint8_t> bytes, const HeightmapImportOption
                 message = "PGM sample " + std::to_string(i) + " is " +
                           std::to_string(image.samples[i]) + ", above the declared maxval " +
                           std::to_string(maxval);
-                image.samples.clear();
                 return false;
             }
         }
@@ -487,6 +515,42 @@ bool decode_pgm(std::span<const std::uint8_t> bytes, const HeightmapImportOption
 std::string stb_reason() {
     const char* reason = stbi_failure_reason();
     return reason != nullptr ? std::string{reason} : std::string{"no reason given"};
+}
+
+/**
+ * @brief Read the declared bit depth out of the PNG's IHDR chunk
+ *
+ * stb answers only "is it 16 bits?", and PNG greyscale is legally 1, 2, 4, 8 or
+ * 16. Every depth below 16 therefore reads back as 8 unless the file is asked
+ * directly, and stb SCALES a sub-byte sample up to fill 0..255 on the way out --
+ * so the heights are right and the lie is completely silent. max_sample_value
+ * would say 255 for a 1-bit file, vertical_quantum_metres would divide the range
+ * by 255 instead of by 1, and the coarseness warning that exists to catch a
+ * quantum this large would be suppressed because the understated figure falls
+ * below kCoarseVerticalQuantumMetres. Over a 0-200 m range that is 0.78 m
+ * reported against 200 m real: the factor-of-N lie this whole file is written to
+ * prevent, reachable from an untrusted file.
+ *
+ * The layout is fixed by the PNG specification and needs no chunk walk: an
+ * 8-byte signature, then IHDR as a 4-byte length, the 4-byte type "IHDR", a
+ * 4-byte width and a 4-byte height. The bit depth is the next byte, byte 24 of
+ * the file. IHDR must be the first chunk, so anything else there is malformed.
+ *
+ * @param bytes Whole encoded file, already known to carry the PNG signature
+ * @param depth Set to the declared depth on success; untouched otherwise
+ * @return false when the file is too short for an IHDR or does not start with one
+ */
+bool png_ihdr_bit_depth(std::span<const std::uint8_t> bytes, int& depth) noexcept {
+    constexpr std::size_t kIhdrTypeOffset = 12;
+    constexpr std::size_t kBitDepthOffset = 24;
+    if (bytes.size() <= kBitDepthOffset) {
+        return false;
+    }
+    if (std::memcmp(bytes.data() + kIhdrTypeOffset, "IHDR", 4) != 0) {
+        return false;
+    }
+    depth = static_cast<int>(bytes[kBitDepthOffset]);
+    return true;
 }
 
 bool decode_png(std::span<const std::uint8_t> bytes, const HeightmapImportOptions& options,
@@ -538,18 +602,33 @@ bool decode_png(std::span<const std::uint8_t> bytes, const HeightmapImportOption
         return false;
     }
 
-    // Branch on the true source depth rather than always loading 16-bit. stb
-    // would widen an 8-bit sample by *257, which normalises identically, but then
-    // max_sample_value and vertical_quantum_metres would both claim 16-bit
-    // precision the file does not have -- and that quantum is the number the
-    // caller is meant to act on.
-    const int stride = stbi_is_16_bit_from_memory(bytes.data(), length);
+    // The TRUE source depth, read out of IHDR. Asking stb whether the file is
+    // 16-bit answers only that question, and PNG greyscale is legally 1, 2, 4, 8
+    // or 16: everything below 16 would come back as "8" and be reported as 8-bit
+    // with a full scale of 255 it does not have. See png_ihdr_bit_depth().
+    int depth = 0;
+    if (!png_ihdr_bit_depth(bytes, depth)) {
+        status = HeightmapImportStatus::MalformedHeader;
+        message = "PNG does not begin with an IHDR chunk";
+        return false;
+    }
+    if (depth != 1 && depth != 2 && depth != 4 && depth != 8 && depth != 16) {
+        status = HeightmapImportStatus::MalformedHeader;
+        message = "PNG declares a bit depth of " + std::to_string(depth) +
+                  "; the specification allows 1, 2, 4, 8 and 16";
+        return false;
+    }
+
     const std::size_t count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
     image.width = width;
     image.height = height;
-    image.samples.resize(count);
+    image.bits_per_sample = depth;
+    // Full scale is what the DEPTH can represent: 1, 3, 15, 255, 65535. This is
+    // the denominator vertical_quantum_metres is computed from, so it has to be
+    // the file's own scale and not the scale stb hands the samples back on.
+    image.max_sample = (1u << static_cast<unsigned int>(depth)) - 1u;
 
-    if (stride != 0) {
+    if (depth == 16) {
         int out_w = 0;
         int out_h = 0;
         int out_c = 0;
@@ -557,13 +636,14 @@ bool decode_png(std::span<const std::uint8_t> bytes, const HeightmapImportOption
         if (pixels == nullptr) {
             status = HeightmapImportStatus::DecodeFailed;
             message = "PNG raster could not be decoded: " + stb_reason();
-            image.samples.clear();
             return false;
         }
-        std::memcpy(image.samples.data(), pixels, count * sizeof(std::uint16_t));
+        // Sized from the decode that SUCCEEDED, not from the header. Sizing it
+        // before the call put a second buffer of width*height alongside stb's
+        // own, on the strength of two numbers out of the file, and kept it for a
+        // file whose IDAT could never have filled it.
+        image.samples.assign(pixels, pixels + count);
         stbi_image_free(pixels);
-        image.bits_per_sample = 16;
-        image.max_sample = 65535;
     } else {
         int out_w = 0;
         int out_h = 0;
@@ -572,15 +652,20 @@ bool decode_png(std::span<const std::uint8_t> bytes, const HeightmapImportOption
         if (pixels == nullptr) {
             status = HeightmapImportStatus::DecodeFailed;
             message = "PNG raster could not be decoded: " + stb_reason();
-            image.samples.clear();
             return false;
         }
+        // stb expands a sub-byte greyscale sample to FILL 0..255 by multiplying
+        // by a fixed scale -- 255, 85 and 17 for 1, 2 and 4 bits, which is
+        // exactly 255 / max_sample. Dividing it back out is lossless and
+        // recovers the value the file stored. Skipping it would hand a 1-bit
+        // sample back as 255 against a max_sample of 1, and every set pixel
+        // would normalise to 255 times full scale.
+        const unsigned int expansion = 255u / image.max_sample;
+        image.samples.resize(count);
         for (std::size_t i = 0; i < count; ++i) {
-            image.samples[i] = pixels[i];
+            image.samples[i] = static_cast<std::uint16_t>(pixels[i] / expansion);
         }
         stbi_image_free(pixels);
-        image.bits_per_sample = 8;
-        image.max_sample = 255;
     }
 
     return true;
@@ -747,10 +832,22 @@ void resample(const DecodedImage& image, const ElevationRange& vertical,
     const int src_h = image.height;
     const double inv_max = 1.0 / static_cast<double>(image.max_sample);
 
+    // Clamped HERE, at the read, and not only where x1 and y1 are computed.
+    //
+    // The far taps are weighted by fx and fy, and on the right and top edges of
+    // the source those weights are EXACTLY zero -- so an index one past the end
+    // there is multiplied away before it reaches the output. No assertion on any
+    // returned height can see it; only a sanitizer can, and this project has no
+    // sanitizer preset. A bound whose failure is invisible is not a bound, and
+    // SECURITY.md names out-of-bounds reads from a malformed file as the most
+    // likely real vulnerability in this parser. So the only index that reaches
+    // the vector is one this function has already clamped, and an off-by-one in
+    // the interpolation arithmetic above costs a duplicated edge sample rather
+    // than a read past the buffer.
     const auto raw = [&](int x, int y) -> double {
-        return static_cast<double>(
-            image.samples[static_cast<std::size_t>(y) * static_cast<std::size_t>(src_w) +
-                          static_cast<std::size_t>(x)]);
+        const std::size_t cx = static_cast<std::size_t>(std::clamp(x, 0, src_w - 1));
+        const std::size_t cy = static_cast<std::size_t>(std::clamp(y, 0, src_h - 1));
+        return static_cast<double>(image.samples[cy * static_cast<std::size_t>(src_w) + cx]);
     };
 
     for (int dz = 0; dz < dst_h; ++dz) {
@@ -758,15 +855,18 @@ void resample(const DecodedImage& image, const ElevationRange& vertical,
         const double northness = static_cast<double>(dz) / static_cast<double>(dst_h - 1);
         const double row_fraction = options.source_row_zero_is_north ? 1.0 - northness : northness;
         const double sy = row_fraction * static_cast<double>(src_h - 1);
+        // y0 is clamped because fy is measured from it; y1 is not, because raw()
+        // clamps every index it is given and a second clamp here would only hide
+        // an arithmetic slip rather than survive one.
         const int y0 = std::clamp(static_cast<int>(std::floor(sy)), 0, src_h - 1);
-        const int y1 = std::min(y0 + 1, src_h - 1);
+        const int y1 = y0 + 1;
         const double fy = std::clamp(sy - static_cast<double>(y0), 0.0, 1.0);
 
         for (int dx = 0; dx < dst_w; ++dx) {
             const double eastness = static_cast<double>(dx) / static_cast<double>(dst_w - 1);
             const double sx = eastness * static_cast<double>(src_w - 1);
             const int x0 = std::clamp(static_cast<int>(std::floor(sx)), 0, src_w - 1);
-            const int x1 = std::min(x0 + 1, src_w - 1);
+            const int x1 = x0 + 1;
             const double fx = std::clamp(sx - static_cast<double>(x0), 0.0, 1.0);
 
             const double top = raw(x0, y0) * (1.0 - fx) + raw(x1, y0) * fx;
@@ -849,7 +949,11 @@ HeightmapImportResult import_heightmap_from_memory(std::span<const std::uint8_t>
     result.warnings = std::move(image.warnings);
 
     if (!apply_placement(placement, dst_w, dst_h, result)) {
-        result.heightmap = Heightmap{};
+        // No reset needed and none written: apply_placement() validates before it
+        // writes anything, and resample() has not run, so the grid is still the
+        // default -- empty data, one-metre cells, origin at zero. The suite
+        // asserts exactly that rather than trusting a clearing statement whose
+        // removal nothing could detect.
         return result;
     }
 
