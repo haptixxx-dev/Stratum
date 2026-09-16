@@ -87,12 +87,14 @@ set(STRATUM_TEST_SOURCES
     osm/test_scene_export.cpp
     road/test_blocks.cpp
     road/test_lots.cpp
+    road/test_lots_offset.cpp
     road/test_lot_edges.cpp
     road/test_zoning.cpp
     road/test_segment_attrs.cpp
     road/test_graph_edit.cpp
     procgen/test_heightmap_io.cpp
     procgen/test_rule_parser.cpp
+    procgen/test_interpreter.cpp
 
     # Attribute-mode colour tables: totality, determinism and separation.
     osm/test_attribute_palette.cpp
@@ -102,6 +104,7 @@ set(STRATUM_TEST_SOURCES
 
     # Engine-agnostic geometry processing.
     geometry/test_ambient_occlusion.cpp
+    geometry/test_straight_skeleton.cpp
 
     # The scene model.
     scene/test_command_stack.cpp
@@ -129,6 +132,9 @@ set(STRATUM_TEST_SUITES
     Zoning
     SegmentAttrs
     RuleParser
+    Interpreter
+    StraightSkeleton
+    LotsOffset
     GraphEdit
     HeightmapIO
     SceneExport
@@ -217,6 +223,30 @@ stratum_msvc_options(stratum_tests)
 find_package(Threads REQUIRED)
 
 target_link_libraries(stratum_tests PRIVATE stratum_core Threads::Threads)
+
+# The Python binding suite. Built into stratum_tests only when the bindings
+# exist; with STRATUM_ENABLE_PYTHON=OFF the source is not compiled at all and
+# the rest of the suite is unaffected, which is the property the brief asked
+# for. --whole-archive is not optional: the embedded module registers itself
+# from a static constructor, and without it the linker discards that object and
+# every import in the suite fails.
+if(STRATUM_ENABLE_PYTHON)
+    target_sources(stratum_tests PRIVATE python/run_python_tests.cpp)
+    if(MSVC)
+        target_link_libraries(stratum_tests PRIVATE stratum_python)
+        set_target_properties(stratum_tests PROPERTIES LINK_FLAGS "/WHOLEARCHIVE:stratum_python")
+    elseif(APPLE)
+        target_link_libraries(stratum_tests PRIVATE -Wl,-force_load stratum_python)
+    else()
+        target_link_libraries(stratum_tests PRIVATE
+            -Wl,--whole-archive stratum_python -Wl,--no-whole-archive)
+    endif()
+
+    # The suite runs test_bindings.py from the source tree rather than a copy,
+    # so an edit to the .py is picked up without reconfiguring.
+    target_compile_definitions(stratum_tests PRIVATE
+        STRATUM_PYTHON_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/python")
+endif()
 
 # framework.hpp is included as "framework.hpp" from every suite, wherever it sits
 # in the tree, so tests/ itself is on the include path.
@@ -401,6 +431,14 @@ endif()
 # One ctest entry per suite, each invoking the binary with the suite filter, so a
 # failure names the suite. The runner exits non-zero when a filter matches no
 # test, which catches a suite renamed here but not in the source.
+# Conditional, unlike every other suite: run_python_tests.cpp is only compiled
+# when STRATUM_ENABLE_PYTHON is ON, and the `ci` preset deliberately turns it
+# off (pybind11 wants Python dev headers a runner may not have). Registering it
+# unconditionally makes ctest fail on a tree that never built it.
+if(STRATUM_ENABLE_PYTHON)
+    list(APPEND STRATUM_TEST_SUITES PythonBindings)
+endif()
+
 foreach(suite IN LISTS STRATUM_TEST_SUITES)
     add_test(NAME ${suite} COMMAND stratum_tests ${suite})
     set_tests_properties(${suite} PROPERTIES

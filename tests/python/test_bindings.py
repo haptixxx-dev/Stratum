@@ -13,13 +13,30 @@ What is asserted here, and what is deliberately not:
   outlives the C++ object it came from still reads correctly -- the SceneObject
   that outlives its Mesh, the Layer snapshot that outlives its layer, the
   ParsedOSMData that outlives the parser (there is no parser to outlive: it is
-  not bound). A binding that handed out a borrow instead of a copy would pass
-  the value checks and then segfault here, which is the point.
+  not bound).
+
+  Those value checks are NOT sufficient on their own and this file used to
+  pretend they were. Every borrow-shaped read in this module is of a trivially
+  destructible struct, and freed plain-data bytes read back correctly: a binding
+  with a genuine dangling reference passed the whole ownership section while
+  AddressSanitizer reported heap-use-after-free on the very same lines. So each
+  of those tests now also calls :func:`check_is_a_fresh_copy`, which compares
+  object IDENTITY across two reads and is the only assertion available from
+  Python that tells a copy from a borrow. Read its docstring before touching
+  them.
 
 * **Errors.** Every refusal is asserted by TYPE and by message content. A
   binding that returned ``None`` on failure would pass a test that only checked
   the happy path, and the script author would find out three hundred lines
   later, on an empty export.
+
+* **The GIL.** Every call that does real work is supposed to release it, and a
+  missing ``py::gil_scoped_release`` compiles, passes every other test here, and
+  shows up months later as a UI that freezes for the length of an import. The
+  probe under "GIL measurement" below measures it, and a control test proves the
+  probe can tell a GIL hog from a call that lets go. The pinning in
+  ``export_scene`` is tested the only way it can be: by emptying its list from
+  another thread while it runs.
 
 * **Numbers with a known answer.** Block areas are cross-checked against a
   shoelace computed in Python over the same ring, so the assertion does not
@@ -35,6 +52,8 @@ import math
 import os
 import shutil
 import tempfile
+import threading
+import time
 import traceback
 
 import stratum
@@ -101,6 +120,42 @@ def check_raises(exc_type, fn, needle=None):
     raise AssertionError("expected {} but nothing was raised".format(exc_type.__name__))
 
 
+def check_is_a_fresh_copy(read, label):
+    """Assert that ``read()`` hands back a COPY and not a borrow into its owner.
+
+    This is the only assertion in this file that can tell the two apart for a
+    struct of plain data, and it is here because every value-based attempt is
+    vacuous. ``BlockStats``, ``LotStats``, ``BoundingBox``, ``CoordinateSystem``,
+    ``ParseStatistics`` and ``LayerTransform`` are all trivially destructible, so
+    a binding that handed out a borrow and then LOST its keep_alive would read
+    freed bytes that still hold the right numbers, pass every check about the
+    value, and take the process down somewhere else entirely. A review round
+    proved exactly that: a no-keep_alive borrow of ``BlockExtraction.stats`` left
+    the suite at "0 failed" while AddressSanitizer reported heap-use-after-free
+    on the very read the ownership test performs.
+
+    What is NOT vacuous is object identity. pybind11 keeps one Python wrapper per
+    C++ address, so a second read of a BORROWED member finds the wrapper the
+    first read registered and returns the same object:
+
+        extraction.stats is extraction.stats   ->  True   for a borrow
+        extraction.stats is extraction.stats   ->  False  for a copy
+
+    A copy allocates fresh storage every call, so its address -- and therefore
+    its wrapper -- is new. Both halves of that hold for ``reference`` and for
+    ``reference_internal``, so this catches a lost keep_alive AND the borrow that
+    still has one, which is the point: module.hpp rule 3 says the module has no
+    such borrows at all, and this is what enforces it.
+    """
+    first = read()
+    second = read()
+    check(
+        first is not second,
+        "{} must be a fresh copy on every read; two reads gave one object, which "
+        "means the binding handed out a pointer into its owner".format(label),
+    )
+
+
 def without_next_id(text):
     """The document JSON with the layer-allocator line removed.
 
@@ -113,6 +168,130 @@ def without_next_id(text):
     compare them without that field, and assert the field's behaviour separately.
     """
     return [line for line in text.splitlines() if '"next_id"' not in line]
+
+
+# ============================================================================
+# GIL measurement
+#
+# module.hpp promises that every call doing real work releases the GIL. Nothing
+# about a binding is easier to get wrong or quieter when it is: a missing
+# `py::gil_scoped_release` compiles, passes every other test in this file, and
+# shows up as a Python UI that freezes for the length of an import.
+#
+# The measurement below is a timing one and does not pretend otherwise. What
+# makes it trustworthy is the size of the gap rather than the absolute number: a
+# releasing call scores above 0.9 on every machine tried, and a holding one --
+# including a pure-Python `sum(range(n))`, which is a single bytecode CPython
+# runs to completion with the GIL held -- scores below 0.15. Both ends are
+# asserted, so a probe that had stopped measuring anything fails the control
+# instead of passing everything.
+# ============================================================================
+
+_GIL_WINDOW = 0.10
+_GIL_FLOOR_SECONDS = 0.06
+
+# Above this, the call let other Python threads run; below it, it did not.
+#
+# Measured on this tree, four runs each, with gil_share() below:
+#
+#   |                        | 16 CPUs     | 2 CPUs      | 1 CPU       |
+#   |------------------------|-------------|-------------|-------------|
+#   | parse_osm (releases)   | 0.92 - 0.95 | 0.56 - 0.95 | 0.45 - 0.47 |
+#   | export_scene (releases)| 0.92 - 0.97 | 0.93 - 0.96 | 0.43 - 0.49 |
+#   | sum(range) (holds)     | 0.04 - 0.05 | 0.04 - 0.06 | 0.071       |
+#
+# The single-CPU column is why this is 0.20 and not 0.5. A call that releases
+# the GIL still competes for the one core, so the other thread gets about half
+# the time rather than nearly all of it -- and 0.5 failed there, on a binding
+# that was perfectly correct. 0.20 sits about 3x above every holding measurement
+# and about 2x below the worst releasing one, which is the widest gap available
+# without the test becoming a statement about the machine.
+_GIL_RELEASED_FLOOR = 0.20
+
+
+def _count_while(worker_body):
+    """Main-thread loop iterations while ``worker_body`` runs on another thread.
+
+    The loop body is one truth test and one increment, and it is the SAME body
+    in the baseline and in the measurement. A loop that called perf_counter()
+    per iteration would make the two rates incomparable, because that call costs
+    far more than the counting does.
+    """
+    done = []
+
+    def worker():
+        try:
+            worker_body()
+        finally:
+            done.append(True)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    spins = 0
+    while not done:
+        spins += 1
+    thread.join()
+    return spins
+
+
+def _gil_free_rate():
+    """Iterations per second with the other thread asleep: the GIL all to us."""
+    spins = _count_while(lambda: time.sleep(_GIL_WINDOW))
+    return spins / _GIL_WINDOW
+
+
+def gil_share(call):
+    """Fraction of one ``call``'s wall time during which Python bytecode still ran.
+
+    ~1.0 when the call released the GIL, ~0.0 when it held it. The baseline is
+    taken immediately before the measurement so that a slow or loaded machine
+    moves both numbers together.
+    """
+    baseline = _gil_free_rate()
+    check(baseline > 0.0, "the baseline counter did not count")
+
+    box = {}
+
+    def body():
+        started = time.perf_counter()
+        try:
+            call()
+        finally:
+            box["seconds"] = time.perf_counter() - started
+
+    spins = _count_while(body)
+    seconds = box["seconds"]
+    # Not a soft failure. A call too short to measure would make every share
+    # meaningless, and returning some number anyway is how a probe stops testing
+    # without anyone noticing.
+    check(
+        seconds >= _GIL_FLOOR_SECONDS,
+        "the call under test took only {:.1f} ms, too short to measure a GIL release "
+        "against; the workload needs to be bigger".format(seconds * 1000.0),
+    )
+    return spins / (baseline * seconds)
+
+
+def sized_for_measurement(make_call, first_n):
+    """Double ``n`` until ``make_call(n)`` takes long enough to measure.
+
+    Machines differ by more than an order of magnitude, and a workload hard-coded
+    to take 80 ms here would take 8 ms on the next one and silently stop
+    measuring anything. Returns the callable, already warmed up.
+    """
+    n = first_n
+    for _ in range(8):
+        call = make_call(n)
+        started = time.perf_counter()
+        call()
+        if time.perf_counter() - started >= _GIL_FLOOR_SECONDS * 1.25:
+            return call
+        n *= 2
+    raise AssertionError(
+        "could not build a workload that runs for {:.0f} ms, even at n={}".format(
+            _GIL_FLOOR_SECONDS * 1250.0, n
+        )
+    )
 
 
 def shoelace(ring):
@@ -219,8 +398,36 @@ def square_block():
 
 @test
 def module_reports_a_version_string():
-    check(isinstance(stratum.__version__, str), "__version__ must be a str")
-    check(len(stratum.__version__) > 0, "__version__ must not be empty")
+    # Both branches assert, which is why `version_from_build` exists. The first
+    # version of this test guarded its whole body on `version != "0.0.0+unknown"`
+    # and STRATUM_VERSION_STRING is passed by nothing in the tree, so the only
+    # check that ever ran was isinstance(version, str) -- a test that could not
+    # fail, hidden inside one that looked thorough.
+    version = stratum.__version__
+    check(isinstance(version, str), "__version__ must be a str")
+    from_build = stratum.version_from_build
+    check(isinstance(from_build, bool), "version_from_build must be a bool")
+
+    if from_build:
+        # The build passed STRATUM_VERSION_STRING. It must be a dotted release
+        # number and it must NOT be the sentinel, or the define landed empty and
+        # the module is lying about knowing its version.
+        check(
+            version != "0.0.0+unknown",
+            "a build that supplied a version must not report the unknown sentinel",
+        )
+        parts = version.split("+")[0].split("-")[0].split(".")
+        check(len(parts) >= 2, "__version__ must be dotted, got {!r}".format(version))
+        for part in parts:
+            check(part.isdigit(), "__version__ component {!r} is not a number".format(part))
+    else:
+        # No define. bindings.cpp says so in exactly these words, and anything
+        # else means __version__ is being set from somewhere nobody intended.
+        check_eq(
+            version,
+            "0.0.0+unknown",
+            "a build that supplied no version must report the documented sentinel",
+        )
 
 
 @test
@@ -235,6 +442,11 @@ def stratum_error_is_catchable_as_runtime_error():
 
 @test
 def the_module_exposes_the_documented_surface():
+    # hasattr alone was nine checks that could not fail against anything a
+    # plausible edit would do -- `m.attr("parse_osm") = 3` satisfies it. Each
+    # name must be CALLABLE, so it is a bound function or a bound type and not a
+    # stray attribute, and each must be DOCUMENTED, because a def() that lost its
+    # docstring is how this module stops being usable from an interactive prompt.
     for name in (
         "parse_osm",
         "Document",
@@ -242,11 +454,37 @@ def the_module_exposes_the_documented_surface():
         "extract_blocks",
         "subdivide_block",
         "export_scene",
+        "export_scene_object",
         "build_building_mesh",
+        "build_area_mesh",
         "parse_rules",
+        "signed_ring_area",
+        "SceneObject",
         "StratumError",
     ):
         check(hasattr(stratum, name), "stratum.{} is missing".format(name))
+        value = getattr(stratum, name)
+        check(callable(value), "stratum.{} is not callable: {!r}".format(name, value))
+        doc = getattr(value, "__doc__", None)
+        check(
+            isinstance(doc, str) and doc.strip() != "",
+            "stratum.{} has no docstring".format(name),
+        )
+        if isinstance(doc, str) and not isinstance(value, type):
+            # A non-empty __doc__ proves nothing on its own for a bound FUNCTION:
+            # pybind11 writes the signature into the first line whether the
+            # binding supplied prose or not, so `m.def("f", f)` still passes the
+            # check above. What a reader of `help(stratum.parse_osm)` needs is
+            # the part after that line.
+            prose = doc.split("\n", 1)[1].strip() if "\n" in doc else ""
+            check(
+                prose != "",
+                "stratum.{} has only its auto-generated signature, no prose".format(name),
+            )
+    check(
+        isinstance(stratum.__doc__, str) and stratum.__doc__.strip() != "",
+        "the module itself must carry a docstring",
+    )
 
 
 # ============================================================================
@@ -276,6 +514,17 @@ def parse_osm_of_a_non_osm_file_raises_stratum_error_with_a_message():
 
 
 @test
+def parse_osm_of_a_directory_raises_rather_than_crashing():
+    # A directory EXISTS, so the FileNotFoundError guard lets it through and
+    # libosmium is handed a path it cannot classify. It throws, and the throw
+    # happens inside the GIL-released region: without the catch in the binding
+    # that exception would cross the pybind11 dispatcher with no GIL held and
+    # abort the process instead of raising.
+    exc = check_raises(stratum.StratumError, lambda: stratum.parse_osm(_TMP_DIR))
+    check(len(str(exc)) > len("parse_osm: "), "the refusal must carry libosmium's own message")
+
+
+@test
 def parse_osm_counts_roads_buildings_and_raw_elements():
     data = square_data()
     check_eq(data.road_count, 4, "four ways tagged highway")
@@ -301,12 +550,77 @@ def parsed_data_is_owned_by_python_and_survives_the_parser():
 
 
 @test
-def road_accessors_are_copies_not_borrows():
+def every_value_read_out_of_parsed_data_outlives_it():
+    # bounds, coord_system and stats are the reads that could hand back a
+    # reference into the ParsedOSMData rather than a copy of it. Dropping the
+    # owner and reading them afterwards is the only test that tells the
+    # difference, because a borrow gives the right answer right up until the
+    # storage is reused.
+    local = stratum.parse_osm(_SQUARE_PATH)
+
+    # FIRST, and before anything is dropped: prove the three reads are copies.
+    # BoundingBox, CoordinateSystem and ParseStatistics are all plain data, so
+    # the "drop the owner and read it back" checks below pass just as happily
+    # against a BORROW into freed storage -- freed POD bytes still hold the right
+    # numbers. This is what actually distinguishes the two. See
+    # check_is_a_fresh_copy().
+    check_is_a_fresh_copy(lambda: local.bounds, "ParsedOSMData.bounds")
+    check_is_a_fresh_copy(lambda: local.coord_system, "ParsedOSMData.coord_system")
+    check_is_a_fresh_copy(lambda: local.stats, "ParsedOSMData.stats")
+
+    bounds = local.bounds
+    coords = local.coord_system
+    stats = local.stats
+    buildings = local.buildings()
+    tags = local.way_tags(101)
+    centre = bounds.center_lat_lon
+
+    del local
+    gc.collect()
+
+    check_eq(stats.total_nodes, 8)
+    check_eq(stats.processed_roads, 4)
+    check_eq(bounds.center_lat_lon, centre)
+    check(bounds.is_valid, "the bounding box copy is still a valid box")
+    check_eq(len(coords.origin_lat_lon), 2)
+    check_eq(buildings[0].name, "Test House")
+    check_eq(tags.get("highway"), "residential")
+
+
+@test
+def unbounded_reads_are_methods_and_cheap_ones_are_properties():
+    # This test used to be called road_accessors_are_copies_not_borrows and
+    # asserted `data.roads() is not data.roads()`. That cannot fail: a
+    # std::vector<Road> crosses through pybind11's stl caster, which builds a
+    # fresh Python list of fresh Road objects on every call whatever the
+    # return_value_policy says. There is no borrow to catch, so the check was
+    # decoration.
+    #
+    # What IS falsifiable is module.hpp's naming rule, and it is falsifiable by
+    # the exact edit somebody will make: turning `roads()` into a property
+    # because `for r in data.roads` reads better. It copies every road per read,
+    # so `data.roads[0]` inside a loop is a hidden O(n^2), and the parentheses
+    # are the only warning a script author gets.
     data = square_data()
+    for name in ("roads", "buildings", "areas", "way_tags"):
+        member = getattr(type(data), name)
+        check(
+            not isinstance(member, property),
+            "ParsedOSMData.{} copies an unbounded amount and must stay a method".format(name),
+        )
+    for name in ("road_count", "building_count", "area_count", "node_count", "way_count"):
+        member = getattr(type(data), name)
+        check(
+            isinstance(member, property),
+            "ParsedOSMData.{} is a cheap scalar and must stay a property".format(name),
+        )
+
+    # And the list really is the caller's to do as it likes with: emptying one
+    # read must not reach the ParsedOSMData or any other read.
     first = data.roads()
-    second = data.roads()
-    check(first is not second, "roads() must return a fresh list each call")
-    check_eq(len(first), len(second))
+    del first[:]
+    check_eq(len(data.roads()), 4, "mutating a returned list must not reach the source")
+    check_eq(data.road_count, 4)
 
 
 @test
@@ -471,6 +785,57 @@ def layer_is_a_snapshot_and_reading_it_after_a_delete_gives_none():
 
 
 @test
+def a_layer_snapshot_and_its_transform_outlive_the_whole_document():
+    # The sharper version of the test above: not "delete the layer" but "drop
+    # the Document", which frees the LayerTree, the AttributeStore and the
+    # command history in one go. own_transform is the interesting part -- it is
+    # a bound class read out of another bound class, which is the one shape in
+    # this module that can produce a borrow, and a borrow here would be a read
+    # of freed storage with no diagnostic at all.
+    doc = stratum.Document()
+    layer = doc.create_layer(stratum.LayerKind.SHAPE, "Doomed")
+    transform = stratum.LayerTransform()
+    transform.translation = (1.5, -2.0, 3.25)
+    doc.set_layer_transform(layer, transform)
+
+    snapshot = doc.layer(layer)
+
+    # own_transform is the read that could produce a borrow, and LayerTransform
+    # is three vectors of plain data -- so "drop the document and read it back"
+    # cannot tell a copy from a borrow into freed storage. These two can.
+    check_is_a_fresh_copy(lambda: doc.layer(layer), "Document.layer()")
+    check_is_a_fresh_copy(lambda: snapshot.own_transform, "Layer.own_transform")
+
+    # And the copy is what makes the class docstring true. Under the borrow this
+    # binding started with, writing through the read rewrote the snapshot that
+    # stratum.Layer calls read-only: pybind11 does not carry constness into
+    # Python, so a `def_readonly` member of bound class type is fully writable.
+    scribble = snapshot.own_transform
+    scribble.translation = (99.0, 99.0, 99.0)
+    check_eq(
+        snapshot.own_transform.translation,
+        (1.5, -2.0, 3.25),
+        "writing through a read of own_transform must not reach the snapshot",
+    )
+    check_eq(
+        doc.layer(layer).own_transform.translation,
+        (1.5, -2.0, 3.25),
+        "nor the document",
+    )
+
+    own = snapshot.own_transform
+    children = snapshot.children
+
+    del doc
+    gc.collect()
+
+    check_eq(snapshot.name, "Doomed")
+    check_eq(snapshot.kind, stratum.LayerKind.SHAPE)
+    check_eq(own.translation, (1.5, -2.0, 3.25))
+    check_eq(children, [])
+
+
+@test
 def visibility_and_lock_inherit_down_the_tree():
     doc = stratum.Document()
     group = doc.create_layer(stratum.LayerKind.GROUP, "Group")
@@ -588,6 +953,26 @@ def aborting_a_transaction_reverts_what_it_applied_and_records_nothing():
     check(not doc.can_undo)
 
 
+@test
+def committing_or_aborting_without_an_open_transaction_raises():
+    # CommandStack logs a warning and returns, which is right for the editor: a
+    # stray commit on mouse-up must not take the application down. A script
+    # balances its transactions by hand, usually in a try/finally, and the
+    # symptom of an unbalanced pair is an undo that takes back a third of a
+    # change several steps later.
+    doc = stratum.Document()
+    check_raises(stratum.StratumError, doc.commit_transaction, "no transaction is open")
+    check_raises(stratum.StratumError, doc.abort_transaction, "no transaction is open")
+
+    doc.begin_transaction("One")
+    doc.create_layer(stratum.LayerKind.SHAPE, "Inside")
+    doc.commit_transaction()
+    check_eq(doc.undo_depth, 1)
+    # The second commit is the one that used to be silent.
+    check_raises(stratum.StratumError, doc.commit_transaction, "no transaction is open")
+    check_eq(doc.undo_depth, 1, "and the refused commit changed nothing")
+
+
 # ============================================================================
 # Objects and attributes
 # ============================================================================
@@ -602,6 +987,32 @@ def an_object_remembers_which_layer_it_is_in():
     check_eq(doc.object_layer(obj), layer)
     check_eq(doc.object_count, 1)
     check_eq(doc.objects(), [obj])
+
+
+@test
+def an_object_may_name_a_layer_that_does_not_exist_yet():
+    # Asserted so that nobody "fixes" it. Everywhere else in this module a bad
+    # layer id raises, and this looks like the same thing and is not:
+    # Document::create_object() documents that the layer is NOT validated,
+    # because the importer creates objects before their layers exist and
+    # refusing here would force it to order its work around this call.
+    # set_object_layer() follows the same rule. The id is kept verbatim.
+    doc = stratum.Document()
+    obj = doc.create_object(4242)
+    check(obj.valid)
+    check_eq(doc.object_layer(obj), 4242, "the id is kept, not zeroed")
+
+    other = doc.create_object()
+    check_eq(doc.object_layer(other), 0, "no layer reads as 0")
+    doc.set_object_layer(other, 9999)
+    check_eq(doc.object_layer(other), 9999)
+
+    # A LAYER attribute, by contrast, does name a layer that must exist.
+    check_raises(
+        stratum.StratumError,
+        lambda: doc.set_layer_attribute(9999, "height", 1.0),
+        "no layer with id 9999",
+    )
 
 
 @test
@@ -988,30 +1399,134 @@ def subdividing_a_block_produces_lots_that_tile_it():
     check_near(total, block.area, block.area * 0.02, "and must very nearly fill it")
 
 
+def subdivision_params(block, seed=7, irregularity=0.3, block_key=0xABCDEF):
+    """Params that make the subdivider actually consult its RNG.
+
+    ``irregularity`` is the whole point of the default. At LotParams' own default
+    of 0.0 the subdivider never draws from the stream at all, so every seed
+    produces byte-identical rings and a determinism test written against it
+    passes just as well on a binding that dropped ``params.seed`` on the floor.
+    Measured on the square fixture: at 0.0, seeds 7, 8 and 12345 give the same
+    five lots; at 0.3 they give three different sets.
+    """
+    params = stratum.LotParams()
+    params.lot_area_min = block.area / 12.0
+    params.lot_area_max = block.area / 4.0
+    params.irregularity = irregularity
+    params.seed = seed
+    params.block_key = block_key
+    return params
+
+
 @test
-def subdivision_is_deterministic_for_the_same_seed():
+def subdivision_is_deterministic_for_the_same_seed_and_varies_with_it():
     block = square_block()
 
     def rings(seed):
-        params = stratum.LotParams()
-        params.lot_area_min = block.area / 12.0
-        params.lot_area_max = block.area / 4.0
-        params.seed = seed
-        return [lot.ring() for lot in stratum.subdivide_block(block, params).lots()]
+        return [
+            lot.ring()
+            for lot in stratum.subdivide_block(block, subdivision_params(block, seed=seed)).lots()
+        ]
 
-    check_eq(rings(7), rings(7), "the same seed must give the same lots")
+    same = rings(7)
+    check(len(same) >= 2, "the fixture must actually split, or nothing below means anything")
+    check_eq(same, rings(7), "the same seed must give the same lots")
+    # The half that makes the half above worth having. Without it the test
+    # passes against a binding that never passed params.seed through at all --
+    # which is precisely what LotParams' default irregularity of 0.0 hid.
+    check(
+        same != rings(8),
+        "a different seed must give different lots, or params.seed is not reaching the subdivider",
+    )
+    check(same != rings(12345), "and so must a third seed")
 
 
 @test
-def lot_ids_are_stable_and_unique_within_a_subdivision():
+def lot_ids_are_stable_across_runs_and_unique_within_a_subdivision():
+    # "Stable" is the C7 claim in lots.hpp and it is about ids surviving a
+    # RE-subdivision, so it cannot be tested inside a single run. This test used
+    # to check uniqueness and non-zero in one subdivision and nothing else,
+    # under a name that promised the rest.
     block = square_block()
+
+    def subdivide(block_key=0xABCDEF, seed=3):
+        # irregularity 0.0 here, deliberately, and it is the opposite choice from
+        # the determinism test above. At 0.0 the subdivider draws nothing, so the
+        # RINGS are fixed and any change in the ids is attributable to the key
+        # alone rather than to the geometry moving under them.
+        params = subdivision_params(block, seed=seed, irregularity=0.0, block_key=block_key)
+        lots = stratum.subdivide_block(block, params).lots()
+        return [lot.id for lot in lots], [lot.ring() for lot in lots]
+
+    first_ids, first_rings = subdivide()
+    check(len(first_ids) >= 2, "the fixture must actually split")
+    check_eq(len(set(first_ids)), len(first_ids), "lot ids must be unique")
+    check(all(lot_id != 0 for lot_id in first_ids), "0 is the invalid lot id")
+
+    # C7 part one: same block, same params, same ids. Twice, so a subdivider that
+    # drew from one stream carried across calls would be caught.
+    check_eq(first_ids, subdivide()[0], "the same block and params must reproduce the same ids")
+    check_eq(first_ids, subdivide()[0], "and must keep reproducing them")
+
+    # C7 part two, mechanism 1: every id is rooted in LotParams::block_key, the
+    # caller's stable name for the block. The rings are identical across the two
+    # keys -- asserted, not assumed -- so the ids differing can only be the key
+    # reaching the subdivider. If it did not, every block in a city would hand
+    # out the same lot ids.
+    other_ids, other_rings = subdivide(block_key=0x123456)
+    check_eq(other_rings, first_rings, "at irregularity 0 the key must not move the geometry")
+    check(
+        first_ids != other_ids,
+        "lot ids must depend on params.block_key, or nothing distinguishes one block's "
+        "lots from another's",
+    )
+
+
+@test
+def blocks_lots_and_stats_outlive_the_containers_they_came_from():
+    # Every `.stats` in this module is a bound class read out of another bound
+    # class, which is the one shape that can hand out a pointer into its owner.
+    #
+    # The `del container; read it back` checks below are NOT what proves that is
+    # not happening, and for a long time this test pretended they were. BlockStats
+    # and LotStats are counters of plain data: a borrow whose keep_alive was lost
+    # reads freed bytes that still hold the right numbers, so every check here
+    # passes while AddressSanitizer reports heap-use-after-free on the same line.
+    # The copy checks are what bite; the read-back checks say the copy is intact.
+    graph = stratum.RoadGraph()
+    graph.build(square_data())
+    extraction = stratum.extract_blocks(graph)
+    check_is_a_fresh_copy(lambda: extraction.stats, "BlockExtraction.stats")
+    block = extraction.block(0)
+    block_stats = extraction.stats
+    faces = block_stats.faces
+    area = block.area
+
+    del extraction
+    gc.collect()
+    check_eq(block_stats.faces, faces, "BlockStats must outlive its BlockExtraction")
+    check_eq(block.area, area, "a Block copy must outlive its BlockExtraction")
+
+    del graph
+    gc.collect()
+    check_eq(len(block.ring()), 4, "and must outlive the RoadGraph it was walked from")
+
+    # A block that outlived both is still a usable input, which is the whole
+    # point of handing out copies.
     params = stratum.LotParams()
-    params.lot_area_min = block.area / 12.0
-    params.seed = 3
-    lots = stratum.subdivide_block(block, params).lots()
-    ids = [lot.id for lot in lots]
-    check_eq(len(set(ids)), len(ids), "lot ids must be unique")
-    check(all(lot_id != 0 for lot_id in ids), "0 is the invalid lot id")
+    params.lot_area_min = area / 12.0
+    params.seed = 11
+    subdivision = stratum.subdivide_block(block, params)
+    check_is_a_fresh_copy(lambda: subdivision.stats, "LotSubdivision.stats")
+    lots = subdivision.lots()
+    lot_stats = subdivision.stats
+    count = subdivision.lot_count
+    first_ring = lots[0].ring()
+
+    del subdivision
+    gc.collect()
+    check_eq(lot_stats.lots, count, "LotStats must outlive its LotSubdivision")
+    check_eq(lots[0].ring(), first_ring, "and so must every Lot copy")
 
 
 # ============================================================================
@@ -1045,10 +1560,39 @@ def a_scene_object_owns_its_mesh_and_outlives_it():
     del mesh
     gc.collect()
 
-    check_eq(obj.mesh.triangle_count, triangles, "the object kept its own copy")
+    check_eq(obj.triangle_count, triangles, "the object kept its own copy")
+    check_eq(obj.mesh().triangle_count, triangles)
     check_eq(obj.kind, stratum.SceneObjectKind.BUILDING)
     check_eq(obj.osm_id, 200)
     check(len(obj.name) > 0, "describe_building names the object")
+
+
+@test
+def the_mesh_read_out_of_a_scene_object_is_a_copy_and_cannot_change_it():
+    # This was `def_readonly("mesh", ...)` and it did not hold. pybind11 gives a
+    # data member reference_internal, which blocks rebinding and nothing else:
+    # the Mesh handed back wrapped the object's own storage and pybind11 does not
+    # carry constness into Python, so `obj.mesh.clear()` emptied the geometry the
+    # exporter was about to write -- ten triangles before, zero after, no error,
+    # and an empty file at the end of it.
+    building = square_data().buildings()[0]
+    obj = stratum.scene_object_for_building(building, stratum.build_building_mesh(building))
+    before = obj.triangle_count
+    check(before > 0, "the fixture must have geometry for this test to mean anything")
+
+    borrowed = obj.mesh()
+    borrowed.clear()
+    check_eq(borrowed.triangle_count, 0, "the copy really was cleared")
+    check_eq(obj.triangle_count, before, "and the SceneObject did not notice")
+    check_eq(obj.mesh().triangle_count, before)
+
+    # Two reads are two objects, which is what "copy" has to mean.
+    check(obj.mesh() is not obj.mesh(), "each read must be a fresh copy")
+
+    # And the export still carries the geometry, which is the failure the
+    # mutation would actually have caused.
+    stats = stratum.export_scene([obj], tmp_path("mesh_copy_out"))
+    check_eq(stats.triangles, before, "the export must still see the original triangles")
 
 
 @test
@@ -1078,6 +1622,13 @@ def export_scene_rejects_a_list_of_the_wrong_thing():
         TypeError, lambda: stratum.export_scene([1, 2, 3], out_dir), "element 0"
     )
     check_raises(TypeError, lambda: stratum.export_scene([None], out_dir), "element 0")
+    # A str passes PySequence_Check and indexes to one-character strings, so
+    # `export_scene("obj", d)` would otherwise walk three "objects" before
+    # failing on something unrelated. It must be refused at element 0.
+    check_raises(TypeError, lambda: stratum.export_scene("obj", out_dir), "element 0")
+    # Not a sequence at all: the refusal comes from the signature, not the loop.
+    check_raises(TypeError, lambda: stratum.export_scene(42, out_dir))
+    check_raises(TypeError, lambda: stratum.export_scene(None, out_dir))
     check(
         not os.path.exists(out_dir),
         "a refused export must not have created the directory",
@@ -1089,6 +1640,102 @@ def export_scene_of_nothing_writes_nothing_and_does_not_raise():
     stats = stratum.export_scene([], tmp_path("export_empty_out"))
     check_eq(stats.files, 0)
     check_eq(stats.objects, 0)
+
+
+@test
+def export_scene_raises_when_the_destination_refuses_the_write():
+    # The C++ exporter is documented to come back with files == 0 rather than
+    # throwing, which is right for a caller that wants a partial export's
+    # numbers and wrong for a script: a headless run would get a stats object
+    # full of zeroes, no exception, and exit status 0. The binding turns
+    # unwritten_triangles into a refusal.
+    #
+    # The destination is an ordinary FILE standing where the directory should
+    # be, rather than a chmod: chmod does nothing when the suite runs as root,
+    # and this failure has to be reproducible in a container.
+    blocker = tmp_path("not_a_directory")
+    with open(blocker, "w", encoding="utf-8") as handle:
+        handle.write("in the way\n")
+
+    building = square_data().buildings()[0]
+    obj = stratum.scene_object_for_building(building, stratum.build_building_mesh(building))
+
+    exc = check_raises(
+        stratum.StratumError, lambda: stratum.export_scene([obj], blocker), "could not write"
+    )
+    check(blocker in str(exc), "the refusal must name the destination")
+
+    # The refusal carries the numbers, not just a sentence about two of them.
+    # A job that half-wrote a city has to be able to report what it DID write,
+    # and `triangles`, `chunks`, `objects`, `vertices` and `written_files` are
+    # unrecoverable from the message text. See module.hpp's Errors section.
+    check(hasattr(exc, "stats"), "a refused export must carry its SceneExportStats as .stats")
+    check(
+        isinstance(exc.stats, stratum.SceneExportStats),
+        "exc.stats must be a SceneExportStats, got {!r}".format(type(exc.stats)),
+    )
+    check_eq(
+        exc.stats.unwritten_triangles,
+        obj.triangle_count,
+        "every triangle was refused, so every triangle must be counted unwritten",
+    )
+    check_eq(exc.stats.files, 0, "nothing was written")
+    check_eq(exc.stats.written_files, [])
+    check_eq(exc.stats.triangles, 0, "and nothing reached a file")
+    # The stats outlive the C++ frame that produced them: it returned long
+    # before the script got to this line.
+    stats = exc.stats
+    del exc
+    gc.collect()
+    check_eq(stats.unwritten_triangles, obj.triangle_count)
+
+    # And the same for a path UNDER the file, which is where a chunked export
+    # would have tried to create its directory.
+    check_raises(
+        stratum.StratumError,
+        lambda: stratum.export_scene([obj], os.path.join(blocker, "sub")),
+        "could not write",
+    )
+
+
+@test
+def export_scene_object_separates_an_empty_mesh_from_a_failed_write():
+    # One C++ bool covers both, and reporting "could not write <path>" for an
+    # object with no triangles sends the author to check permissions on a path
+    # that was never the problem.
+    blocker = tmp_path("blocker_file")
+    with open(blocker, "w", encoding="utf-8") as handle:
+        handle.write("in the way\n")
+
+    empty = stratum.SceneObject(stratum.Mesh(), name="nothing_here")
+    exc = check_raises(
+        stratum.StratumError,
+        lambda: stratum.export_scene_object(empty, tmp_path("empty.obj")),
+        "no triangles",
+    )
+    check("nothing_here" in str(exc), "the refusal must name the object")
+
+    building = square_data().buildings()[0]
+    obj = stratum.scene_object_for_building(building, stratum.build_building_mesh(building))
+    check_raises(
+        stratum.StratumError,
+        lambda: stratum.export_scene_object(obj, os.path.join(blocker, "x.obj")),
+        "could not write",
+    )
+
+
+@test
+def saving_a_document_to_an_unwritable_path_raises_and_names_it():
+    blocker = tmp_path("blocker_doc")
+    with open(blocker, "w", encoding="utf-8") as handle:
+        handle.write("in the way\n")
+    doc = stratum.Document()
+    doc.create_layer(stratum.LayerKind.SHAPE, "Something")
+    exc = check_raises(
+        stratum.StratumError, lambda: doc.save(os.path.join(blocker, "x.stratum")), "save:"
+    )
+    check(blocker in str(exc), "the refusal must name the path it could not write")
+    check(doc.dirty, "a save that failed must NOT have marked the document saved")
 
 
 @test
@@ -1159,6 +1806,156 @@ def a_library_file_with_no_start_rule_reports_an_empty_start_rule():
 
 
 # ============================================================================
+# The GIL
+# ============================================================================
+
+
+def _generated_osm(nways):
+    """A synthetic extract of ``nways`` two-node residential ways."""
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<osm version="0.6" generator="stratum-python-test">',
+    ]
+    node = 1
+    for i in range(nways):
+        lat = 53.3400 + (i % 1000) * 1e-5
+        lon = -6.2600 + (i // 1000) * 1e-5
+        parts.append('<node id="%d" version="1" lat="%.6f" lon="%.6f"/>' % (node, lat, lon))
+        parts.append(
+            '<node id="%d" version="1" lat="%.6f" lon="%.6f"/>' % (node + 1, lat + 2e-5, lon + 2e-5)
+        )
+        node += 2
+    node = 1
+    for i in range(nways):
+        parts.append(
+            '<way id="%d" version="1"><nd ref="%d"/><nd ref="%d"/>'
+            '<tag k="highway" v="residential"/></way>' % (900000 + i, node, node + 1)
+        )
+        node += 2
+    parts.append("</osm>")
+    return "\n".join(parts)
+
+
+@test
+def the_gil_probe_can_see_a_thread_that_holds_the_gil():
+    # The control, and the reason the two tests after it are worth anything.
+    # `sum(range(n))` is one bytecode: CPython runs the whole C loop with the GIL
+    # held and never offers it back. A probe that scored this as "released"
+    # would score everything as released, and the two tests below would be two
+    # more tests that cannot fail.
+    def make(n):
+        return lambda: sum(range(n))
+
+    share = gil_share(sized_for_measurement(make, 2000000))
+    check(
+        share < _GIL_RELEASED_FLOOR,
+        "a call that holds the GIL must score below {}; got {:.3f}, so the probe is not "
+        "measuring what it claims to".format(_GIL_RELEASED_FLOOR, share),
+    )
+
+
+@test
+def parse_osm_releases_the_gil():
+    # The flagship case. A script that imports an extract on a worker thread
+    # must not freeze the thread driving its UI, and without the release in
+    # parse_osm it would freeze for the whole parse.
+    directory = tmp_path("gil_parse")
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, "generated.osm")
+
+    # One path, overwritten each round. sized_for_measurement() only ever uses
+    # the LAST callable it built, and a file per round would leave a dozen
+    # megabytes of discarded fixtures behind on the way there.
+    def make(nways):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(_generated_osm(nways))
+        return lambda: stratum.parse_osm(path)
+
+    share = gil_share(sized_for_measurement(make, 8000))
+    check(
+        share > _GIL_RELEASED_FLOOR,
+        "parse_osm must release the GIL; other threads ran for only {:.1%} of it".format(share),
+    )
+
+
+@test
+def export_scene_survives_its_list_being_emptied_under_it():
+    # The other half of releasing the GIL, and the reason export_scene holds its
+    # own strong reference to every element for the length of the call. Once the
+    # GIL is released, ANOTHER Python thread can clear the list it was handed,
+    # drop the last reference to each SceneObject, and free the very Mesh the
+    # exporter is reading. The argument tuple keeps the LIST alive and says
+    # nothing about its contents.
+    #
+    # A binding that got this wrong does not fail this test, it crashes the
+    # process. That is the correct outcome: a use-after-free reported as a soft
+    # assertion failure would be a lie about what happened.
+    building = square_data().buildings()[0]
+    mesh = stratum.build_building_mesh(building)
+    per_object = mesh.triangle_count
+    check(per_object > 0, "the fixture must have geometry")
+
+    out_dir = tmp_path("export_race_out")
+
+    def build(count):
+        # Distinct objects, so the list holds the ONLY reference to each.
+        return [
+            stratum.SceneObject(mesh, stratum.SceneObjectKind.BUILDING, "o%d" % i)
+            for i in range(count)
+        ]
+
+    # Long enough that the clear below lands while the exporter is running.
+    count = 1000
+    for _ in range(8):
+        started = time.perf_counter()
+        stratum.export_scene(build(count), out_dir)
+        if time.perf_counter() - started >= _GIL_FLOOR_SECONDS:
+            break
+        count *= 2
+
+    objects = build(count)
+    result = {}
+
+    def worker():
+        result["stats"] = stratum.export_scene(objects, out_dir)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    time.sleep(0.005)  # let the export get past the argument conversion
+    del objects[:]
+    gc.collect()
+    thread.join()
+
+    stats = result["stats"]
+    check_eq(stats.objects, count, "every object must still have been exported")
+    check_eq(
+        stats.triangles,
+        count * per_object,
+        "and with all of its geometry, not whatever was left in the freed storage",
+    )
+
+
+@test
+def export_scene_releases_the_gil():
+    # The other half of what J3 and J4 stand on: an export of a whole city is
+    # the longest call in the module, and it writes files, which is exactly when
+    # a held GIL is most visible.
+    building = square_data().buildings()[0]
+    obj = stratum.scene_object_for_building(building, stratum.build_building_mesh(building))
+    out_dir = tmp_path("gil_export")
+
+    def make(count):
+        objects = [obj] * count
+        return lambda: stratum.export_scene(objects, out_dir)
+
+    share = gil_share(sized_for_measurement(make, 1000))
+    check(
+        share > _GIL_RELEASED_FLOOR,
+        "export_scene must release the GIL; other threads ran for only {:.1%} of it".format(share),
+    )
+
+
+# ============================================================================
 # Runner
 # ============================================================================
 
@@ -1180,17 +1977,30 @@ def _teardown():
 def run_all():
     """Run every registered test and report what happened.
 
-    Returns a dict with ``run``, ``passed`` and ``failures``. The C++ driver
-    checks all three: a run count of zero has to FAIL the suite, because a
-    harness that silently registers nothing looks exactly like a pass.
+    Returns a dict with ``registered``, ``run``, ``passed`` and ``failures``.
+
+    ``registered`` and ``run`` are separate numbers and that is the whole reason
+    the driver's arithmetic is worth checking. Both used to be ``len(_TESTS)``,
+    which made ``passed + len(failures) == run`` true by construction: the driver
+    asserted it, and the assertion could not fail. ``run`` is now incremented
+    BEFORE each call, so a test that neither passes nor raises -- the loop
+    breaking, an exception escaping while a traceback is being formatted, a test
+    calling ``os._exit`` -- leaves the three numbers disagreeing and the driver
+    says so.
+
+    ``registered`` carries the other half: a harness that silently stopped
+    registering tests reports zero failures and looks exactly like a pass, so the
+    driver holds it against a floor.
     """
     failures = []
     passed = 0
+    run = 0
 
     try:
         _setup()
     except BaseException:  # noqa: BLE001 - a broken fixture must be reported, not hidden
         return {
+            "registered": len(_TESTS),
             "run": 0,
             "passed": 0,
             "failures": ["<setup>: " + traceback.format_exc()],
@@ -1198,6 +2008,7 @@ def run_all():
 
     try:
         for fn in _TESTS:
+            run += 1
             try:
                 fn()
                 passed += 1
@@ -1206,4 +2017,9 @@ def run_all():
     finally:
         _teardown()
 
-    return {"run": len(_TESTS), "passed": passed, "failures": failures}
+    return {
+        "registered": len(_TESTS),
+        "run": run,
+        "passed": passed,
+        "failures": failures,
+    }

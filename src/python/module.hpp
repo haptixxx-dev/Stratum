@@ -53,10 +53,30 @@
  *      That pointer dies when the layer is deleted, and "delete the layer, then
  *      read the object you took out of it earlier" is the most natural thing in
  *      the world to write.
- *   3. **What must borrow, borrows with `reference_internal`.** The one place a
- *      reference crosses is `Document.attribute_keys` and friends, where
- *      pybind11's keep_alive ties the borrower's life to the document's.
+ *   3. **No bound class is ever read out of another bound class by reference.**
+ *      `def_readonly` on a member whose type is itself bound gives that read
+ *      pybind11's `reference_internal`, which is a borrow into the container
+ *      with a keep_alive holding it up. Three of those existed --
+ *      `Layer.own_transform`, `BlockExtraction.stats`, `LotSubdivision.stats` --
+ *      and all three are now `def_property_readonly` returning a COPY, because a
+ *      borrow of that shape has two failure modes with no diagnostic:
  *
+ *        - The keep_alive can be lost by a later edit, and every one of those
+ *          three types is plain data, so the borrower goes on reading FREED
+ *          BYTES and returning the right numbers. No assertion about the value
+ *          can catch it; the review that found this needed AddressSanitizer.
+ *        - pybind11 does not carry constness into Python, so the "read-only"
+ *          member is writable through the borrow. `own = snapshot.own_transform;
+ *          own.translation = (99, 99, 99)` rewrote the snapshot that
+ *          `stratum.Layer`'s own docstring calls read-only.
+ *
+ *      A copy of a counter struct costs under a hundred bytes and makes both
+ *      impossible. The test for this asserts `x.stats is not x.stats`: pybind11
+ *      hands back the SAME Python object for two reads of one C++ address, so
+ *      two reads being one object is the signature of a borrow and is the only
+ *      way to tell a borrow from a copy of a struct with no writable field.
+ *
+
  * The sharpest case is osm::SceneObject, which holds a RAW `const Mesh*`. Binding
  * it directly would let a script write `obj.mesh = m; del m; export(...)` and get
  * a crash. So the Python type named `stratum.SceneObject` is OwnedSceneObject
@@ -93,13 +113,48 @@
  * is a query, not a refused operation. Anything naming a handle that does not
  * exist raises.
  *
+ * Two places raise where the C++ underneath deliberately does not, because the
+ * caller is a script and not the editor:
+ *
+ *   - **`export_scene` raises when the destination refused the write, and the
+ *     refusal carries the stats.** scene_export.hpp promises that "a completely
+ *     failed export comes back with `files == 0` rather than throwing", which is
+ *     right for a caller that wants a partial export's numbers and wrong for a
+ *     headless run, which would get zeroes, no exception and exit status 0.
+ *     `unwritten_triangles` is the signal; geometry the exporter itself rejected
+ *     goes to `dropped_triangles` and does not raise, because that is a
+ *     complaint about the input.
+ *
+ *     Raising must not cost the caller the numbers, though, and at first it did:
+ *     the message named `unwritten_triangles` and `files` as text and the other
+ *     six counts were lost with the discarded SceneExportStats. A partial export
+ *     is exactly the case scene_export.hpp's non-throwing contract was shaped
+ *     for, so the whole stats object is attached to the exception instance as
+ *     `.stats` and `except stratum.StratumError as exc: exc.stats.written_files`
+ *     reports what the job managed to write before it stopped.
+ *   - **`commit_transaction` and `abort_transaction` raise when nothing is
+ *     open.** CommandStack logs a warning and returns, which keeps a stray
+ *     commit on mouse-up from taking the editor down. A script balances its
+ *     transactions by hand, and the symptom of an unbalanced pair is an undo
+ *     that takes back a third of a change.
+ *
  * ### Naming
  *
  * snake_case methods, properties for cheap reads, and enum members in UPPER_CASE
- * per PEP 8. A read that COPIES is a method and not a property:
- * `data.roads()` copies every road, and a property that silently costs O(n) turns
- * `for r in data.roads` into an O(n^2) loop nobody can see. Cheap scalars --
- * `data.road_count`, `doc.dirty` -- stay properties.
+ * per PEP 8. A read that COPIES an unbounded amount is a method and not a
+ * property: `data.roads()` copies every road, and a property that silently costs
+ * O(n) turns `for r in data.roads` into an O(n^2) loop nobody can see. Cheap
+ * scalars -- `data.road_count`, `doc.dirty` -- stay properties, and so do the
+ * fixed-size copies of rule 3 above, because a hundred bytes is not O(n).
+ *
+ * ### Version
+ *
+ * `stratum.__version__` is `STRATUM_VERSION_STRING` when the build passed one
+ * and the literal `"0.0.0+unknown"` when it did not. `stratum.version_from_build`
+ * says WHICH, and exists for the test: without it, a test of `__version__` can
+ * only assert the dotted shape behind an `if`, and that `if` is dead in every
+ * tree where CMake has not yet passed the define. With the flag both branches
+ * are assertable, so the test is worth running in either build.
  */
 
 #pragma once
@@ -169,6 +224,15 @@ public:
  * is simply true. export_scene() builds the pointer-carrying osm::SceneObject
  * array itself, inside the call, from objects it has pinned with a strong Python
  * reference for the duration.
+ *
+ * `mesh` is bound as a METHOD returning a COPY, and not as a read-only data
+ * member. `def_readonly` blocks rebinding and nothing else: pybind11 hands back a
+ * live Python Mesh wrapping this object's own storage and does not carry
+ * constness across, so `obj.mesh.clear()` emptied the mesh the exporter was
+ * about to write -- ten triangles before, zero after, no error, an empty file.
+ * Rule 2 above already says what to do about that, and this type is not an
+ * exception to it. `vertex_count` and `triangle_count` stay cheap properties, so
+ * the loop that only wanted the size does not pay for a copy.
  */
 struct OwnedSceneObject {
     Mesh mesh;

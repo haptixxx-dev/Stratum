@@ -134,6 +134,80 @@ constexpr uint32_t kNone = 0xFFFFFFFFu;
     return false;
 }
 
+/**
+ * @brief Delete every out-and-back excursion from a closed ring, in place
+ *
+ * ### What it removes, and why it is safe to remove
+ *
+ * Three consecutive points a, b, c where `b -> c` runs back along `a -> b`: the
+ * ring leaves along a line and returns down the same line. The triangle a, b, c is
+ * degenerate, so deleting b changes the ring's area by exactly nothing, and what
+ * is left -- a, then c -- is the same boundary with the excursion taken out.
+ *
+ * The test is a REVERSAL, not merely collinearity: `dot` must be negative. An
+ * ordinary collinear vertex, where the ring carries straight on, is left alone.
+ * Dropping those as well would be harmless for the area and would throw away the
+ * contour vertices of a densified street, which a caller reads.
+ *
+ * ### Why a face ring ever contains one
+ *
+ * The missing vertex event. See the scope section of straight_skeleton.hpp: two
+ * reflex vertices of the same wavefront loop arriving at exactly the same point
+ * are not detected, both carry on, and the face they bound picks up a spur along
+ * the bisector they shared. The spur encloses nothing, so every area and the whole
+ * tiling are still exact -- but the RING crosses itself, and
+ * `check_tiles_polygon()` in the suite, D5's triangulator and this file's own
+ * contract all say that must never leave here. A comb of equal teeth produces one;
+ * the same comb with the teeth even slightly unequal does not.
+ *
+ * Indices 0 and 1 are never removed: they are the two ends of the face's own
+ * contour edge, which SkeletonFace::ring promises, and a contour edge of a simple
+ * polygon is never a reversal anyway.
+ *
+ * @param ring  Ring to repair; first point not repeated
+ * @param times Parallel to @p ring and kept in step with it
+ * @param eps   Points closer than this are one point, and the collinearity slack
+ * @return How many vertices were deleted
+ */
+[[nodiscard]] size_t drop_ring_spurs(std::vector<glm::dvec2>& ring, std::vector<double>& times,
+                                     double eps) {
+    size_t removed = 0;
+    bool changed = true;
+    while (changed && ring.size() > 3) {
+        changed = false;
+        for (size_t i = 2; i < ring.size(); ++i) {
+            const glm::dvec2 u = ring[i] - ring[i - 1];
+            const glm::dvec2 v = ring[(i + 1) % ring.size()] - ring[i];
+            const double lu2 = length2(u);
+            const double lv2 = length2(v);
+            if (lu2 <= eps * eps || lv2 <= eps * eps) continue;
+            if (glm::dot(u, v) >= 0.0) continue;
+            // Collinear to within `eps` measured as a DISTANCE: the cross product
+            // over the longer arm is how far the shorter arm's far end lies off the
+            // longer arm's line. A fixed cross-product threshold would be an area
+            // and would tighten as the arms shorten.
+            const double longer = std::sqrt(std::max(lu2, lv2));
+            if (std::fabs(cross2(u, v)) > eps * longer) continue;
+
+            ring.erase(ring.begin() + static_cast<std::ptrdiff_t>(i));
+            times.erase(times.begin() + static_cast<std::ptrdiff_t>(i));
+            ++removed;
+            changed = true;
+            // Deleting b can leave a and c coincident -- the spur went out and came
+            // all the way back. Then they are one point and one of them has to go
+            // too, or the next pass sees a zero-length arm and skips the vertex.
+            while (ring.size() > 3 &&
+                   length2(ring[i % ring.size()] - ring[i - 1]) <= eps * eps) {
+                ring.erase(ring.begin() + static_cast<std::ptrdiff_t>(i % ring.size()));
+                times.erase(times.begin() + static_cast<std::ptrdiff_t>(i % ring.size()));
+                ++removed;
+            }
+            break;
+        }
+    }
+    return removed;
+}
+
 /// True when segments (a,b) and (c,d) cross at a point interior to both
 [[nodiscard]] bool segments_properly_cross(const glm::dvec2& a, const glm::dvec2& b,
                                            const glm::dvec2& c, const glm::dvec2& d) noexcept {
@@ -249,6 +323,37 @@ public:
     Sim(const std::vector<glm::dvec2>& contour, const SkeletonConfig& config)
         : eps_(config.point_epsilon > 0.0 ? config.point_epsilon : 1e-6) {
         out_.contour = contour;
+
+        // The wavefront at time t is at distance t from every contour edge, so a
+        // disc of radius t fits inside the polygon and therefore inside its
+        // bounding box: the last PHYSICAL event is no later than half the shorter
+        // side. The limit kept here is a thousand times the DIAGONAL, which is
+        // thousands of times that bound, and the factor is not timidity.
+        //
+        // The simulation schedules events long past the physical bound while it is
+        // tidying up a wavefront that has already degenerated, and those events are
+        // how it terminates. Clamping anywhere near the honest bound cost 1% of
+        // non-convex polygons their last event, and the flat sweep then closed a
+        // loop that still had area -- a wrong answer rather than a late one, and
+        // the face rings came out self-crossing. At eight times the bound that was
+        // still happening; at a thousand it is not.
+        //
+        // What this number is for is the event time that arithmetic invented out of
+        // a near-zero closing rate: two edges parallel to within rounding, closing
+        // at 1e-9, dividing a gap of ten metres into a time of 1.5e9. Those are not
+        // a factor of eight out, they are a factor of 1e8 out, and they are not
+        // harmless -- the event fires, a node lands 1.5e9 metres away, and a face
+        // over a 500 square metre block comes out at 5e10. That outcome is COMPLETE
+        // and catastrophically wrong, which is the one thing this file is supposed
+        // never to produce. Dropping the candidate leaves the wavefront with no
+        // event, which is what the last-resort flat sweep in run() is for.
+        glm::dvec2 lo = contour.empty() ? glm::dvec2{0.0} : contour.front();
+        glm::dvec2 hi = lo;
+        for (const glm::dvec2& p : contour) {
+            lo = glm::min(lo, p);
+            hi = glm::max(hi, p);
+        }
+        t_limit_ = 1000.0 * std::sqrt(length2(hi - lo)) + eps_;
     }
 
     StraightSkeleton run(size_t max_iterations);
@@ -267,13 +372,15 @@ private:
 
     void seed();
     void collapse_small_loops(double t);
-    size_t resolve_flat_loops(double t, size_t min_members);
+    size_t resolve_flat_loops(double t, size_t min_members, bool last_resort);
     [[nodiscard]] Event find_event(double t) const;
     void apply_edge_event(const Event& ev);
     void apply_split_event(const Event& ev);
     void build_faces();
 
     double eps_ = 1e-6;
+    /// Latest time an event can possibly happen at; see the constructor.
+    double t_limit_ = 0.0;
     /// Next free wavefront-loop id. Loop 0 is the input ring; every split makes
     /// one more, and ids are never reused, so a stale id can never alias a live
     /// loop and let two disconnected wavefronts see each other.
@@ -449,9 +556,13 @@ void Sim::collapse_small_loops(double t) {
  *                    that path is exact and must not be diverted here; passing 4
  *                    leaves it alone, and passing 1 is the last-resort sweep when
  *                    no event could be found at all.
+ * @param last_resort Widen what counts as flat, because the alternative is now
+ *                    returning nothing at all. See the threshold below: the
+ *                    routine sweep must stay tight or it flattens geometry that
+ *                    the simulation could still have resolved exactly.
  * @return How many loops were resolved
  */
-size_t Sim::resolve_flat_loops(double t, size_t min_members) {
+size_t Sim::resolve_flat_loops(double t, size_t min_members, bool last_resort) {
     size_t resolved = 0;
     std::vector<uint32_t> seen_loops;
 
@@ -474,12 +585,59 @@ size_t Sim::resolve_flat_loops(double t, size_t min_members) {
         if (count < min_members || count == 0) continue;
 
         double twice_area = 0.0;
+        double perimeter = 0.0;
         for (size_t k = 0; k < count; ++k) {
             const glm::dvec2 a = pos(members[k], t);
             const glm::dvec2 b = pos(members[(k + 1) % count], t);
             twice_area += a.x * b.y - b.x * a.y;
+            perimeter += std::sqrt(length2(b - a));
         }
-        if (0.5 * twice_area > kAreaEpsilon) continue;
+        // THE THRESHOLD IS RELATIVE TO THE LOOP'S OWN SIZE, and it has to be.
+        //
+        // A flat wavefront is one whose vertices lie on a line to within the point
+        // epsilon, and a ribbon of length L and width eps has area L * eps -- so
+        // the area of a loop that IS flat grows with the loop. Against a fixed
+        // area floor of 1e-12 a ridge 40 m long came out at 3e-11 square metres
+        // and was declared non-flat, which is a width of under a picometre.
+        //
+        // That is not a rounding quibble, it is where the simulation died. The
+        // vertices of such a loop are the meetings of near-opposing edges and have
+        // no usable velocity (see kMaxVertexSpeed), so they generate no events:
+        // refusing to flatten the loop left the wavefront alive with nothing to do
+        // and the whole skeleton came back incomplete. It cost roughly 40% of
+        // rectangular blocks whose edges carry street-polyline vertices, which is
+        // most of them. The other 5% got a worse answer -- see find_event().
+        //
+        // THE THRESHOLD IS A WIDTH, AND IT IS RELATIVE TO THE LOOP'S OWN SIZE.
+        // A flat wavefront is one whose vertices lie on a line, and a ribbon of
+        // length L and width w has area L * w, so the area of a loop that IS flat
+        // grows with the loop. Against a fixed area floor of 1e-12 a ridge forty
+        // metres long came out at 3e-11 square metres and was declared non-flat,
+        // which is a width of under a picometre. Everything below is stated as a
+        // width and multiplied back up by the perimeter here.
+        //
+        // The ROUTINE sweep uses the point epsilon and nothing more. It runs at the
+        // top of every step, before any event, so a threshold that is generous here
+        // flattens a loop the simulation could still have resolved exactly -- and
+        // then the faces are approximate for no reason. A third of jittered
+        // rectangles came out with the wrong face areas when this was widened.
+        //
+        // The LAST-RESORT sweep uses the width the VELOCITY SOLVE cannot resolve,
+        // which is far coarser. A vertex is abandoned as degenerate once its two
+        // edges are within 2/kMaxVertexSpeed of exactly opposing (see Wv::finite),
+        // and over a ridge of length L two lines closing at that angle are still
+        // L / kMaxVertexSpeed apart -- eighty microns on a forty-metre ridge, a
+        // hundred times the point epsilon. A loop in that band can produce no
+        // event, because every one of its vertices has been abandoned, so refusing
+        // to flatten it is refusing to finish: the wavefront stalls and the whole
+        // skeleton comes back incomplete. That cost roughly 40% of rectangular
+        // blocks whose edges carry street-polyline vertices, which is most of them.
+        //
+        // The comparison stays SIGNED so that a loop that has folded through
+        // itself, and so has negative area, still resolves here rather than being
+        // simulated on.
+        const double flat_width = last_resort ? (eps_ + perimeter / kMaxVertexSpeed) : eps_;
+        if (0.5 * twice_area > 0.5 * perimeter * flat_width + kAreaEpsilon) continue;
 
         // Positions that coincide are ONE skeleton point, however far apart in the
         // ring they sit. Grouping only consecutive members would emit two nodes at
@@ -576,6 +734,11 @@ size_t Sim::resolve_flat_loops(double t, size_t min_members) {
 Event Sim::find_event(double t) const {
     Event best;
 
+    // An event past t_limit_ did not come out of the geometry, it came out of a
+    // near-zero divisor. See the Sim constructor for why the limit is where it is
+    // and what happens to the faces when such an event is allowed to fire.
+    const auto plausible = [this](double time) { return time <= t_limit_; };
+
     for (uint32_t vi = 0; vi < verts_.size(); ++vi) {
         const Wv& v = verts_[vi];
         if (!v.alive || !v.finite) continue;
@@ -595,16 +758,26 @@ Event Sim::find_event(double t) const {
             const double rate = glm::dot(verts_[bi].vel - v.vel, e.dir);
             if (rate < -kRateEpsilon) {
                 const double dt = std::max(0.0, gap) / (-rate);
-                Event candidate;
-                candidate.time = t + dt;
-                candidate.kind = 0;
-                candidate.a = vi;
-                candidate.b = bi;
-                // The midpoint rather than either endpoint: the two agree to
-                // rounding, and averaging them keeps the node from being biased
-                // toward whichever vertex the loop happened to evaluate first.
-                candidate.point = 0.5 * (pos(vi, candidate.time) + pos(bi, candidate.time));
-                if (better_event(candidate, best)) best = candidate;
+                // An implausible edge event is DROPPED, not `continue`d past. The
+                // split-event scan for this same vertex is below, and skipping the
+                // vertex because its edge event was rejected takes that scan with
+                // it -- so a reflex vertex whose edge event happened to be absurd
+                // generates no split event either, and a missing split is the one
+                // failure this whole file exists to avoid. It cost 10% of strongly
+                // perturbed rectangles their faces, with self-crossing rings.
+                if (plausible(t + dt)) {
+                    Event candidate;
+                    candidate.time = t + dt;
+                    candidate.kind = 0;
+                    candidate.a = vi;
+                    candidate.b = bi;
+                    // The midpoint rather than either endpoint: the two agree to
+                    // rounding, and averaging them keeps the node from being biased
+                    // toward whichever vertex the loop happened to evaluate first.
+                    candidate.point =
+                        0.5 * (pos(vi, candidate.time) + pos(bi, candidate.time));
+                    if (better_event(candidate, best)) best = candidate;
+                }
             }
         }
 
@@ -643,6 +816,7 @@ Event Sim::find_event(double t) const {
 
             const double dt = std::max(0.0, gap) / (-rate);
             const double hit_time = t + dt;
+            if (!plausible(hit_time)) continue;
             const glm::dvec2 hit = pos(vi, hit_time);
 
             // The vertex must land ON the live stretch of the edge, not on its
@@ -867,6 +1041,8 @@ void Sim::build_faces() {
             face.ring.pop_back();
             face.times.pop_back();
         }
+        // The one repair this file makes to a ring it built. See drop_ring_spurs().
+        out_.stats.folded_spurs += drop_ring_spurs(face.ring, face.times, eps_);
 
         face.area = signed_ring_area(face.ring);
         if (face.ring.size() < 3 || face.area <= kAreaEpsilon) {
@@ -885,7 +1061,7 @@ StraightSkeleton Sim::run(size_t max_iterations) {
     for (size_t step = 0; step <= max_iterations; ++step) {
         collapse_small_loops(t);
         // Four or more, so the ordinary three-vertex finish keeps its exact path.
-        resolve_flat_loops(t, 4);
+        resolve_flat_loops(t, 4, false);
 
         bool any_alive = false;
         for (const Wv& v : verts_) {
@@ -906,7 +1082,7 @@ StraightSkeleton Sim::run(size_t max_iterations) {
             // wavefront degenerated in a shape the four-member sweep above did not
             // cover. One last unconditional pass, and only then give up -- giving
             // up throws away every face, so it is worth one more try.
-            if (resolve_flat_loops(t, 1) > 0) continue;
+            if (resolve_flat_loops(t, 1, true) > 0) continue;
             break;
         }
 
@@ -923,7 +1099,37 @@ StraightSkeleton Sim::run(size_t max_iterations) {
     }
 
     out_.complete = finished;
-    if (finished) build_faces();
+    if (finished) {
+        build_faces();
+
+        // THE LAST CHECK BEFORE THE ANSWER LEAVES, AND IT IS NOT BELT AND BRACES.
+        //
+        // `complete` is the promise that the faces TILE the polygon, and both
+        // callers act on it without looking further: C3 cuts lots out of the faces
+        // and D5 builds a roof on them. A wavefront can terminate cleanly and still
+        // leave nothing usable behind -- every instance abandoned as degenerate, so
+        // build_faces() dropped every face -- and then this returned `complete`
+        // with an EMPTY face list over real land, which is precisely the half
+        // answer the header says must never leave here. A needle 1000 m long and
+        // 20 microns wide does it: its mitre exceeds kMaxVertexSpeed, every vertex
+        // is abandoned, and 0.0105 square metres of polygon came back as no faces
+        // and `complete` true. Refusing sends the caller to its fallback; saying
+        // yes and handing back nothing does not.
+        //
+        // The tolerance is a tenth of a percent rather than the point epsilon. A
+        // face over a block ring that carries street-polyline vertices is good to
+        // about a part in a million and no better, and refusing those would throw
+        // the answer away on most real blocks. What this catches is the answer that
+        // is wrong by a FACTOR: no faces at all, or the 5e10 square metres over a
+        // 500 square metre block that an unbounded event time used to produce.
+        double total = 0.0;
+        for (const SkeletonFace& face : out_.faces) total += face.area;
+        const double expected = std::fabs(signed_ring_area(out_.contour));
+        if (out_.faces.empty() || std::fabs(total - expected) > 1e-3 * expected) {
+            out_.complete = false;
+            out_.faces.clear();
+        }
+    }
     return std::move(out_);
 }
 

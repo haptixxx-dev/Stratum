@@ -140,6 +140,7 @@ add_library(stratum_core STATIC
     src/osm/road/junction_builder.cpp
     src/osm/road/blocks.cpp
     src/osm/road/lots.cpp
+    src/osm/road/lots_offset.cpp
     src/osm/road/lot_edges.cpp
     src/osm/road/zoning.cpp
     src/osm/road/segment_attrs.cpp
@@ -175,6 +176,12 @@ add_library(stratum_core STATIC
     # knows about OSM, terrain or SDL.
     src/geometry/ambient_occlusion.cpp
 
+    # The straight skeleton lives here rather than under osm/road ON PURPOSE:
+    # C3's skeleton lot subdivision and D5's roof operations need the same
+    # thing. A hipped roof over an arbitrary footprint IS the straight skeleton
+    # of that footprint, and two implementations would quietly disagree.
+    src/geometry/straight_skeleton.cpp
+
     # The scene model: layers, attributes, selection, and the undo history every
     # edit goes through. Engine-agnostic by the same rule as the rest of
     # stratum_core -- no SDL, no ImGui, no renderer.
@@ -194,6 +201,8 @@ add_library(stratum_core STATIC
     # (D2-D6) lands alongside them here.
     src/procgen/rules/lexer.cpp
     src/procgen/rules/parser.cpp
+    src/procgen/rules/shape.cpp
+    src/procgen/rules/interpreter.cpp
     src/procgen/terrain_generator.cpp
     src/procgen/terrain_carve.cpp
     src/procgen/terrain_mesh_builder.cpp
@@ -322,6 +331,26 @@ endif()
 if(STRATUM_ENABLE_PYTHON)
     target_link_libraries(stratum_editor_lib PUBLIC pybind11::embed)
     target_compile_definitions(stratum_editor_lib PUBLIC STRATUM_ENABLE_PYTHON)
+endif()
+
+# ═══════════════════════════════════════════════════════════════════
+# PYTHON BINDINGS (J1)
+# ═══════════════════════════════════════════════════════════════════
+# A static library rather than a source added to stratum_core, because
+# stratum_core must stay free of pybind11: it is the layer that compiles for a
+# game engine runtime, where there is no interpreter at all.
+#
+# The bindings register an EMBEDDED module from a static constructor. In a
+# static library the linker drops an object no symbol references, which would
+# leave the module unregistered and every import failing at run time, so
+# consumers link it with --whole-archive. module_linked() exists for the same
+# reason and is deliberately never the assertion -- the import is.
+if(STRATUM_ENABLE_PYTHON)
+    add_library(stratum_python STATIC src/python/bindings.cpp)
+    stratum_msvc_options(stratum_python)
+    target_link_libraries(stratum_python PUBLIC stratum_core pybind11::embed)
+    target_include_directories(stratum_python PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(stratum_python PUBLIC STRATUM_ENABLE_PYTHON)
 endif()
 
 # ═══════════════════════════════════════════════════════════════════

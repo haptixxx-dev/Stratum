@@ -74,10 +74,21 @@
  *     different function; they are not bolted on here.
  *   - **Simultaneous and near-simultaneous events are handled by cascade, not by
  *     exact degeneracy analysis.** Four edges collapsing to one point come out as
- *     several events at the same time, which is the right answer. Two reflex
- *     vertices meeting each other exactly (a "vertex event") is treated as a
- *     split event whose hit point sits on the end of the target edge; the result
- *     is right to within the point epsilon, not exactly right.
+ *     several events at the same time, which is the right answer.
+ *   - **THERE IS NO VERTEX-EVENT HANDLER.** Two reflex vertices of the same loop
+ *     arriving at exactly the same point -- which the textbook calls a vertex
+ *     event -- is not detected. The simulation lets both carry on past each
+ *     other, and the AREAS still come out exact, because the extra excursion is
+ *     an out-and-back along one bisector and encloses nothing. The RING does not:
+ *     it leaves and re-enters along the same line and so crosses itself, and a
+ *     self-intersecting ring is the one thing this file must never hand back.
+ *     `build_faces()` therefore deletes the out-and-back before the face is
+ *     emitted and counts it in SkeletonStats::folded_spurs. The face that comes
+ *     out is the right region with the right area; what is lost is the excursion,
+ *     which was never land. Non-zero `folded_spurs` means the input had an exact
+ *     symmetry in it -- a comb of equal teeth is the shape that produces one --
+ *     and is reported so that a caller can tell the difference between a face
+ *     this file computed and a face it repaired.
  *
  * ### The method: full re-evaluation, on purpose
  *
@@ -254,6 +265,20 @@ struct SkeletonStats {
 
     /// Faces that came out with non-positive area and were dropped
     size_t degenerate_faces = 0;
+
+    /**
+     * @brief Face-ring vertices deleted because the ring doubled back on itself
+     *
+     * The missing vertex event, repaired. See the scope section of this file's
+     * header: two reflex vertices meeting exactly leave the face ring with an
+     * out-and-back excursion along one bisector, which encloses no area but does
+     * make the ring self-intersecting. Each such vertex is removed here and
+     * counted, so the repair is visible rather than silent.
+     *
+     * Zero for every shape without an exact symmetry in it. Non-zero is not an
+     * error and does not change any face's area; it says the input had one.
+     */
+    size_t folded_spurs = 0;
 
     /// Pairs of non-adjacent contour edges that cross. Non-zero means the input was refused.
     size_t self_intersections = 0;

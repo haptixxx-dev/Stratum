@@ -44,6 +44,22 @@
  * That failure has been found in this project five times in five review rounds,
  * so the count is asserted against a floor and the floor is below the current
  * number only far enough to allow ordinary editing.
+ *
+ * ### registered, run, passed, failures
+ *
+ * Four numbers and three checks between them, and the checks are only worth
+ * making because run_all() derives the numbers independently:
+ *
+ *   - `registered` is `len(_TESTS)`, and is what the floor is held against.
+ *   - `run` counts ENTRIES into the loop body.
+ *   - `passed` and `len(failures)` count the two ways out of it.
+ *
+ * `passed + failures == run` therefore catches a test that took the harness down
+ * rather than returning, and `run == registered` catches a loop that stopped
+ * short. Both were tautologies until run_all() stopped reporting `len(_TESTS)`
+ * for all of them: the driver asserted arithmetic that could not come out wrong,
+ * which is this project's most-found defect and was sitting in its own guard
+ * against that defect.
  */
 
 #include "framework.hpp"
@@ -71,7 +87,7 @@ namespace {
  * See the note in the file comment. Raise it when the file grows; never lower it
  * to make a run go green.
  */
-constexpr size_t kMinimumPythonTests = 60;
+constexpr size_t kMinimumPythonTests = 76;
 
 /**
  * @brief Where test_bindings.py might be, in the order worth trying
@@ -147,11 +163,34 @@ TEST(PythonBindings, test_bindings_py_passes_in_the_embedded_interpreter) {
     // linker drops an archive member nothing references. Without this call the
     // object file is never extracted, the constructor never runs, and the
     // failure is ModuleNotFoundError from a build that linked cleanly.
-    CHECK_TRUE(stratum::python::module_linked());
+    //
+    // Deliberately NOT wrapped in a CHECK. module_linked() returns true
+    // unconditionally -- its whole job is to be a symbol worth extracting -- so
+    // `CHECK_TRUE(module_linked())` is a check that cannot fail, and this
+    // project has found one of those in every review round it has run. The
+    // import below is the assertion that actually proves the linkage.
+    (void)stratum::python::module_linked();
 
     // One interpreter for the whole suite; see the file comment.
     py::scoped_interpreter interpreter;
 
+    // The linkage assertion, separated from the script so that its failure reads
+    // as what it is. If the archive member above was dropped, this is where it
+    // surfaces, and a bare traceback out of eval_file() would not say which of
+    // the two dozen things in the file went wrong.
+    try {
+        py::module_::import("stratum");
+    } catch (const py::error_already_set& e) {
+        CHECK_TRUE(false);
+        std::fprintf(stderr,
+                     "PythonBindings: `import stratum` failed, so the embedded module was never "
+                     "registered. The usual cause is the linker dropping bindings.cpp from the "
+                     "stratum_core archive; module_linked() exists to prevent exactly that.\n%s\n",
+                     e.what());
+        return;
+    }
+
+    size_t registered = 0;
     size_t run = 0;
     size_t passed = 0;
     std::vector<std::string> failures;
@@ -175,6 +214,7 @@ TEST(PythonBindings, test_bindings_py_passes_in_the_embedded_interpreter) {
         }
 
         const py::dict result = globals["run_all"]().cast<py::dict>();
+        registered = dict_size_t(result, "registered", shape_ok);
         run = dict_size_t(result, "run", shape_ok);
         passed = dict_size_t(result, "passed", shape_ok);
 
@@ -196,6 +236,13 @@ TEST(PythonBindings, test_bindings_py_passes_in_the_embedded_interpreter) {
 
     CHECK_TRUE(shape_ok);
 
+    // Say how many. The framework can only report this suite as one test, so
+    // without this line a run of eighty-two Python assertions and a run of none
+    // both print "1 passed" -- which is the shape of the GPU-suite defect that
+    // skip_test() exists to prevent, in a place skip_test() cannot reach.
+    std::printf("PythonBindings: %zu of %zu registered Python tests ran, %zu passed, %zu failed\n",
+                run, registered, passed, failures.size());
+
     // Each Python failure gets its own framework failure line, with the
     // traceback on stderr next to it.
     for (const std::string& failure : failures) {
@@ -204,32 +251,62 @@ TEST(PythonBindings, test_bindings_py_passes_in_the_embedded_interpreter) {
     }
 
     CHECK_EQ(failures.size(), size_t{0});
+
+    // Every test that STARTED must have finished as a pass or as a failure.
+    // `run` counts entries into the loop and `passed`/`failures` count exits, so
+    // this catches a test that took the harness down with it -- a bare os._exit,
+    // an exception raised while a traceback was being formatted, the loop
+    // breaking early. It was a tautology while run_all() reported len(_TESTS)
+    // for all three; see the note on run_all().
     CHECK_EQ(passed + failures.size(), run);
 
-    // The floor. See the file comment: a harness that registers nothing is the
-    // one failure mode that otherwise looks exactly like success.
-    CHECK(run >= kMinimumPythonTests);
-    if (run < kMinimumPythonTests) {
+    // And every test that was REGISTERED must have started. A `for` loop that
+    // stopped short reports fewer runs than registrations and nothing else here
+    // would notice, because the tests it never reached also never failed.
+    CHECK_EQ(run, registered);
+    if (run != registered) {
         std::fprintf(stderr,
-                     "PythonBindings: only %zu tests ran, expected at least %zu -- has the "
-                     "registration in test_bindings.py stopped working?\n",
-                     run, kMinimumPythonTests);
+                     "PythonBindings: %zu tests are registered but only %zu ran -- the harness "
+                     "loop in test_bindings.py did not reach the end of _TESTS\n",
+                     registered, run);
+    }
+
+    // The floor. See the file comment: a harness that registers nothing is the
+    // one failure mode that otherwise looks exactly like success. Held against
+    // `registered` rather than `run`, so a file that stopped registering is
+    // reported as that and not as a truncated loop.
+    CHECK(registered >= kMinimumPythonTests);
+    if (registered < kMinimumPythonTests) {
+        std::fprintf(stderr,
+                     "PythonBindings: only %zu tests are registered, expected at least %zu -- has "
+                     "the registration in test_bindings.py stopped working?\n",
+                     registered, kMinimumPythonTests);
     }
 }
 
 #else // STRATUM_ENABLE_PYTHON
 
-#include <cstdio>
-
 /**
  * The suite must still EXIST when Python is off, or `ctest -R PythonBindings`
- * fails on a filter that matches no test. Asserting nothing is deliberate: there
- * are no bindings to test in this build.
+ * fails on a filter that matches no test.
+ *
+ * skip_test(), and NOT a bare return with a message on stderr. A test that
+ * asserts nothing and returns is counted as a PASS, and the run says "1 passed"
+ * for a build containing no bindings at all -- the same defect that let 123 GPU
+ * tests report green on a machine with no GPU for months. skip_test() makes the
+ * summary say "0 passed, 0 failed, 1 skipped" and print the reason, so the two
+ * builds cannot be confused for one another.
  */
 TEST(PythonBindings, skipped_because_stratum_enable_python_is_off) {
-    std::fprintf(stderr,
-                 "SKIPPED: PythonBindings -- this build has STRATUM_ENABLE_PYTHON=OFF, so there "
-                 "are no bindings to exercise.\n");
+    // The reason names the define rather than saying "Python is off", because
+    // the likeliest cause of this branch compiling is NOT that somebody turned
+    // the option off. STRATUM_ENABLE_PYTHON is attached per target: a tree that
+    // puts it on stratum_editor_lib and forgets stratum_tests builds this branch
+    // forever and reports one cheerful SKIP for a feature that is fully
+    // implemented and fully tested. A skip that names its define can be checked.
+    ::stratum::test::skip_test("STRATUM_ENABLE_PYTHON is not defined for this TARGET, so the "
+                               "bindings were not compiled into it -- check that the tests "
+                               "target has the definition and not only stratum_editor_lib");
 }
 
 #endif // STRATUM_ENABLE_PYTHON
