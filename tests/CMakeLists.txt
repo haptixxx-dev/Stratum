@@ -86,8 +86,13 @@ set(STRATUM_TEST_SOURCES
     osm/test_roof_shapes.cpp
     osm/test_scene_export.cpp
     road/test_blocks.cpp
+    road/test_lots.cpp
+    road/test_lot_edges.cpp
+    road/test_zoning.cpp
+    road/test_segment_attrs.cpp
     road/test_graph_edit.cpp
     procgen/test_heightmap_io.cpp
+    procgen/test_rule_parser.cpp
 
     # Attribute-mode colour tables: totality, determinism and separation.
     osm/test_attribute_palette.cpp
@@ -119,6 +124,11 @@ set(STRATUM_TEST_SUITES
     Document
     MapLayer
     Blocks
+    Lots
+    LotEdges
+    Zoning
+    SegmentAttrs
+    RuleParser
     GraphEdit
     HeightmapIO
     SceneExport
