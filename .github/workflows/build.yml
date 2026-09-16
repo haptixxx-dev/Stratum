@@ -87,7 +87,12 @@ jobs:
           vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverName" || \
             echo "no Vulkan device visible"
           echo "--- stratum_gpu_tests ---"
-          ./build/ci/bin/stratum_gpu_tests 2>/dev/null | tail -3 || \
+          # stderr is NOT discarded here, deliberately. The suites print their
+          # skip reason -- the string SDL_GetError() returned when
+          # SDL_CreateGPUDevice() refused -- to stderr, and the first version of
+          # this step sent it to /dev/null. So the log showed "32 skipped" with
+          # no way to find out why, which is half a diagnostic.
+          ./build/ci/bin/stratum_gpu_tests 2>&1 | grep -E "SKIPPED|passed," | head -5 || \
             echo "gpu test binary did not run"
 
   # ══════════════════════════════════════════════════════════════════════════
