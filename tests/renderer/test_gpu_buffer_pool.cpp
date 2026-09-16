@@ -145,7 +145,10 @@ SDL_GPUDevice* device() {
 bool start(GPUBufferPool& pool, uint32_t block_size,
            SDL_GPUBufferUsageFlags usage = SDL_GPU_BUFFERUSAGE_VERTEX) {
     SDL_GPUDevice* dev = device();
-    if (dev == nullptr) return false;
+    if (dev == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return false;
+    }
     const bool ok = pool.init(dev, usage, block_size);
     CHECK_TRUE(ok);
     return ok;
@@ -179,7 +182,10 @@ TEST(GPUBufferPool, init_refuses_bad_arguments) {
     CHECK_FALSE(pool.is_initialized());
 
     SDL_GPUDevice* dev = device();
-    if (dev == nullptr) return;
+    if (dev == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
 
     CHECK_FALSE(pool.init(dev, SDL_GPU_BUFFERUSAGE_VERTEX, 0));
     CHECK_TRUE(pool.init(dev, SDL_GPU_BUFFERUSAGE_VERTEX, kUnit * 4));

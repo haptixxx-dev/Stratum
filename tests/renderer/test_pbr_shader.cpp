@@ -226,7 +226,10 @@ struct Harness {
 
     Harness() {
         dev = device();
-        if (dev == nullptr) return;
+        if (dev == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
         if (!textures.init(dev)) return;
 
         // The counts GPURenderer::load_shader() passes, from the same constants.
@@ -747,7 +750,10 @@ SceneUniforms sun_from(glm::vec3 light_dir) {
  * well-formed frame.
  */
 TEST(PbrShader, a_degenerate_bitangent_still_shades) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     CHECK_TRUE(h.ok);
     if (!h.ok) return;
@@ -779,7 +785,10 @@ TEST(PbrShader, a_degenerate_bitangent_still_shades) {
 /// The same wall turned away from the sun is dark, which is what makes the
 /// assertion above a measurement of direct light rather than of ambient.
 TEST(PbrShader, an_unlit_wall_is_much_darker_than_a_lit_one) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     if (!h.ok) return;
 
@@ -814,7 +823,10 @@ TEST(PbrShader, an_unlit_wall_is_much_darker_than_a_lit_one) {
  * freezing the BRDF's arithmetic.
  */
 TEST(PbrShader, metallic_reaches_the_shader_through_the_default_orm) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     if (!h.ok) return;
 
@@ -841,7 +853,10 @@ TEST(PbrShader, metallic_reaches_the_shader_through_the_default_orm) {
 /// same texture, so they were never broken -- but they are asserted here so a
 /// future edit to that texel cannot break one of the three unnoticed.
 TEST(PbrShader, roughness_and_ao_reach_the_shader_too) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     if (!h.ok) return;
 
@@ -895,7 +910,10 @@ TEST(PbrShader, roughness_and_ao_reach_the_shader_too) {
  * dropped the pixel to ambient; the assertion is that it no longer does.
  */
 TEST(PbrShader, the_view_vector_follows_the_camera_not_the_world_origin) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     CHECK_TRUE(h.ok);
     if (!h.ok) return;
@@ -932,7 +950,10 @@ TEST(PbrShader, the_view_vector_follows_the_camera_not_the_world_origin) {
  * anything -- after the curve the value is already clamped to 0..1.
  */
 TEST(PbrShader, exposure_scales_the_image) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     if (!h.ok) return;
 
@@ -971,7 +992,10 @@ TEST(PbrShader, exposure_scales_the_image) {
  * branch would otherwise flip the normal being measured.
  */
 TEST(PbrShader, hemisphere_ambient_separates_an_upward_face_from_a_downward_one) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     CHECK_TRUE(h.ok);
     if (!h.ok) return;
@@ -1096,7 +1120,10 @@ SceneUniforms overhead_sun() {
  * shadow map is exactly the failure this is here to catch.
  */
 TEST(PbrShader, a_caster_shadows_the_ground_beneath_it_and_nowhere_else) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     CHECK_TRUE(h.ok);
     if (!h.ok) return;
@@ -1141,7 +1168,10 @@ TEST(PbrShader, a_caster_shadows_the_ground_beneath_it_and_nowhere_else) {
  * the shadow into it as well is what turns shadows into black holes.
  */
 TEST(PbrShader, a_shadowed_surface_still_receives_sky_ambient) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     if (!h.ok) return;
 
@@ -1181,7 +1211,10 @@ TEST(PbrShader, a_shadowed_surface_still_receives_sky_ambient) {
  * rendered. It is asserted directly rather than assumed.
  */
 TEST(PbrShader, a_zero_cascade_count_leaves_the_surface_fully_lit) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     if (!h.ok) return;
 
@@ -1216,7 +1249,10 @@ TEST(PbrShader, a_zero_cascade_count_leaves_the_surface_fully_lit) {
  * a slider nobody trusts.
  */
 TEST(PbrShader, shadow_strength_scales_between_lit_and_shadowed) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     if (!h.ok) return;
 
@@ -1267,7 +1303,10 @@ TEST(PbrShader, shadow_strength_scales_between_lit_and_shadowed) {
  * accept an implementation that does nothing at all.
  */
 TEST(PbrShader, baked_ao_attenuates_ambient_but_not_direct_sun) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     CHECK_TRUE(h.ok);
     if (!h.ok) return;
@@ -1318,7 +1357,10 @@ TEST(PbrShader, baked_ao_attenuates_ambient_but_not_direct_sun) {
  * visible when the other is not at 1.
  */
 TEST(PbrShader, baked_ao_multiplies_with_the_material_ao) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     if (!h.ok) return;
 

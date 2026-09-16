@@ -153,7 +153,10 @@ struct Harness {
 
     Harness() {
         dev = device();
-        if (dev == nullptr) return;
+        if (dev == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
 
         // The counts GPURenderer::load_sky_shaders() passes: one uniform buffer
         // per stage, no samplers on either.
@@ -332,7 +335,10 @@ const glm::vec3 kSunBehind{ 0.0f, 0.35f, -0.94f };
  * which is what the old ambient constant did.
  */
 TEST(Sky, the_zenith_is_deeper_and_bluer_than_the_horizon) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     CHECK_TRUE(h.ok);
     if (!h.ok) return;
@@ -364,7 +370,10 @@ TEST(Sky, the_zenith_is_deeper_and_bluer_than_the_horizon) {
  * road surface on top of it -- exactly the artefact the constant ambient had.
  */
 TEST(Sky, below_the_horizon_is_darker_than_above_it) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     if (!h.ok) return;
 
@@ -384,7 +393,10 @@ TEST(Sky, below_the_horizon_is_darker_than_above_it) {
  * the environment it reflects.
  */
 TEST(Sky, the_sun_disk_is_the_brightest_thing_in_the_sky) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     Harness h;
     if (!h.ok) return;
 

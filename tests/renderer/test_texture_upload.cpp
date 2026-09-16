@@ -197,7 +197,10 @@ TEST(TextureUpload, the_default_orm_texel_is_unit_in_every_channel) {
 /// later bind has something legal to substitute. If they were not ready, the
 /// neutral bind GPURenderer uses when materials are off would have nothing to bind.
 TEST(TextureUpload, init_leaves_every_builtin_ready_to_sample) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     ManagerFixture fx;
     CHECK_TRUE(fx.ok);
     if (!fx.ok) return;
@@ -225,7 +228,10 @@ TEST(TextureUpload, init_leaves_every_builtin_ready_to_sample) {
  * texture holds uninitialised device memory and must keep binding the fallback.
  */
 TEST(TextureUpload, a_recorded_copy_is_not_ready_until_it_is_committed) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     ManagerFixture fx;
     if (!fx.ok) return;
 
@@ -260,7 +266,10 @@ TEST(TextureUpload, a_recorded_copy_is_not_ready_until_it_is_committed) {
  * memory for the rest of the session with no path back.
  */
 TEST(TextureUpload, a_failed_submit_leaves_the_texture_unready_and_re_queued) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     ManagerFixture fx;
     if (!fx.ok) return;
 
@@ -297,7 +306,10 @@ TEST(TextureUpload, a_failed_submit_leaves_the_texture_unready_and_re_queued) {
 /// A queue with more than one entry keeps its ORDER across a rollback, or the
 /// staging-arena offsets the retry reads from no longer name the right pixels.
 TEST(TextureUpload, a_rollback_preserves_queue_order) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     ManagerFixture fx;
     if (!fx.ok) return;
 
@@ -348,7 +360,10 @@ TEST(TextureUpload, a_rollback_preserves_queue_order) {
  * run under a second.
  */
 TEST(TextureUpload, attaching_a_generated_albedo_neutralises_base_color) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     ManagerFixture fx;
     if (!fx.ok) return;
 
@@ -399,7 +414,10 @@ TEST(TextureUpload, attaching_a_generated_albedo_neutralises_base_color) {
 /// Every material still binds the built-in ORM, which is the reason the unit-ORM
 /// invariant above is load-bearing rather than theoretical.
 TEST(TextureUpload, every_installed_material_binds_the_builtin_orm) {
-    if (device() == nullptr) return;
+    if (device() == nullptr) {
+        ::stratum::test::skip_test("no SDL_GPU device on this machine");
+        return;
+    }
     ManagerFixture fx;
     if (!fx.ok) return;
 
