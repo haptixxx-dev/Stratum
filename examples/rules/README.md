@@ -78,6 +78,13 @@ against 1540.
   `roof("pyramid", 72)` instead, which takes a pitch and cannot collapse.
 - **A reveal deeper than the wall is cut back**, with a warning naming both
   numbers.
+- **A face that `select face` does not name is DROPPED.** Omit the `top` arm
+  and you get a building with walls and no roof, with nothing reported —
+  because nothing went wrong. The rule asked for four walls and got four
+  walls. The `Examples` suite lints for this.
+- **`wall_panel()` with no thickness is one quad.** Two triangles, one-sided,
+  invisible from below or edge-on, and with no underside to export. A flat roof
+  wants `wall_panel(0.0, 0.25)`, which is a closed slab of twelve.
 - **`comp.size` does not measure in the same axes `split` divides.** `split(z)`
   uses the shape scope's z. `comp.size` measures a COMPONENT in its own frame,
   where a face's two in-plane axes are x and y and z is its thickness. On a

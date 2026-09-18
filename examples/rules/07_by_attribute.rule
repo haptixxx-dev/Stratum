@@ -65,12 +65,17 @@ rule HouseUpper {
 
 // --------------------------------------------------------------------- shop
 
-// A shop is an office with its ground floor given over to glass. The roof is
-// flat, which here means no roof operation at all -- the top face is left as
-// it came out of the massing.
+// A shop is an office with its ground floor given over to glass, and a flat
+// roof rather than a pitched one.
+//
+// "Flat roof" still needs a `top` arm. A face that `select face` does not name
+// is DROPPED -- this rule used to omit it, on the idea that the top face would
+// be "left as it came out of the massing", and the result was a shop with no
+// roof at all and nothing reported.
 rule Shop {
     floors(storeys, storey);
-    select face { front : { ShopFront(); } vertical : { Brick(); } }
+    select face { front : { ShopFront(); } vertical : { Brick(); }
+                  top : { RoofDeck(); } }
 }
 
 rule ShopFront {
@@ -88,7 +93,7 @@ rule WindowWall {
 
 rule Office {
     floors(storeys, storey);
-    select face { vertical : { OfficeElevation(); } }
+    select face { vertical : { OfficeElevation(); } top : { RoofDeck(); } }
 }
 
 rule OfficeElevation {
@@ -112,3 +117,6 @@ rule Brick    { wall_panel(); }
 rule Cladding { wall_panel(); }
 rule Pier     { wall_panel(0.0, 0.2); }
 rule Mullion  { wall_panel(0.0, 0.12); }
+
+// Real thickness, so the deck has an underside and survives being exported.
+rule RoofDeck { wall_panel(0.0, 0.3); }

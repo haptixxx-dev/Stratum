@@ -15,11 +15,16 @@ attr steps        : float = 3.0
 @start
 rule Main {
     podium(base_height, tower_height, setback, steps);
+    // `top` is NOT optional. A face that `select face` does not name is
+    // DROPPED, not left alone, so omitting this arm gives a tower that is open
+    // at every tier -- walls and no roof, with no diagnostic anywhere, because
+    // nothing went wrong. It is just a building with a hole in it.
     select face {
         front : { Elevation(); }
         back  : { Elevation(); }
         left  : { Elevation(); }
         right : { Elevation(); }
+        top   : { RoofDeck(); }
     }
 }
 
@@ -64,6 +69,12 @@ rule OfficeBay {
         ~1.0 : { Glazing(); }
     }
 }
+
+// A roof deck with real THICKNESS, not a bare `wall_panel()`. A panel with no
+// thickness is a single quad: two triangles, one-sided, and invisible from
+// below or edge-on. As a game asset it is worse than that -- it has no
+// underside at all.
+rule RoofDeck { wall_panel(0.0, 0.3); }
 
 rule Glazing { window(0.0, 0.25); }
 rule Pier     {}

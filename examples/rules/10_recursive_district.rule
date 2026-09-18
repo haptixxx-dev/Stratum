@@ -123,6 +123,10 @@ rule Bay {
 
 rule Window  { window(0.0, 0.14, 0.05, 0.05); }
 rule Wall    { wall_panel(); }
-rule FlatTop { wall_panel(); }
+// A roof deck with THICKNESS. `wall_panel()` on its own is one quad -- two
+// triangles, one-sided -- so a flat-roofed building is invisible from below
+// and edge-on, and has no underside to export. With a thickness it is a closed
+// slab of twelve triangles.
+rule FlatTop { wall_panel(0.0, 0.25); }
 rule Street  {}
 rule Yard    {}

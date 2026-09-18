@@ -251,6 +251,56 @@ TEST(Examples, no_example_hits_a_generation_cap) {
     }
 }
 
+TEST(Examples, every_select_face_in_an_example_accounts_for_the_top) {
+    // A face that `select face` does not name is DROPPED, not left alone. So a
+    // block that lists front/back/left/right and omits `top` produces a
+    // building with walls and no roof -- and reports nothing, because nothing
+    // went wrong. It is simply a building with a hole in it.
+    //
+    // That is exactly what 01_office_tower and two rules in 07_by_attribute
+    // did until it was spotted in a screenshot. Nothing in the geometry checks
+    // caught it: every terminal had geometry, every normal pointed the right
+    // way, no triangle was inside out, and the roof that was never asked for
+    // was never missed.
+    //
+    // This is a source lint rather than a geometry check because that is what
+    // the defect is. The rule file is asking for the wrong thing, and the
+    // generator is right to give it exactly what it asked for.
+    for (const Example& example : kExamples) {
+        std::string source;
+        CHECK_TRUE(read_file(examples_dir() / example.file, source));
+
+        size_t at = 0;
+        while ((at = source.find("select face", at)) != std::string::npos) {
+            const size_t open = source.find('{', at);
+            if (open == std::string::npos) break;
+            // Walk to the matching brace so a nested arm body does not end the
+            // block early.
+            size_t depth = 0;
+            size_t close = open;
+            for (size_t i = open; i < source.size(); ++i) {
+                if (source[i] == '{') ++depth;
+                else if (source[i] == '}') {
+                    --depth;
+                    if (depth == 0) { close = i; break; }
+                }
+            }
+            const std::string block = source.substr(open, close - open + 1);
+            const bool covered = block.find("top") != std::string::npos ||
+                                 block.find("all") != std::string::npos;
+            if (!covered) {
+                const size_t line = 1 + static_cast<size_t>(
+                    std::count(source.begin(), source.begin() + static_cast<long>(at), '\n'));
+                std::printf("  %s:%zu: a select face block names no top or all arm, "
+                            "so the top face is dropped and the building has no roof\n",
+                            example.file, line);
+            }
+            CHECK_TRUE(covered);
+            at = close + 1;
+        }
+    }
+}
+
 TEST(Examples, the_stochastic_street_reproduces_exactly_and_varies_with_the_seed) {
     // 08 makes a claim in its own header comment, and this is the test that
     // holds it to it: the same seed gives a byte-identical street, a different
