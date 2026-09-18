@@ -1,0 +1,461 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Seamus Mullan and the Stratum contributors
+
+/**
+ * @file test_examples.cpp
+ * @brief Every rule file in examples/rules/ parses, runs and builds geometry
+ * @author Stratum Team
+ * @version 0.1.0
+ * @date 2026
+ *
+ * ================================================================================
+ * WHY THIS EXISTS
+ * ================================================================================
+ *
+ * A shipped example that does not run is worse than no example. It is the
+ * first thing a new reader opens, and when it reports an error they conclude
+ * the language is broken rather than that the file rotted. Examples also rot
+ * silently: they are not compiled, so nothing notices when an operation's
+ * arity changes or a catalogue row is renamed.
+ *
+ * So the examples are TESTS. Every `.rule` file in examples/rules/ is parsed
+ * and generated on each build, through `full_operations()` -- the same table
+ * the rule editor panel runs -- and has to come back with no error diagnostic
+ * and with geometry.
+ *
+ * ================================================================================
+ * HOW THIS TEST CAN FAIL
+ * ================================================================================
+ *
+ * The obvious way to write it is "for each file, check it runs", and that
+ * passes for an empty directory, a mistyped path, a build that never defined
+ * STRATUM_EXAMPLES_DIR, and a CI checkout that did not fetch the folder. Every
+ * one of those is a silent pass, which is this project's most-found defect.
+ *
+ * So the count is pinned. `kExampleCount` is asserted against what the
+ * directory actually holds, and adding or deleting an example is expected to
+ * break this file -- that is the reminder to look at it.
+ *
+ * Each example is also asserted to produce a MINIMUM amount of geometry, taken
+ * from what it produced when it was written. A rule file that still parses but
+ * now yields four vertices because a split stopped repeating would otherwise
+ * pass, and a flat box is exactly the failure these examples exist to prevent.
+ */
+
+#include "framework.hpp"
+
+#include "procgen/rules/parser.hpp"
+#include "procgen/rules/registry.hpp"
+#include "procgen/rules/shape.hpp"
+
+#include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace stratum::procgen::rules;
+
+namespace {
+
+/// How many .rule files examples/rules/ holds. See the header: this is pinned
+/// on purpose, so adding one is a deliberate act rather than an accident.
+constexpr size_t kExampleCount = 14;
+
+struct Example {
+    const char* file;
+    double width;
+    double depth;
+    size_t min_terminals;
+    size_t min_triangles;
+};
+
+/// The seed each example is written for, and the floor its output must clear.
+/// The numbers are what each produced when it was written, rounded well down --
+/// they are a rot detector, not a golden value, so an improvement does not
+/// fail them.
+constexpr Example kExamples[] = {
+    {"01_office_tower.rule",      30.0, 20.0, 400, 5000},
+    {"02_terrace.rule",           24.0, 12.0,  30,  300},
+    {"03_courtyard_block.rule",   60.0, 40.0, 600, 6000},
+    {"04_townhouse.rule",          7.0, 10.0,  20,  200},
+    {"05_tower_and_spire.rule",   30.0, 14.0,  50,  600},
+    {"06_warehouse.rule",         48.0, 24.0,  40,  500},
+    {"07_by_attribute.rule",      16.0, 12.0, 100, 2000},
+    {"08_stochastic_street.rule", 60.0, 14.0, 150, 1500},
+    // The recursive four. Their floors are set well under what they produce,
+    // because a recursion's output moves with any change to its termination
+    // test and a tight bound here would be a brittle golden value.
+    {"09_twisting_tower.rule",    10.0, 10.0, 200,  4000},
+    {"10_recursive_district.rule", 120.0, 80.0, 1500, 15000},
+    {"11_fractal_tower.rule",     32.0, 32.0, 1200, 25000},
+    {"12_stacked_modules.rule",   24.0, 14.0, 100,  1200},
+    // Written for an OSM seed, where it reads the feature's tags. On the test
+    // rectangle it still runs and takes every default, which is the fallback
+    // path and worth holding to as well.
+    {"13_from_osm_tags.rule",     16.0, 12.0, 100,  1200},
+    {"14_materials.rule",         14.0, 10.0,  50,   600},
+};
+
+[[nodiscard]] std::filesystem::path examples_dir() {
+    return std::filesystem::path{STRATUM_EXAMPLES_DIR};
+}
+
+[[nodiscard]] bool read_file(const std::filesystem::path& path, std::string& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    out = buffer.str();
+    return true;
+}
+
+[[nodiscard]] std::vector<std::string> rule_files() {
+    std::vector<std::string> names;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(examples_dir(), ec)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".rule") {
+            names.push_back(entry.path().filename().string());
+        }
+    }
+    // Sorted, so the failure message names files in a stable order whatever the
+    // filesystem hands back.
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+[[nodiscard]] std::string first_error(const GenerationResult& result) {
+    for (const Diagnostic& d : result.diagnostics) {
+        if (d.severity == Severity::Error) return d.message;
+    }
+    return {};
+}
+
+} // namespace
+
+// ============================================================================
+// The directory itself
+// ============================================================================
+
+TEST(Examples, the_examples_directory_holds_what_the_table_below_expects) {
+    // The guard that stops every other test in this file passing vacuously.
+    // An empty directory, a mistyped STRATUM_EXAMPLES_DIR, or a checkout that
+    // did not fetch the folder all land here rather than sliding through as a
+    // zero-iteration loop.
+    const std::vector<std::string> found = rule_files();
+    CHECK_EQ(found.size(), kExampleCount);
+
+    for (const Example& example : kExamples) {
+        bool present = false;
+        for (const std::string& name : found) {
+            if (name == example.file) { present = true; break; }
+        }
+        if (!present) {
+            std::printf("  missing example: %s\n", example.file);
+        }
+        CHECK_TRUE(present);
+    }
+
+    // And the other direction: a file on disk that the table does not know
+    // about is not being exercised, which is how an example rots unnoticed.
+    for (const std::string& name : found) {
+        bool listed = false;
+        for (const Example& example : kExamples) {
+            if (name == example.file) { listed = true; break; }
+        }
+        if (!listed) {
+            std::printf("  example not in the table: %s\n", name.c_str());
+        }
+        CHECK_TRUE(listed);
+    }
+}
+
+TEST(Examples, the_readme_lists_every_example) {
+    // The README is the first thing a reader opens. An example missing from its
+    // table is an example nobody finds.
+    std::string readme;
+    CHECK_TRUE(read_file(examples_dir() / "README.md", readme));
+    for (const Example& example : kExamples) {
+        if (readme.find(example.file) == std::string::npos) {
+            std::printf("  README does not mention: %s\n", example.file);
+        }
+        CHECK_TRUE(readme.find(example.file) != std::string::npos);
+    }
+}
+
+// ============================================================================
+// Every example runs
+// ============================================================================
+
+TEST(Examples, every_example_parses_with_no_error) {
+    for (const Example& example : kExamples) {
+        std::string source;
+        CHECK_TRUE(read_file(examples_dir() / example.file, source));
+        const ParseResult parsed = parse(source, example.file);
+        if (!parsed.ok()) {
+            std::printf("  %s:\n%s", example.file, parsed.render_all(source).c_str());
+        }
+        CHECK_TRUE(parsed.ok());
+    }
+}
+
+TEST(Examples, every_example_generates_geometry_without_an_error) {
+    for (const Example& example : kExamples) {
+        std::string source;
+        CHECK_TRUE(read_file(examples_dir() / example.file, source));
+        const ParseResult parsed = parse(source, example.file);
+        CHECK_TRUE(parsed.ok());
+        if (!parsed.ok()) continue;
+
+        const Shape seed = shape_from_rect(example.width, example.depth);
+        const GenerationResult result =
+            generate(parsed.file, seed, GenerationOptions{}, &full_operations(), &full_functions());
+
+        const std::string error = first_error(result);
+        if (!error.empty()) {
+            std::printf("  %s: %s\n", example.file, error.c_str());
+        }
+        CHECK_TRUE(error.empty());
+
+        // Not a flat box. The whole point of an example is that it builds
+        // something, and "it parsed" is the weaker claim these files exist to
+        // go beyond.
+        const stratum::Mesh mesh = result.build_mesh();
+        const size_t triangles = mesh.indices.size() / 3;
+        if (result.terminals.size() < example.min_terminals || triangles < example.min_triangles) {
+            std::printf("  %s: %zu terminals (want >= %zu), %zu triangles (want >= %zu)\n",
+                        example.file, result.terminals.size(), example.min_terminals,
+                        triangles, example.min_triangles);
+        }
+        CHECK((result.terminals.size()) >= example.min_terminals);
+        CHECK((triangles) >= example.min_triangles);
+    }
+}
+
+TEST(Examples, every_example_survives_a_range_of_seeds) {
+    // Every other test in this file runs at seed 0, which is one draw out of
+    // 2^64. An example whose `choose` or `random.*` picks a branch that fails
+    // -- a plot too small for its inset, a footprint too thin for its roof --
+    // passes at seed 0 and breaks for the person who moves the slider.
+    //
+    // That is not hypothetical. The seed decides, per plot, whether
+    // 10_recursive_district builds a house, a block or a tower, and the three
+    // take different roofs: at seed 5 it is 6 flat to 18 pitched, at seed 1 it
+    // is 14 to 13. Any defect on one of those branches is a defect that
+    // appears and disappears as the seed changes, which is exactly the report
+    // that found the last one.
+    for (const Example& example : kExamples) {
+        std::string source;
+        CHECK_TRUE(read_file(examples_dir() / example.file, source));
+        const ParseResult parsed = parse(source, example.file);
+        CHECK_TRUE(parsed.ok());
+        if (!parsed.ok()) continue;
+
+        for (uint64_t seed = 1; seed <= 6; ++seed) {
+            GenerationOptions options;
+            options.seed = seed;
+            const GenerationResult result =
+                generate(parsed.file, shape_from_rect(example.width, example.depth),
+                         options, &full_operations(), &full_functions());
+
+            const std::string error = first_error(result);
+            if (!error.empty()) {
+                std::printf("  %s at seed %llu: %s\n", example.file,
+                            static_cast<unsigned long long>(seed), error.c_str());
+            }
+            CHECK_TRUE(error.empty());
+            CHECK_FALSE(result.stats.depth_limit_hit);
+            CHECK_FALSE(result.stats.shape_limit_hit);
+
+            // Still a building, not a husk. The floors are the seed-0 ones
+            // halved, because a different draw legitimately builds less.
+            CHECK((result.terminals.size()) >= example.min_terminals / 2);
+        }
+    }
+}
+
+TEST(Examples, no_flat_roof_in_an_example_is_a_one_sided_plane) {
+    // `wall_panel()` with no thickness is a single quad: two triangles, one
+    // side, no underside. It vanishes edge-on and from below, and it exports
+    // as a building with a hole in the top.
+    //
+    // A rule named like a roof that produces one face is almost always this
+    // mistake, so every terminal whose rule name looks like a cap is required
+    // to be a solid. Checked across seeds, because which buildings get a flat
+    // cap rather than a pitched roof is itself a draw.
+    for (const Example& example : kExamples) {
+        std::string source;
+        CHECK_TRUE(read_file(examples_dir() / example.file, source));
+        const ParseResult parsed = parse(source, example.file);
+        if (!parsed.ok()) continue;
+
+        for (uint64_t seed = 0; seed <= 3; ++seed) {
+            GenerationOptions options;
+            options.seed = seed;
+            const GenerationResult result =
+                generate(parsed.file, shape_from_rect(example.width, example.depth),
+                         options, &full_operations(), &full_functions());
+            for (const Shape& terminal : result.terminals) {
+                const bool looks_like_a_cap =
+                    terminal.rule.find("FlatTop") != std::string::npos ||
+                    terminal.rule.find("RoofDeck") != std::string::npos;
+                if (!looks_like_a_cap) continue;
+                if (terminal.geometry.faces.size() <= 1) {
+                    std::printf("  %s seed %llu: '%s' is a one-sided plane; "
+                                "a flat roof wants wall_panel(0.0, thickness)\n",
+                                example.file, static_cast<unsigned long long>(seed),
+                                terminal.rule.c_str());
+                }
+                CHECK((terminal.geometry.faces.size()) > 1);
+            }
+        }
+    }
+}
+
+TEST(Examples, the_materials_example_assigns_the_variants_it_documents) {
+    // 14_materials.rule exists to show materials working. Every other test in
+    // this file would pass for a version of it that assigned none at all --
+    // it would still parse, still generate, still make geometry.
+    //
+    // The variants are a published vocabulary shared with the OSM importer
+    // (osm/road/road_style.hpp), so these are the numbers a rule and an import
+    // agree on: wall 1 brick, 2 stone, 5 glass, 6 metal; roof 2 slate.
+    std::string source;
+    CHECK_TRUE(read_file(examples_dir() / "14_materials.rule", source));
+    const ParseResult parsed = parse(source, "14_materials.rule");
+    CHECK_TRUE(parsed.ok());
+    if (!parsed.ok()) return;
+
+    const GenerationResult result =
+        generate(parsed.file, shape_from_rect(14.0, 10.0), GenerationOptions{},
+                 &full_operations(), &full_functions());
+    CHECK_TRUE(result.ok());
+
+    stratum::Mesh mesh = result.build_mesh();
+    mesh.sort_submeshes_by_material();
+
+    auto triangles_of = [&](stratum::MaterialId slot, uint16_t variant) {
+        size_t n = 0;
+        for (const stratum::SubMesh& sub : mesh.effective_submeshes()) {
+            if (sub.material == slot && sub.variant == variant) n += sub.index_count / 3;
+        }
+        return n;
+    };
+
+    // Brick, stone and metal are set by the file itself.
+    CHECK((triangles_of(stratum::MaterialId::Wall, 1)) > 0);
+    CHECK((triangles_of(stratum::MaterialId::Wall, 2)) > 0);
+    CHECK((triangles_of(stratum::MaterialId::Wall, 6)) > 0);
+    // Slate, set on the roof.
+    CHECK((triangles_of(stratum::MaterialId::Roof, 2)) > 0);
+
+    // Glass is NOT set by the file -- window() assigns it. This is the check
+    // that would have caught facade_material() casting the part ordinal, which
+    // put glazing on variant 3, the concrete slot.
+    CHECK((triangles_of(stratum::MaterialId::Wall, 5)) > 0);
+    CHECK_EQ(triangles_of(stratum::MaterialId::Wall, 3), size_t{0});
+
+    // And the whole thing is a handful of ranges, not one per window part.
+    CHECK((mesh.effective_submeshes().size()) <= 12);
+}
+
+TEST(Examples, no_example_hits_a_generation_cap) {
+    // A cap means the output was truncated, so the example is showing a
+    // fragment of the building it describes. An example is exactly the wrong
+    // place for that.
+    for (const Example& example : kExamples) {
+        std::string source;
+        CHECK_TRUE(read_file(examples_dir() / example.file, source));
+        const ParseResult parsed = parse(source, example.file);
+        if (!parsed.ok()) continue;
+        const GenerationResult result =
+            generate(parsed.file, shape_from_rect(example.width, example.depth),
+                     GenerationOptions{}, &full_operations(), &full_functions());
+        if (result.stats.depth_limit_hit || result.stats.shape_limit_hit) {
+            std::printf("  %s hit a cap: depth=%d shapes=%d\n", example.file,
+                        result.stats.depth_limit_hit ? 1 : 0,
+                        result.stats.shape_limit_hit ? 1 : 0);
+        }
+        CHECK_FALSE(result.stats.depth_limit_hit);
+        CHECK_FALSE(result.stats.shape_limit_hit);
+    }
+}
+
+TEST(Examples, every_select_face_in_an_example_accounts_for_the_top) {
+    // A face that `select face` does not name is DROPPED, not left alone. So a
+    // block that lists front/back/left/right and omits `top` produces a
+    // building with walls and no roof -- and reports nothing, because nothing
+    // went wrong. It is simply a building with a hole in it.
+    //
+    // That is exactly what 01_office_tower and two rules in 07_by_attribute
+    // did until it was spotted in a screenshot. Nothing in the geometry checks
+    // caught it: every terminal had geometry, every normal pointed the right
+    // way, no triangle was inside out, and the roof that was never asked for
+    // was never missed.
+    //
+    // This is a source lint rather than a geometry check because that is what
+    // the defect is. The rule file is asking for the wrong thing, and the
+    // generator is right to give it exactly what it asked for.
+    for (const Example& example : kExamples) {
+        std::string source;
+        CHECK_TRUE(read_file(examples_dir() / example.file, source));
+
+        size_t at = 0;
+        while ((at = source.find("select face", at)) != std::string::npos) {
+            const size_t open = source.find('{', at);
+            if (open == std::string::npos) break;
+            // Walk to the matching brace so a nested arm body does not end the
+            // block early.
+            size_t depth = 0;
+            size_t close = open;
+            for (size_t i = open; i < source.size(); ++i) {
+                if (source[i] == '{') ++depth;
+                else if (source[i] == '}') {
+                    --depth;
+                    if (depth == 0) { close = i; break; }
+                }
+            }
+            const std::string block = source.substr(open, close - open + 1);
+            const bool covered = block.find("top") != std::string::npos ||
+                                 block.find("all") != std::string::npos;
+            if (!covered) {
+                const size_t line = 1 + static_cast<size_t>(
+                    std::count(source.begin(), source.begin() + static_cast<long>(at), '\n'));
+                std::printf("  %s:%zu: a select face block names no top or all arm, "
+                            "so the top face is dropped and the building has no roof\n",
+                            example.file, line);
+            }
+            CHECK_TRUE(covered);
+            at = close + 1;
+        }
+    }
+}
+
+TEST(Examples, the_stochastic_street_reproduces_exactly_and_varies_with_the_seed) {
+    // 08 makes a claim in its own header comment, and this is the test that
+    // holds it to it: the same seed gives a byte-identical street, a different
+    // seed gives a different one. A test asserting only the first half passes
+    // for a file that ignores the seed entirely.
+    std::string source;
+    CHECK_TRUE(read_file(examples_dir() / "08_stochastic_street.rule", source));
+    const ParseResult parsed = parse(source, "08_stochastic_street.rule");
+    CHECK_TRUE(parsed.ok());
+    if (!parsed.ok()) return;
+
+    const Shape seed = shape_from_rect(60.0, 14.0);
+    auto run = [&](uint64_t s) {
+        GenerationOptions options;
+        options.seed = s;
+        return generate(parsed.file, seed, options, &full_operations(), &full_functions()).dump();
+    };
+
+    const std::string a = run(0);
+    const std::string b = run(0);
+    const std::string c = run(7);
+
+    CHECK_TRUE(a == b);
+    CHECK_FALSE(a == c);
+    CHECK_TRUE(a.size() > 1000);
+}

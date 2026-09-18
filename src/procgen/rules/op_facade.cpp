@@ -27,6 +27,8 @@
 
 #include "procgen/rules/op_facade.hpp"
 
+#include "osm/road/road_style.hpp"
+
 #include "procgen/rules/op_comp.hpp"
 
 #include <algorithm>
@@ -661,7 +663,36 @@ void op_wall_panel(OperationArgs& context) {
 // ============================================================================
 
 MaterialKey facade_material(FacadePart part) {
-    return MaterialKey{MaterialId::Wall, static_cast<uint16_t>(part)};
+    // NOT `variant = part`. The Wall slot's variants are a published
+    // vocabulary -- osm/road/road_style.hpp names them kWallDefault 0,
+    // kWallBrick 1, kWallStone 2, kWallConcrete 3, kWallRender 4, kWallGlass 5,
+    // kWallMetal 6, kWallWood 7 -- and the OSM importer has been writing them
+    // for every mapped building since P0.3.
+    //
+    // Casting the part ordinal put the facade parts straight on top of that:
+    // Glass is part 3, so a window's glazing asked for kWallConcrete; Frame is
+    // part 2, so a frame asked for kWallStone; Sill is part 4, so a sill asked
+    // for kWallRender. In ShaderMode::Simple nothing is bound and it never
+    // showed, which is why it survived E3's whole suite.
+    //
+    // So each part maps to the variant that actually describes it. The mapping
+    // is injective, which matters beyond correctness: the tests use this
+    // function to find a part's faces, and two parts sharing a key would make
+    // them indistinguishable.
+    //
+    // kWallBrick is deliberately left unused here. Brick is a decision about a
+    // whole building, not about a window part, and leaving it free is what lets
+    // a rule say `material("wall", 1)` and mean it.
+    switch (part) {
+        case FacadePart::Panel:     return MaterialKey{MaterialId::Wall, osm::road::variants::kWallDefault};
+        case FacadePart::Reveal:    return MaterialKey{MaterialId::Wall, osm::road::variants::kWallRender};
+        case FacadePart::Frame:     return MaterialKey{MaterialId::Wall, osm::road::variants::kWallMetal};
+        case FacadePart::Glass:     return MaterialKey{MaterialId::Wall, osm::road::variants::kWallGlass};
+        case FacadePart::Sill:      return MaterialKey{MaterialId::Wall, osm::road::variants::kWallStone};
+        case FacadePart::Leaf:      return MaterialKey{MaterialId::Wall, osm::road::variants::kWallWood};
+        case FacadePart::Threshold: return MaterialKey{MaterialId::Wall, osm::road::variants::kWallConcrete};
+    }
+    return MaterialKey{MaterialId::Wall, osm::road::variants::kWallDefault};
 }
 
 const char* facade_part_name(FacadePart part) {

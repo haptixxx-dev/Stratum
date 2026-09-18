@@ -121,6 +121,7 @@ add_library(stratum_core STATIC
     src/osm/coordinates.cpp
     src/osm/mesh_builder.cpp
     src/osm/quadtree.cpp
+    src/osm/rule_seed.cpp
     src/osm/scene_export.cpp
     src/osm/attribute_palette.cpp
     src/osm/building_collision.cpp
@@ -195,7 +196,9 @@ add_library(stratum_core STATIC
 
     # Procedural Generation
     src/procgen/noise.cpp
+    src/procgen/building_lod.cpp
     src/procgen/heightmap_io.cpp
+    src/procgen/instances.cpp
 
     # The rule language. D1 is the lexer, AST and parser; the interpreter
     # (D2-D6) lands alongside them here.
@@ -204,10 +207,13 @@ add_library(stratum_core STATIC
     src/procgen/rules/shape.cpp
     src/procgen/rules/interpreter.cpp
     src/procgen/rules/op_split.cpp
+    src/procgen/rules/op_cleanup.cpp
     src/procgen/rules/op_comp.cpp
     src/procgen/rules/op_control.cpp
     src/procgen/rules/op_facade.cpp
+    src/procgen/rules/op_insert.cpp
     src/procgen/rules/op_mass.cpp
+    src/procgen/rules/op_material.cpp
     src/procgen/rules/op_roof.cpp
     src/procgen/rules/registry.cpp
     src/procgen/terrain_generator.cpp

@@ -1,0 +1,141 @@
+// A rule that reads what the survey already knew.
+//
+// POINT THIS AT AN IMPORT, not at the test rectangle. In the rule editor set
+// "Seed from" to "Imported buildings"; the rule then runs once per footprint
+// in the OSM data, seeded from the real outline.
+//
+// Every other example in this folder makes the same building wherever you put
+// it. This one does not: it reads the tags OSM carried and builds what they
+// describe, so a warehouse comes out as a shed, a house as a pitched-roof
+// house, and an apartment block as storeys of bays -- from the data rather
+// than from a draw.
+//
+// The attributes a seeded shape carries, all documented in
+// src/osm/rule_seed.hpp:
+//
+//     osm.id         int      the OSM way or relation id
+//     osm.height     float    metres, as mapped or as defaulted on import
+//     osm.levels     int      storeys
+//     osm.type       string   house, apartments, retail, warehouse, ...
+//     osm.roof       string   flat, gable, hip, pyramid, shed, dome
+//     osm.name       string   only when the feature is named
+//
+// The walls and windows are already materialled without asking: wall_panel(),
+// window() and door() tag each part with its own variant of the Wall slot --
+// panel 0, reveal 1, frame 2, glass 3, sill 4 -- so the glass is separable
+// from the brick before any material() call. This file only overrides the
+// roof and the industrial cladding.
+//
+// `osm.roof` is deliberately spelled the way `roof()` spells its kinds. OSM
+// calls them skillion and pyramidal; the seeding translates, so a rule can
+// write `roof(attrs.get("osm.roof", "hip"))` with no lookup table of its own.
+//
+// Seed: an OSM import. On the test rectangle it still runs, and takes every
+// default, which is a fair way to see the fallback path.
+//
+// No `cleanup()` call is needed here, and that is worth knowing because this
+// file used to need one. An OSM way is closed by repeating its first node as
+// its last, and that repeat used to reach the seed shape as a zero-length edge
+// -- which has no corner, which is what `roof()` refuses with "corner 0 of the
+// outline is a spike with no mitre". Over 400 buildings of the Lucan extract
+// that was 53 refusals and 400 dropped-component warnings.
+//
+// osm/rule_seed.cpp now drops the closing point, because that is an OSM
+// convention and the seam is where OSM conventions belong. `cleanup()` is
+// still there for a footprint that needs more than that -- a spur that doubles
+// back, or points a millimetre apart -- and a rule asks for it.
+
+attr storey : float = 3.1
+
+@start
+rule Building {
+    // Prefer the mapped storey count. A building with no levels tag falls back
+    // to its height, and to three storeys if it has neither.
+    Massing(attrs.get("osm.levels", max(1.0, round(attrs.get("osm.height", 9.3) / storey))));
+}
+
+rule Massing(levels: float) {
+    floors(levels, storey);
+    select face {
+        front    : { StreetFace(); }
+        vertical : { SideFace(); }
+        top      : { Cap(); }
+    }
+}
+
+// The roof kind comes straight from the tag. `flat` is not a roof() kind, so
+// it is the one case that needs a branch -- a flat roof is a deck.
+rule Cap {
+    // cleanup() FIRST. A surveyed outline repeats vertices and carries spurs
+    // that double back, and the skeleton behind roof() cannot mitre a corner
+    // whose edges are opposite or zero length. Without this line about one
+    // building in eight comes out with walls and no roof.
+    align_scope("y_up");
+    if (attrs.get("osm.roof", "flat") == "flat") {
+        Deck();
+    } else {
+        Pitched();
+    }
+}
+
+rule Pitched { roof(attrs.get("osm.roof", "hip"), 35.0, 0.3); material("roof", 1); }
+// material(slot, variant) AFTER the geometry operation. wall_panel() tags its
+// own output through facade_material(), so a material set before it is thrown
+// away -- see src/procgen/rules/op_material.hpp.
+//
+// Nothing here is textured in Render Settings > Shader Mode > Simple. The
+// simple shader has no samplers at all; materials bind only in PBR.
+rule Deck    { wall_panel(0.0, 0.25); material("roof", 0); }
+
+// An industrial shed gets big openings and no domestic detail; everything else
+// gets storeys of windows.
+rule StreetFace {
+    if (attrs.get("osm.type", "unknown") == "warehouse"
+        || attrs.get("osm.type", "unknown") == "industrial") {
+        ShedFace();
+    } else {
+        Storeys();
+    }
+}
+
+rule SideFace {
+    if (attrs.get("osm.type", "unknown") == "warehouse"
+        || attrs.get("osm.type", "unknown") == "industrial") {
+        Cladding();
+    } else {
+        Storeys();
+    }
+}
+
+rule ShedFace {
+    split(y) {
+        ~1.0 : { Cladding(); }
+        4.0  : { DoorBand(); }
+    }
+}
+
+rule DoorBand {
+    split(x) { repeat { 8.0 : { ShedBay(); } } }
+}
+
+rule ShedBay {
+    split(x) { ~1.0 : { Cladding(); } 4.0 : { RollerDoor(); } ~1.0 : { Cladding(); } }
+}
+
+rule Storeys {
+    split(y) { repeat { storey : { Storey(); } } }
+}
+
+rule Storey {
+    split(x) { repeat { 2.6 : { Bay(); } } }
+}
+
+rule Bay {
+    split(x) { ~1.0 : { Wall(); } 1.2 : { Window(); } ~1.0 : { Wall(); } }
+}
+
+rule Window     { window(0.0, 0.14, 0.05, 0.05); }
+rule RollerDoor { door(0.0, 0.10, 0.04, 0.02); }
+rule Wall       { wall_panel(); }
+// Industrial cladding reads as concrete rather than brick.
+rule Cladding   { wall_panel(); material("concrete", 0); }

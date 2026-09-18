@@ -1,0 +1,80 @@
+// A tower that twists as it rises, and tapers as it twists.
+//
+// THIS IS THE ONE THAT SHOWS WHY THE LANGUAGE IS RECURSIVE. There is no loop
+// construct and no list of floors. `Level` calls itself with one less to go,
+// and the building is however deep the recursion went. Change `levels` from 14
+// to 40 and you have a skyscraper; nothing else in the file moves.
+//
+// Each level turns its GEOMETRY by a few degrees before the next one is built
+// on top, so the corners trace a helix -- the Cayan Tower move.
+//
+// `rotate` and `rotate_scope` are NOT interchangeable here, and swapping them
+// is the difference between a twist and a straight box. Measured on a 10 x 10
+// seed, 14 levels, 7 degrees a level, both 49.75 m tall:
+//
+//     rotate         world extent 12.96 x 49.75 x 13.05   twists
+//     rotate_scope   world extent 10.04 x 49.75 x 10.04   does not
+//
+// `rotate_scope` turns the FRAME and leaves the geometry where it is, so every
+// level lands back on the same square. `rotate` turns the geometry, which is
+// what a twist is. The taper pulls the upper levels in as they turn, so the
+// widest sweep is somewhere in the middle rather than at the top.
+//
+// Seed: a square, about 10 x 10 m.
+
+attr levels     : float = 14.0
+attr storey     : float = 3.2
+attr twist      : float = 7.0
+attr taper_step : float = 0.12
+
+@start
+rule Tower {
+    Level(levels);
+}
+
+// One storey, then the top face becomes the next storey's plot. The recursion
+// bottoms out on `n <= 1`, which is the ONLY thing stopping it -- the language
+// will happily build until the depth cap catches it, and that cap is an error
+// rather than a silent truncation.
+rule Level(n: float) {
+    extrude(storey);
+    select face {
+        vertical : { Elevation(); }
+        top      : { Above(n); }
+    }
+}
+
+rule Above(n: float) {
+    align_scope("y_up");
+    if (n > 1.0) {
+        // Turn the plan, then pull it in a little. The order matters: inset
+        // first and the rotation would spin an already smaller square, which
+        // reads as a jitter rather than a twist.
+        rotate(0.0, twist, 0.0);
+        offset(-taper_step, "inside");
+        Level(n - 1.0);
+    } else {
+        Crown();
+    }
+}
+
+rule Crown {
+    roof("pyramid", 55.0);
+}
+
+// Every level is glazed the same way. The elevations get narrower as the tower
+// tapers, and the floating pier absorbs the difference, so no rule anywhere
+// needs to know how high up it is.
+rule Elevation {
+    split(x) { repeat { 2.2 : { Bay(); } } }
+}
+
+rule Bay {
+    split(x) {
+        0.35 : { Mullion(); }
+        ~1.0 : { Glass(); }
+    }
+}
+
+rule Glass   { window(0.0, 0.18, 0.04, 0.02); }
+rule Mullion { wall_panel(0.0, 0.14); }

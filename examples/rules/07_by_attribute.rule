@@ -1,0 +1,122 @@
+// One rule file, four building types, chosen by an attribute.
+//
+// This is the file to copy when you want a rule PACK rather than a rule. The
+// caller sets `kind` -- from a zoning layer, from an OSM tag, from a slider in
+// the panel -- and the same file produces a house, a shop, an office or a
+// warehouse. Nothing downstream changes.
+//
+// `if` is an ordinary statement, so the choice can be made anywhere: at the
+// massing, at the roof, or inside a single bay.
+//
+// Seed: about 16 x 12 m.
+
+attr kind    : string = "office"
+attr storeys : float  = 4.0
+attr storey  : float  = 3.2
+
+@start
+rule Building {
+    if (kind == "warehouse") {
+        Warehouse();
+    } else if (kind == "house") {
+        House();
+    } else if (kind == "shop") {
+        Shop();
+    } else {
+        Office();
+    }
+}
+
+// ---------------------------------------------------------------- warehouse
+
+rule Warehouse {
+    extrude(7.5);
+    select face { vertical : { Cladding(); } top : { ShedRoof(); } }
+}
+
+rule ShedRoof { align_scope("y_up"); roof("shed", 10.0, 0.5); }
+
+// -------------------------------------------------------------------- house
+
+rule House {
+    floors(2.0, 2.8);
+    select face { front : { HouseFront(); } side : { Brick(); } back : { Brick(); }
+                  top : { GableRoof(); } }
+}
+
+rule GableRoof { align_scope("y_up"); roof("gable", 45.0, 0.35); }
+
+rule HouseFront {
+    split(y) {
+        2.8  : { HouseGround(); }
+        ~1.0 : { HouseUpper(); }
+    }
+}
+
+rule HouseGround {
+    split(x) { ~1.0 : { Brick(); } 1.0 : { Door(); } 0.5 : { Brick(); }
+               1.3 : { Sash(); } ~1.0 : { Brick(); } }
+}
+
+rule HouseUpper {
+    split(x) { ~1.0 : { Brick(); } 1.2 : { Sash(); } ~1.0 : { Brick(); }
+               1.2 : { Sash(); } ~1.0 : { Brick(); } }
+}
+
+// --------------------------------------------------------------------- shop
+
+// A shop is an office with its ground floor given over to glass, and a flat
+// roof rather than a pitched one.
+//
+// "Flat roof" still needs a `top` arm. A face that `select face` does not name
+// is DROPPED -- this rule used to omit it, on the idea that the top face would
+// be "left as it came out of the massing", and the result was a shop with no
+// roof at all and nothing reported.
+rule Shop {
+    floors(storeys, storey);
+    select face { front : { ShopFront(); } vertical : { Brick(); }
+                  top : { RoofDeck(); } }
+}
+
+rule ShopFront {
+    split(y) {
+        storey : { WindowWall(); }
+        repeat { storey : { OfficeFloor(); } }
+    }
+}
+
+rule WindowWall {
+    split(x) { 0.3 : { Pier(); } repeat { 2.0 : { Glass(); } } 0.3 : { Pier(); } }
+}
+
+// ------------------------------------------------------------------- office
+
+rule Office {
+    floors(storeys, storey);
+    select face { vertical : { OfficeElevation(); } top : { RoofDeck(); } }
+}
+
+rule OfficeElevation {
+    split(y) { repeat { storey : { OfficeFloor(); } } }
+}
+
+rule OfficeFloor {
+    split(x) { repeat { 2.2 : { OfficeBay(); } } }
+}
+
+rule OfficeBay {
+    split(x) { 0.4 : { Mullion(); } ~1.0 : { Glass(); } }
+}
+
+// ------------------------------------------------------------------- shared
+
+rule Sash     { window(0.0, 0.14, 0.05, 0.06); }
+rule Glass    { window(0.0, 0.18, 0.04, 0.02); }
+rule Door     { door(0.0, 0.14, 0.05, 0.04); }
+rule Brick    { wall_panel(); }
+rule Cladding { wall_panel(); }
+rule Pier     { wall_panel(0.0, 0.2); }
+rule Mullion  { wall_panel(0.0, 0.12); }
+
+// Real thickness, so the deck has an underside and survives being exported.
+rule RoofDeck { wall_panel(0.0, 0.3); }

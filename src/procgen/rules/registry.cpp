@@ -3,10 +3,13 @@
 
 #include "procgen/rules/registry.hpp"
 
+#include "procgen/rules/op_cleanup.hpp"
 #include "procgen/rules/op_comp.hpp"
 #include "procgen/rules/op_control.hpp"
 #include "procgen/rules/op_facade.hpp"
+#include "procgen/rules/op_insert.hpp"
 #include "procgen/rules/op_mass.hpp"
+#include "procgen/rules/op_material.hpp"
 #include "procgen/rules/op_roof.hpp"
 
 namespace stratum::procgen::rules {
@@ -19,10 +22,13 @@ const OperationTable& full_operations() {
     // an empty registry in a release build only.
     static const OperationTable table = [] {
         OperationTable t = standard_operations();
+        register_cleanup_operations(t);
         register_control_operations(t);
         register_roof_operations(t);
         register_mass_operations(t);
         register_facade_operations(t);
+        register_insert_operations(t);
+        register_material_operations(t);
         return t;
     }();
     return table;

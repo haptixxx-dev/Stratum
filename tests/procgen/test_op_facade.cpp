@@ -66,6 +66,7 @@
 #include "procgen/rules/ast.hpp"
 #include "procgen/rules/interpreter.hpp"
 #include "procgen/rules/lexer.hpp"
+#include "osm/road/road_style.hpp"
 #include "procgen/rules/op_facade.hpp"
 #include "procgen/rules/parser.hpp"
 #include "procgen/rules/registry.hpp"
@@ -1531,13 +1532,47 @@ TEST(OpFacade, a_split_after_an_opening_is_measured_against_the_grown_scope) {
     }
 }
 
-/// Every part is a distinct material variant, so D8 can tell glass from stone
-TEST(OpFacade, each_part_carries_its_own_material_variant) {
-    CHECK_TRUE(facade_material(FacadePart::Panel) ==
-               (MaterialKey{MaterialId::Wall, uint16_t{0}}));
+/// Every part is a distinct material variant, and the variant MEANS what the part is
+TEST(OpFacade, each_part_carries_the_material_variant_that_describes_it) {
+    // This used to assert Glass == Wall/3, which was the bug rather than the
+    // contract. The Wall slot's variants are a published vocabulary --
+    // osm/road/road_style.hpp names them, and the OSM importer has written them
+    // for every mapped building since P0.3 -- and variant 3 is kWallConcrete.
+    //
+    // Casting the part ordinal put the facade parts on top of that vocabulary:
+    // glazing asked for concrete, a frame for stone, a sill for render. Nothing
+    // is bound in ShaderMode::Simple, so it never showed.
     CHECK_TRUE(facade_material(FacadePart::Glass) ==
-               (MaterialKey{MaterialId::Wall, uint16_t{3}}));
-    CHECK_TRUE(facade_material(FacadePart::Glass) != facade_material(FacadePart::Frame));
+               (MaterialKey{MaterialId::Wall, stratum::osm::road::variants::kWallGlass}));
+    CHECK_TRUE(facade_material(FacadePart::Panel) ==
+               (MaterialKey{MaterialId::Wall, stratum::osm::road::variants::kWallDefault}));
+    CHECK_TRUE(facade_material(FacadePart::Frame) ==
+               (MaterialKey{MaterialId::Wall, stratum::osm::road::variants::kWallMetal}));
+    CHECK_TRUE(facade_material(FacadePart::Sill) ==
+               (MaterialKey{MaterialId::Wall, stratum::osm::road::variants::kWallStone}));
+
+    // Still INJECTIVE, which is load-bearing beyond correctness: the helpers in
+    // this file find a part's faces through facade_material(), so two parts
+    // sharing a key would make them indistinguishable and quietly weaken every
+    // part_faces() assertion below.
+    static const FacadePart kAll[] = {FacadePart::Panel, FacadePart::Reveal,
+                                      FacadePart::Frame, FacadePart::Glass,
+                                      FacadePart::Sill,  FacadePart::Leaf,
+                                      FacadePart::Threshold};
+    for (const FacadePart a : kAll) {
+        for (const FacadePart b : kAll) {
+            if (a == b) continue;
+            CHECK_TRUE(facade_material(a) != facade_material(b));
+        }
+    }
+
+    // And kWallBrick stays free: brick is a decision about a whole building,
+    // not about a window part, which is what lets a rule say
+    // `material("wall", 1)` and mean it.
+    for (const FacadePart part : kAll) {
+        CHECK_TRUE(facade_material(part).variant != stratum::osm::road::variants::kWallBrick);
+    }
+
     CHECK_EQ(std::string{facade_part_name(FacadePart::Glass)}, std::string{"glass"});
 
     Shape shape = make_wall(0.6, 2.0);

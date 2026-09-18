@@ -97,15 +97,21 @@ set(STRATUM_TEST_SOURCES
     procgen/test_interpreter.cpp
     procgen/test_rule_statements.cpp
     procgen/test_op_split.cpp
+    procgen/test_op_cleanup.cpp
     procgen/test_op_comp.cpp
     procgen/test_op_control.cpp
     procgen/test_op_facade.cpp
     procgen/test_op_mass.cpp
+    procgen/test_op_material.cpp
     procgen/test_op_roof.cpp
+    procgen/test_building_lod.cpp
+    procgen/test_examples.cpp
+    procgen/test_instances.cpp
     procgen/test_registry.cpp
 
     # Attribute-mode colour tables: totality, determinism and separation.
     osm/test_attribute_palette.cpp
+    osm/test_rule_seed.cpp
 
     # Building footprints to closed collision prisms.
     osm/test_building_collision.cpp
@@ -143,12 +149,18 @@ set(STRATUM_TEST_SUITES
     Interpreter
     RuleStatements
     OpSplit
+    OpCleanup
     OpComp
+    BuildingLod
+    Examples
+    Instances
     OpControl
     OpFacade
     OpMass
+    OpMaterial
     OpRoof
     Registry
+    RuleSeed
     StraightSkeleton
     LotsOffset
     GraphEdit
@@ -279,6 +291,9 @@ target_include_directories(stratum_tests PRIVATE
 target_compile_definitions(stratum_tests PRIVATE
     STRATUM_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
     STRATUM_TEST_DUMP_DIR="${CMAKE_BINARY_DIR}/road_dump"
+    # The shipped rule examples. Source tree, not build tree: they are
+    # committed files the Examples suite runs so one cannot rot unnoticed.
+    STRATUM_EXAMPLES_DIR="${CMAKE_SOURCE_DIR}/examples/rules"
 )
 
 target_compile_features(stratum_tests PRIVATE cxx_std_20)

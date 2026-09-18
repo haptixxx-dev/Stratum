@@ -1,0 +1,117 @@
+// The materials example: a brick building with a stone plinth, a glazed
+// shopfront, a metal-clad top floor and a slate roof.
+//
+// TURN ON PBR FIRST. Render Settings > Shader Mode > PBR. The simple shader
+// has no samplers and no material uniform block, so every material in this
+// file draws flat grey in Simple and the whole point is invisible.
+//
+// `material(slot, variant)` tags the current shape's faces. The slots are
+// renderer/mesh.hpp's, lower-cased. The variants are a PUBLISHED vocabulary --
+// osm/road/road_style.hpp names them, and the OSM importer writes them for
+// every mapped building, so a rule and an import agree on what "3" means:
+//
+//   wall   0 default   1 brick   2 stone      3 concrete
+//          4 render    5 glass   6 metal      7 wood
+//
+//   roof   0 default   1 tile    2 slate      3 metal
+//          4 membrane  5 concrete 6 thatch    7 glass
+//
+// TWO THINGS THAT WILL CATCH YOU OUT.
+//
+// 1. The facade operations already assign materials. wall_panel(), window()
+//    and door() tag each part for you: a pane gets wall/5 (glass), a frame
+//    wall/6 (metal), a sill wall/2 (stone), a door leaf wall/7 (wood). So a
+//    window is correctly textured before you write anything. `material()` is
+//    for the surfaces you want to differ from the default.
+//
+// 2. Order matters against them. A `material()` call BEFORE wall_panel() is
+//    thrown away, because the facade operation tags its own output afterwards.
+//    Put it after. `extrude`, `split`, `floors` and `roof` leave it alone.
+//
+// Seed: about 14 x 10 m.
+
+attr storey : float = 3.2
+
+@start
+rule Building {
+    floors(5.0, storey);
+    select face {
+        front    : { Frontage(); }
+        vertical : { Flank(); }
+        top      : { Roof(); }
+    }
+}
+
+// Bottom to top: a stone plinth, a glazed shopfront, three brick floors, and
+// a metal-clad attic storey. One elevation, five materials.
+rule Frontage {
+    split(y) {
+        0.6         : { Plinth(); }
+        storey      : { Shopfront(); }
+        repeat { storey : { BrickFloor(); } }
+        storey      : { AtticFloor(); }
+    }
+}
+
+rule Flank {
+    split(y) {
+        0.6    : { Plinth(); }
+        ~1.0   : { BrickWall(); }
+        storey : { AtticWall(); }
+    }
+}
+
+// ------------------------------------------------------------------ surfaces
+
+// wall_panel() first, material() second. The other way round and the panel's
+// own key wins.
+rule Plinth     { wall_panel(0.0, 0.15); material("wall", 2); }  // stone
+rule BrickWall  { wall_panel();          material("wall", 1); }  // brick
+rule AtticWall  { wall_panel();          material("wall", 6); }  // metal
+
+// ------------------------------------------------------------------- storeys
+
+rule Shopfront {
+    split(x) {
+        0.5 : { Pier(); }
+        repeat { 2.2 : { ShopBay(); } }
+        0.5 : { Pier(); }
+    }
+}
+
+// The glazing is NOT given a material. window() already tags the pane wall/5,
+// the frame wall/6 and the sill wall/2, which is what those things are.
+rule ShopBay {
+    split(x) { 0.15 : { Mullion(); } ~1.0 : { ShopGlass(); } 0.15 : { Mullion(); } }
+}
+
+rule BrickFloor {
+    split(x) { repeat { 2.4 : { BrickBay(); } } }
+}
+
+rule BrickBay {
+    split(x) { ~1.0 : { BrickWall(); } 1.2 : { Sash(); } ~1.0 : { BrickWall(); } }
+}
+
+rule AtticFloor {
+    split(x) { repeat { 2.4 : { AtticBay(); } } }
+}
+
+rule AtticBay {
+    split(x) { ~1.0 : { AtticWall(); } 1.4 : { Sash(); } ~1.0 : { AtticWall(); } }
+}
+
+// ---------------------------------------------------------------------- roof
+
+rule Roof {
+    align_scope("y_up");
+    roof("hip", 38.0, 0.35);
+    material("roof", 2);   // slate
+}
+
+// -------------------------------------------------------------------- leaves
+
+rule ShopGlass { window(0.0, 0.22, 0.06, 0.03); }
+rule Sash      { window(0.0, 0.14, 0.05, 0.06); }
+rule Pier      { wall_panel(0.0, 0.2); material("wall", 2); }   // stone
+rule Mullion   { wall_panel(0.0, 0.1); material("wall", 6); }   // metal

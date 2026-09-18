@@ -968,6 +968,31 @@ TEST(OpSplit, a_note_is_said_once_however_many_parts_say_it) {
     CHECK_EQ(both.notes.size(), size_t{2});
 }
 
+TEST(OpSplit, a_repeat_left_exactly_no_room_says_so_rather_than_nothing) {
+    // The case that reported NOTHING. Five metres of fixed part in an extent of
+    // exactly five leaves the repeat a span of zero -- but nothing overflowed,
+    // so the "cut off at the far end" note never fired and the split returned
+    // one piece in silence.
+    //
+    // That is the likelier mistake by far. An author writes
+    // `extrude(5.0)` and `split(y) { 5.0 : Shopfront(); repeat { 3.0 : Floor(); } }`,
+    // gets one quad, sees a flat wall, and has no thread to pull. The overflow
+    // case at least told them a number was too big.
+    const SplitLayout layout =
+        solve_split({fixed_part(5.0), repeat_part({fixed_part(3.0)})}, 5.0);
+
+    CHECK_EQ(layout.repeat_copies, uint32_t{0});
+    CHECK_NEAR(layout.overflow, 0.0, 1e-12);
+    CHECK_EQ(layout.pieces.size(), size_t{1});
+
+    // The note has to name WHY there was no room, not just that there was none.
+    CHECK_TRUE(a_note_says(layout, "left no room"));
+    CHECK_TRUE(a_note_says(layout, "5"));
+    CHECK_EQ(layout.notes.size(), size_t{1});
+    // Not the overflow note: nothing overflowed.
+    CHECK_FALSE(a_note_says(layout, "cut off at the far end"));
+}
+
 TEST(OpSplit, a_repeat_with_no_room_left_produces_no_copy_rather_than_an_empty_one) {
     // Twelve metres of fixed part in an extent of ten leaves the repeat group a
     // span of zero. A zero-length copy would put an empty bay in the shape tree

@@ -1,0 +1,113 @@
+// A tower that branches instead of rising.
+//
+// Every level quarters its own roof and decides, per quarter, whether to build
+// another level there. Four decisions per level, made from each quarter's own
+// address in the tree, so the result is a crystalline mass that is different
+// in every quadrant and identical on every run.
+//
+// WHAT ACTUALLY STOPS IT IS THE GEOMETRY, NOT THE COUNTER. `depth` is 5 here,
+// and raising it to 12 does not produce a taller tower or hit the depth cap:
+// it produces 4336 terminals instead of 3907, both 40.8 m tall,
+// because every branch has already quartered itself down past the three metre
+// floor in `Maybe`. The counter is a backstop; the size test is the real
+// termination condition.
+//
+// That is worth knowing before writing any recursive rule. A counter assumes
+// every branch shrinks at the same rate, and a split with a floating part does
+// not. InterpreterLimits is still there behind both, and a rule that does run
+// away reports an Error rather than quietly truncating -- a cut-off building
+// is the wrong building, and no caller may mistake it for a finished one.
+//
+// Relative split sizes (`50%`) rather than metres, so a quarter is a quarter
+// whatever the level below happened to be.
+//
+// Seed: a square, about 32 x 32 m.
+
+attr depth   : float = 5.0
+attr storey  : float = 3.4
+attr keep    : float = 0.62
+// Storeys each node rises before it quarters itself and branches again.
+// Without this the tower is as tall as the recursion is deep, and the
+// recursion is short: quartering 32 m stops at 3 m after four levels.
+attr stack   : float = 3.0
+
+@start
+rule Crystal {
+    Node(depth);
+}
+
+rule Node(n: float) {
+    extrude(storey * stack);
+    select face {
+        vertical : { Skin(); }
+        top      : { Quarters(n); }
+    }
+}
+
+// Cut the roof into four, and hand each quarter its own decision. `split`
+// nested inside `split` is how a 2D subdivision is written: the outer cut runs
+// along x, and each half is cut again along y -- the face's own second axis,
+// which is the shape scope's z.
+rule Quarters(n: float) {
+    align_scope("y_up");
+    if (n > 1.0) {
+        split(x) {
+            50%  : { Column(n); }
+            ~1.0 : { Column(n); }
+        }
+    } else {
+        Terrace();
+    }
+}
+
+rule Column(n: float) {
+    split(z) {
+        50%  : { Maybe(n); }
+        ~1.0 : { Maybe(n); }
+    }
+}
+
+// The decision. `random.chance` draws from this quarter's address, so the
+// pattern is fixed for a given seed and changes completely with another.
+//
+// A quarter that stops becomes a terrace, which is what stops the tower
+// looking like a stack of boxes: every branch that ends leaves a flat roof
+// where a neighbour kept going.
+rule Maybe(n: float) {
+    // Two conditions, and the size one is not optional. Quartering 16 m five
+    // times leaves a square a metre across, and `offset(-0.3)` on that removes
+    // the whole shape and reports an error. Any recursion that shrinks its own
+    // input has to stop on the GEOMETRY as well as on the counter -- the
+    // counter alone assumes every branch shrinks at the same rate, and a split
+    // with a floating part does not.
+    if (comp.size("all", "x") > 3.0 && comp.size("all", "y") > 3.0
+        && random.chance(keep)) {
+        Inset(n);
+    } else {
+        Terrace();
+    }
+}
+
+// Pull the quarter in slightly before building on it. Without this the four
+// quarters meet exactly at their shared edges and the mass reads as one solid
+// block rather than four towers.
+rule Inset(n: float) {
+    offset(-0.3, "inside");
+    Node(n - 1.0);
+}
+
+rule Skin {
+    split(y) { repeat { storey : { Storey(); } } }
+}
+
+rule Storey {
+    split(x) { repeat { 1.4 : { Bay(); } } }
+}
+
+rule Bay {
+    split(x) { 0.25 : { Fin(); } ~1.0 : { Glass(); } }
+}
+
+rule Glass   { window(0.0, 0.16, 0.04, 0.02); }
+rule Fin     { wall_panel(0.0, 0.1); }
+rule Terrace { wall_panel(); }

@@ -1,0 +1,76 @@
+// An industrial shed with a clerestory and roller doors.
+//
+// The opposite problem from a townhouse: one enormous span, almost no
+// openings, and everything driven by the structural bay rather than by a
+// window rhythm. The floating `~` size does the work -- the bays are whatever
+// divides the building evenly, and the end walls take up the slack.
+//
+// `shed` is the roof kind here because an industrial roof is a single slope,
+// and because shed is the one kind that would still work if the footprint had
+// a hole in it.
+//
+// Seed: a big rectangle, about 48 x 24 m.
+
+attr eaves      : float = 8.0
+attr bay        : float = 6.0
+attr door_width : float = 4.5
+
+@start
+rule Shed {
+    extrude(eaves);
+    select face {
+        front : { LoadingElevation(); }
+        back  : { BlankWall(); }
+        side  : { EndWall(); }
+        top   : { Roof(); }
+    }
+}
+
+// The long elevation: roller doors at the bottom, a continuous clerestory
+// above. The clerestory is one band the full length of the building, split
+// into lights -- which is how the real thing is glazed.
+rule LoadingElevation {
+    split(y) {
+        5.0  : { DoorBand(); }
+        0.6  : { Rail(); }
+        ~1.0 : { Clerestory(); }
+    }
+}
+
+rule DoorBand {
+    split(x) { repeat { bay : { StructuralBay(); } } }
+}
+
+rule StructuralBay {
+    split(x) {
+        ~1.0       : { Column(); }
+        door_width : { RollerDoor(); }
+        ~1.0       : { Column(); }
+    }
+}
+
+rule Clerestory {
+    split(x) { repeat { 2.0 : { Light(); } } }
+}
+
+// The end wall is blind except for a personnel door.
+rule EndWall {
+    split(x) {
+        ~1.0 : { Cladding(); }
+        1.0  : { PersonnelDoor(); }
+        ~1.0 : { Cladding(); }
+    }
+}
+
+rule Roof {
+    align_scope("y_up");
+    roof("shed", 9.0, 0.6);
+}
+
+rule RollerDoor     { door(0.0, 0.10, 0.04, 0.02); }
+rule PersonnelDoor  { door(0.0, 0.12, 0.05, 0.03); }
+rule Light          { window(0.0, 0.08, 0.04, 0.0); }
+rule Cladding       { wall_panel(); }
+rule BlankWall      { wall_panel(); }
+rule Rail           { wall_panel(0.0, 0.15); }
+rule Column         { wall_panel(0.0, 0.25); }

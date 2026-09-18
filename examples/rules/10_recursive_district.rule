@@ -1,0 +1,132 @@
+// A whole district from one rectangle.
+//
+// This is the CityEngine move, and it is recursion doing the work. `Parcel`
+// looks at how big it is, and if it is still too big to build on it CUTS
+// ITSELF IN TWO and calls itself on both halves. When a piece is small enough,
+// it stops subdividing and puts a building on it.
+//
+// Nothing here says how many buildings to make. The count falls out of the
+// seed size and `min_plot`: a 120 x 80 seed gives a few dozen, a 400 x 300
+// seed gives hundreds, and the file does not change.
+//
+// `comp.size("all", ...)` is what lets a rule ask how big its own shape is,
+// which is what makes the recursion terminate on geometry rather than on a
+// counter.
+//
+// ONE TRAP, AND IT COSTS AN HOUR IF YOU MEET IT COLD. `split(z)` divides along
+// the SHAPE SCOPE's z. `comp.size` measures a COMPONENT in the component's own
+// frame, where a face's two in-plane axes are x and y and z is its thickness.
+// On a ground footprint those are not the same z:
+//
+//     comp.size("all", "x")  ->  120   the width
+//     comp.size("all", "y")  ->   80   the depth, which split() calls z
+//     comp.size("all", "z")  ->    0   the thickness of a flat face
+//
+// So a parcel measured with `comp.size("all","z")` is always zero, the
+// recursion terminates on the first test it reaches, and the district comes
+// out as nine streets and ten empty yards with no error anywhere.
+//
+// Seed: a big rectangle, 120 x 80 m or larger.
+
+attr min_plot : float = 16.0
+attr storey   : float = 3.2
+attr road     : float = 5.0
+
+@start
+rule District {
+    Parcel();
+}
+
+// Split the LONG way, so parcels stay roughly square instead of degenerating
+// into slivers. The cut is not down the middle: it lands somewhere in the
+// middle third, which is what stops the result looking like graph paper.
+//
+// The size is `comp.size(...) * random.range(0.35, 0.65)` and NOT
+// `random.range(0.35, 0.65)`. A split size is in METRES, so the bare call asks
+// for a parcel about half a metre wide. A size can also be written with a
+// trailing `%`, which is relative to the extent; multiplying the shape's own
+// measured size is the same idea written out.
+rule Parcel {
+    if (comp.size("all", "x") < min_plot && comp.size("all", "y") < min_plot) {
+        Plot();
+    } else if (comp.size("all", "x") > comp.size("all", "y")) {
+        split(x) {
+            comp.size("all", "x") * random.range(0.35, 0.65) : { Parcel(); }
+            road                                             : { Street(); }
+            ~1.0                                             : { Parcel(); }
+        }
+    } else {
+        split(z) {
+            comp.size("all", "y") * random.range(0.35, 0.65) : { Parcel(); }
+            road                                             : { Street(); }
+            ~1.0                                             : { Parcel(); }
+        }
+    }
+}
+
+// A plot keeps a margin, so buildings do not touch across a boundary.
+//
+// The size guard is not optional. The `~1.0` remainder of a split can come out
+// as a sliver a metre wide, and `offset(-1.5)` on a sliver removes the whole
+// shape and reports an error. Recursive subdivision ALWAYS produces a few of
+// these; a rule that subdivides has to decide what to do with them rather than
+// assume they will not happen.
+rule Plot {
+    if (comp.size("all", "x") < 7.0 || comp.size("all", "y") < 7.0) {
+        Yard();
+    } else {
+        BuiltPlot();
+    }
+}
+
+rule BuiltPlot {
+    offset(-1.5, "inside");
+    choose {
+        4 : { Housing(); }
+        2 : { Block(); }
+        1 : { Tower(); }
+        1 : { Yard(); }
+    }
+}
+
+rule Housing {
+    floors(random.range(2.0, 4.0), storey);
+    select face { vertical : { Elevation(); } top : { PitchedRoof(); } }
+}
+
+rule Block {
+    floors(random.range(4.0, 7.0), storey);
+    select face { vertical : { Elevation(); } top : { FlatTop(); } }
+}
+
+rule Tower {
+    floors(random.range(9.0, 16.0), storey);
+    select face { vertical : { Elevation(); } top : { FlatTop(); } }
+}
+
+rule PitchedRoof {
+    align_scope("y_up");
+    roof("hip", 38.0, 0.3);
+}
+
+rule Elevation {
+    split(y) { repeat { storey : { Storey(); } } }
+}
+
+rule Storey {
+    split(x) { repeat { 2.4 : { Bay(); } } }
+}
+
+rule Bay {
+    split(x) { ~1.0 : { Wall(); } 1.2 : { Window(); } ~1.0 : { Wall(); } }
+}
+
+rule Window  { window(0.0, 0.14, 0.05, 0.05); }
+rule Wall    { wall_panel(); }
+// A roof deck with THICKNESS. `wall_panel()` on its own is one quad -- two
+// triangles, one-sided -- so a flat-roofed building is invisible from below
+// and edge-on, and has no underside to export. With a thickness it is a closed
+// slab of twelve triangles.
+rule FlatTop { wall_panel(0.0, 0.25); }
+rule Street  {}
+rule Yard    {}

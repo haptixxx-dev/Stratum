@@ -1,0 +1,74 @@
+// A terrace of houses, each with its own gable roof.
+//
+// The point of this one is that NOTHING here says which way a ridge runs. A
+// gable's ridge follows its own footprint's long axis, so a plot 6 m wide and
+// 4.5 m deep ridges ALONG the street, and the same rule on a 7.5 m depth
+// ridges back INTO the plot.
+//
+// Measured on a 24 x 12 seed: three roofs come out 6.60 x 5.10 (ridge along
+// x) and one comes out 6.60 x 8.10 (ridge along z). One rule, one parameter.
+//
+// Seed: a long thin rectangle, about 24 x 12 m.
+
+attr pitch  : float = 40.0
+attr storey : float = 2.8
+
+@start
+rule Terrace {
+    split(x) {
+        repeat { 6.0 : { Plot(); } }
+    }
+}
+
+// Every second house is deeper. `choose` draws from the shape's own address in
+// the tree, so the same seed gives the same terrace every time -- and adding a
+// house at one end does not reshuffle the others.
+rule Plot {
+    choose {
+        2 : { House(4.5, 2.0); }
+        1 : { House(7.5, 3.0); }
+    }
+}
+
+// depth   how far the house reaches back into the plot
+// levels  how many storeys, so the eaves line steps along the row
+rule House(depth: float, levels: float) {
+    split(z) {
+        depth : { Block(levels); }
+        ~1.0  : { Garden(); }
+    }
+}
+
+rule Block(levels: float) {
+    floors(levels, storey);
+    select face {
+        front : { StreetElevation(); }
+        top   : { Roof(); }
+    }
+}
+
+rule Roof {
+    align_scope("y_up");
+    roof("gable", pitch, 0.3);
+}
+
+rule StreetElevation {
+    split(y) {
+        repeat { storey : { Storey(); } }
+    }
+}
+
+rule Storey {
+    split(x) {
+        ~1.0 : { Brick(); }
+        1.2  : { Sash(); }
+        ~1.0 : { Brick(); }
+        1.2  : { Sash(); }
+        ~1.0 : { Brick(); }
+    }
+}
+
+rule Sash  { window(0.0, 0.12); }
+rule Brick { wall_panel(); }
+
+rule Garden {}
