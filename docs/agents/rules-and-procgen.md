@@ -92,6 +92,48 @@ Two traps:
   time and never persisted, so inserting a row is safe — but nothing may cache
   that index across a parse.
 
+## Geometry invariants
+
+Four rules that `shape.cpp` keeps and every consumer reads. All four were
+broken at some point, and none of the ~1,500 tests over the file noticed.
+
+**Material is on the left of every directed edge.** The outer ring is wound
+counter-clockwise and every hole clockwise, and that is the entire point of
+the opposite winding: it means ONE rule covers both rings. The left normal
+`{-dir.y, dir.x}` points into the material either way, so moving every edge
+along it shrinks the material — which draws the outline in AND pushes a hole
+boundary out. An inset of the face **grows** its holes. A per-ring sign here is
+always a bug; it made `taper` on a courtyard footprint slope the hole wall the
+wrong way and overhang the void.
+
+**Handedness lives in the frame, and only in the frame.** `mirror_scope()`
+makes `Scope::axes` left-handed on purpose and `orthonormalise()` preserves
+that on purpose. The local face loops still keep their contract — wound
+counter-clockwise seen from outside — so a local signed volume stays positive
+whatever the frame is doing. `reframe()` re-winds on a handedness change to
+make that true, and `append_shape_to_mesh()` emits the reversed triple when the
+frame is left-handed. **Both are needed**: the two orders
+(`extrude; mirror_scope` and `mirror_scope; extrude`) fail for opposite
+reasons, so a patch to one alone cancels itself out.
+
+**Everything planar goes through Clipper2 on a 1e-5 integer grid.** That is
+`kClipperScale`, 10 µm, and it is the real resolution of `offset`, `setback`
+and anything else that round-trips through `to_path()`. A distance below one
+count moves nothing, so both operations refuse one rather than report success
+having done nothing. Two consequences worth knowing: a Clipper round-trip with
+no offset at all can still move a coordinate by up to a count, and a partition
+assertion (`inner + border == original`) holds to about 1e-4 m² on a footprint
+that is not grid-aligned, not to 1e-9. Every test dimension that is a round
+number hides this.
+
+**The scope is a tight box.** After any operation,
+`min(positions) == (0,0,0)` and `max(positions) == scope.size`, with
+orthonormal axes. `refit_scope()` maintains it and is called on every path that
+touches geometry. The documented exception is a shape with NO geometry: its
+scope is whatever was set, untouched, so a rule can build a frame and then
+insert an asset into it. `scale` is the only operation that can set that
+scope's size — it special-cases the empty shape for exactly this reason.
+
 ## Determinism
 
 Same rule text, same seed, same input shape, byte-identical output on any
