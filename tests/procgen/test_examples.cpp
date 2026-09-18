@@ -62,7 +62,7 @@ namespace {
 
 /// How many .rule files examples/rules/ holds. See the header: this is pinned
 /// on purpose, so adding one is a deliberate act rather than an accident.
-constexpr size_t kExampleCount = 13;
+constexpr size_t kExampleCount = 14;
 
 struct Example {
     const char* file;
@@ -96,6 +96,7 @@ constexpr Example kExamples[] = {
     // rectangle it still runs and takes every default, which is the fallback
     // path and worth holding to as well.
     {"13_from_osm_tags.rule",     16.0, 12.0, 100,  1200},
+    {"14_materials.rule",         14.0, 10.0,  50,   600},
 };
 
 [[nodiscard]] std::filesystem::path examples_dir() {
@@ -311,6 +312,53 @@ TEST(Examples, no_flat_roof_in_an_example_is_a_one_sided_plane) {
             }
         }
     }
+}
+
+TEST(Examples, the_materials_example_assigns_the_variants_it_documents) {
+    // 14_materials.rule exists to show materials working. Every other test in
+    // this file would pass for a version of it that assigned none at all --
+    // it would still parse, still generate, still make geometry.
+    //
+    // The variants are a published vocabulary shared with the OSM importer
+    // (osm/road/road_style.hpp), so these are the numbers a rule and an import
+    // agree on: wall 1 brick, 2 stone, 5 glass, 6 metal; roof 2 slate.
+    std::string source;
+    CHECK_TRUE(read_file(examples_dir() / "14_materials.rule", source));
+    const ParseResult parsed = parse(source, "14_materials.rule");
+    CHECK_TRUE(parsed.ok());
+    if (!parsed.ok()) return;
+
+    const GenerationResult result =
+        generate(parsed.file, shape_from_rect(14.0, 10.0), GenerationOptions{},
+                 &full_operations(), &full_functions());
+    CHECK_TRUE(result.ok());
+
+    stratum::Mesh mesh = result.build_mesh();
+    mesh.sort_submeshes_by_material();
+
+    auto triangles_of = [&](stratum::MaterialId slot, uint16_t variant) {
+        size_t n = 0;
+        for (const stratum::SubMesh& sub : mesh.effective_submeshes()) {
+            if (sub.material == slot && sub.variant == variant) n += sub.index_count / 3;
+        }
+        return n;
+    };
+
+    // Brick, stone and metal are set by the file itself.
+    CHECK((triangles_of(stratum::MaterialId::Wall, 1)) > 0);
+    CHECK((triangles_of(stratum::MaterialId::Wall, 2)) > 0);
+    CHECK((triangles_of(stratum::MaterialId::Wall, 6)) > 0);
+    // Slate, set on the roof.
+    CHECK((triangles_of(stratum::MaterialId::Roof, 2)) > 0);
+
+    // Glass is NOT set by the file -- window() assigns it. This is the check
+    // that would have caught facade_material() casting the part ordinal, which
+    // put glazing on variant 3, the concrete slot.
+    CHECK((triangles_of(stratum::MaterialId::Wall, 5)) > 0);
+    CHECK_EQ(triangles_of(stratum::MaterialId::Wall, 3), size_t{0});
+
+    // And the whole thing is a handful of ranges, not one per window part.
+    CHECK((mesh.effective_submeshes().size()) <= 12);
 }
 
 TEST(Examples, no_example_hits_a_generation_cap) {

@@ -17,6 +17,7 @@ headlessly through `full_operations()`.
 | `06_warehouse.rule` | 48 × 24 | One enormous span: structural bays, roller doors, a continuous clerestory |
 | `07_by_attribute.rule` | 16 × 12 | One file, four building types, chosen by an `attr`. Copy this for a rule pack. |
 | `08_stochastic_street.rule` | 60 × 14 | Variety that reproduces exactly. `choose`, `random.*`, and why the seeding works |
+| `14_materials.rule` | 14 × 10 | Six materials on one building. **Needs PBR shader mode.** |
 
 ## Running rules on an imported city
 
@@ -45,6 +46,11 @@ pitched roof because real outlines have spike corners — issue #133, waiting on
 `cleanup()`.
 
 ## Materials
+
+**`14_materials.rule` is the example.** A brick building with a stone plinth,
+a glazed shopfront, a metal-clad attic storey and a slate roof — six materials
+on one building. Turn on **Render Settings → Shader Mode → PBR** first, or it
+all draws grey.
 
 `material(slot, variant)` tags the current shape's faces. The slots are
 `renderer/mesh.hpp`'s, lower-cased: `default`, `asphalt`, `concrete`, `curb`,
