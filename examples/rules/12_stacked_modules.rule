@@ -88,4 +88,7 @@ rule Wall {
 rule Glazing  { window(0.0, 0.16, 0.05, 0.04); }
 rule Rail     { wall_panel(0.0, 0.12); }
 rule Panel    { wall_panel(); }
-rule RoofDeck { wall_panel(); }
+// A real slab, not a bare panel: `wall_panel()` with no thickness is one
+// quad, one-sided, with no underside. On a stack of cantilevered modules the
+// underside is the thing you actually see from the terrace below.
+rule RoofDeck { wall_panel(0.0, 0.22); }

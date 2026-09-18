@@ -229,6 +229,86 @@ TEST(Examples, every_example_generates_geometry_without_an_error) {
     }
 }
 
+TEST(Examples, every_example_survives_a_range_of_seeds) {
+    // Every other test in this file runs at seed 0, which is one draw out of
+    // 2^64. An example whose `choose` or `random.*` picks a branch that fails
+    // -- a plot too small for its inset, a footprint too thin for its roof --
+    // passes at seed 0 and breaks for the person who moves the slider.
+    //
+    // That is not hypothetical. The seed decides, per plot, whether
+    // 10_recursive_district builds a house, a block or a tower, and the three
+    // take different roofs: at seed 5 it is 6 flat to 18 pitched, at seed 1 it
+    // is 14 to 13. Any defect on one of those branches is a defect that
+    // appears and disappears as the seed changes, which is exactly the report
+    // that found the last one.
+    for (const Example& example : kExamples) {
+        std::string source;
+        CHECK_TRUE(read_file(examples_dir() / example.file, source));
+        const ParseResult parsed = parse(source, example.file);
+        CHECK_TRUE(parsed.ok());
+        if (!parsed.ok()) continue;
+
+        for (uint64_t seed = 1; seed <= 6; ++seed) {
+            GenerationOptions options;
+            options.seed = seed;
+            const GenerationResult result =
+                generate(parsed.file, shape_from_rect(example.width, example.depth),
+                         options, &full_operations(), &full_functions());
+
+            const std::string error = first_error(result);
+            if (!error.empty()) {
+                std::printf("  %s at seed %llu: %s\n", example.file,
+                            static_cast<unsigned long long>(seed), error.c_str());
+            }
+            CHECK_TRUE(error.empty());
+            CHECK_FALSE(result.stats.depth_limit_hit);
+            CHECK_FALSE(result.stats.shape_limit_hit);
+
+            // Still a building, not a husk. The floors are the seed-0 ones
+            // halved, because a different draw legitimately builds less.
+            CHECK((result.terminals.size()) >= example.min_terminals / 2);
+        }
+    }
+}
+
+TEST(Examples, no_flat_roof_in_an_example_is_a_one_sided_plane) {
+    // `wall_panel()` with no thickness is a single quad: two triangles, one
+    // side, no underside. It vanishes edge-on and from below, and it exports
+    // as a building with a hole in the top.
+    //
+    // A rule named like a roof that produces one face is almost always this
+    // mistake, so every terminal whose rule name looks like a cap is required
+    // to be a solid. Checked across seeds, because which buildings get a flat
+    // cap rather than a pitched roof is itself a draw.
+    for (const Example& example : kExamples) {
+        std::string source;
+        CHECK_TRUE(read_file(examples_dir() / example.file, source));
+        const ParseResult parsed = parse(source, example.file);
+        if (!parsed.ok()) continue;
+
+        for (uint64_t seed = 0; seed <= 3; ++seed) {
+            GenerationOptions options;
+            options.seed = seed;
+            const GenerationResult result =
+                generate(parsed.file, shape_from_rect(example.width, example.depth),
+                         options, &full_operations(), &full_functions());
+            for (const Shape& terminal : result.terminals) {
+                const bool looks_like_a_cap =
+                    terminal.rule.find("FlatTop") != std::string::npos ||
+                    terminal.rule.find("RoofDeck") != std::string::npos;
+                if (!looks_like_a_cap) continue;
+                if (terminal.geometry.faces.size() <= 1) {
+                    std::printf("  %s seed %llu: '%s' is a one-sided plane; "
+                                "a flat roof wants wall_panel(0.0, thickness)\n",
+                                example.file, static_cast<unsigned long long>(seed),
+                                terminal.rule.c_str());
+                }
+                CHECK((terminal.geometry.faces.size()) > 1);
+            }
+        }
+    }
+}
+
 TEST(Examples, no_example_hits_a_generation_cap) {
     // A cap means the output was truncated, so the example is showing a
     // fragment of the building it describes. An example is exactly the wrong
