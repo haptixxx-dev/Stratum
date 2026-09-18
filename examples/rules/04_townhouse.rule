@@ -1,0 +1,83 @@
+// One townhouse, in detail. The example to read first.
+//
+// Everything here is deliberate at a scale you can check by hand: a door on
+// the ground floor, sash windows above it, a string course between the floors,
+// and a hipped roof with an overhang. Change one number and you can see which
+// part moved.
+//
+// Seed: a narrow plot, about 7 x 10 m.
+
+attr storeys : float = 3.0
+attr storey  : float = 3.0
+attr pitch   : float = 42.0
+
+@start
+rule House {
+    floors(storeys, storey);
+    select face {
+        front : { Front(); }
+        back  : { Back(); }
+        side  : { Gable(); }
+        top   : { Roof(); }
+    }
+}
+
+// The front is the only elevation with a door, and the door is on the ground
+// floor because the ground floor is the first part of the split -- not because
+// `door()` knows where it is. It does not. Put it higher in the split and you
+// get a door into thin air.
+rule Front {
+    split(y) {
+        storey : { GroundFloor(); }
+        0.25   : { StringCourse(); }
+        repeat { storey : { UpperFloor(); } }
+    }
+}
+
+rule GroundFloor {
+    split(x) {
+        ~1.0 : { Brick(); }
+        1.1  : { Doorway(); }
+        0.4  : { Brick(); }
+        1.4  : { BaySash(); }
+        ~1.0 : { Brick(); }
+    }
+}
+
+rule UpperFloor {
+    split(x) {
+        ~1.0 : { Brick(); }
+        1.2  : { Sash(); }
+        ~1.0 : { Brick(); }
+        1.2  : { Sash(); }
+        ~1.0 : { Brick(); }
+    }
+}
+
+// The back gets windows but no door, and plainer ones.
+rule Back {
+    split(y) { repeat { storey : { UpperFloor(); } } }
+}
+
+// A gable wall is blind. Terraced houses share it with the neighbour.
+rule Gable { wall_panel(); }
+
+rule Roof {
+    align_scope("y_up");
+    roof("hip", pitch, 0.4);
+}
+
+// door(inset, reveal, frame, threshold). The threshold is what stops the door
+// floating a centimetre above the pavement.
+rule Doorway { door(0.0, 0.15, 0.06, 0.05); }
+
+// window(inset, reveal, frame, sill, thickness).
+rule Sash    { window(0.0, 0.14, 0.05, 0.06); }
+rule BaySash { window(0.0, 0.20, 0.05, 0.08); }
+
+// A band between the floors. `wall_panel(inset, thickness)` refuses a NEGATIVE
+// inset, so the course cannot be made to jut out past the wall -- it is a
+// thicker slab in the same plane, not a projecting cornice. Worth knowing
+// before you reach for it.
+rule StringCourse { wall_panel(0.0, 0.12); }
+rule Brick        { wall_panel(); }

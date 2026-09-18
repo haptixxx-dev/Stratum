@@ -1,0 +1,64 @@
+// A perimeter block around a courtyard.
+//
+// The European city block: built right up to the street on all four sides,
+// hollow in the middle. `courtyard(depth)` carries the hole through the
+// massing instead of filling it in, so the inner faces are real walls that the
+// facade rules reach through `select face`.
+//
+// ONE LIMITATION WORTH KNOWING. `shed` is the only roof kind that carries
+// interior rings. The straight skeleton does not handle holes -- see issue
+// #127 -- so `roof("hip", ...)` on this mass is REFUSED rather than given a
+// roof over the courtyard, which would be land that does not exist.
+//
+// Seed: a big rectangle, about 60 x 40 m.
+
+attr storey    : float = 3.2
+attr levels    : float = 5.0
+attr yard_size : float = 14.0
+
+@start
+rule Block {
+    courtyard(yard_size);
+    floors(levels, storey);
+    select face {
+        vertical : { Elevation(); }
+        top      : { Roof(); }
+    }
+}
+
+// `vertical` picks every upright face, which here is the four street
+// elevations AND the four courtyard walls. They get the same treatment, which
+// is what a real perimeter block does -- the yard side is plainer, but it is
+// still windows in brick.
+rule Elevation {
+    split(y) {
+        4.0 : { Ground(); }
+        repeat { storey : { Storey(); } }
+    }
+}
+
+rule Ground {
+    split(x) { repeat { 4.0 : { ShopFront(); } } }
+}
+
+rule ShopFront {
+    split(x) { 0.4 : { Pier(); } ~1.0 : { Glass(); } 0.4 : { Pier(); } }
+}
+
+rule Storey {
+    split(x) { repeat { 2.6 : { Bay(); } } }
+}
+
+rule Bay {
+    split(x) { ~1.0 : { Brick(); } 1.1 : { Sash(); } ~1.0 : { Brick(); } }
+}
+
+rule Roof {
+    align_scope("y_up");
+    roof("shed", 12.0);
+}
+
+rule Glass { window(0.0, 0.2); }
+rule Sash  { window(0.0, 0.14); }
+rule Brick { wall_panel(); }
+rule Pier  {}

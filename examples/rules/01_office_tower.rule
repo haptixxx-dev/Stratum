@@ -1,0 +1,70 @@
+// A podium-and-tower office block.
+//
+// The shape a planning envelope forces on a city centre: a wide base that
+// fills its plot, and a narrower tower stepping back above it so the street
+// below still sees the sky. `podium(base, tower, inset, steps)` composes it in
+// one operation; steps > 1 makes a wedding cake.
+//
+// Seed: a rectangle about 30 x 20 m.
+
+attr base_height  : float = 12.0
+attr tower_height : float = 48.0
+attr setback      : float = 2.0
+attr steps        : float = 3.0
+
+@start
+rule Main {
+    podium(base_height, tower_height, setback, steps);
+    select face {
+        front : { Elevation(); }
+        back  : { Elevation(); }
+        left  : { Elevation(); }
+        right : { Elevation(); }
+    }
+}
+
+// Every elevation is the same curtain wall, floor by floor. The repeat tiles
+// whatever height the step it landed on happens to be, so the tower and the
+// podium share one rule and neither needs to know its own height.
+rule Elevation {
+    split(y) {
+        4.5 : { GroundFloor(); }
+        repeat { 3.5 : { Storey(); } }
+    }
+}
+
+// The band at the foot of each tier. On the podium it is the lobby; on a tower
+// tier it is the plant level behind the terrace the setback just created. Both
+// want the same thing: a taller, more open bay than the storeys above.
+//
+// It is NOT a doorway. A rule cannot ask how high up it is -- there is no
+// function that reads the scope position -- so a `door()` here would put a
+// street entrance on the eighteenth floor. See 04_townhouse.rule for doors.
+rule GroundFloor {
+    split(x) {
+        ~1.0 : { Pier(); }
+        repeat { 3.0 : { LobbyBay(); } }
+        ~1.0 : { Pier(); }
+    }
+}
+
+rule LobbyBay {
+    split(x) { 0.3 : { Pier(); } ~1.0 : { Glazing(); } 0.3 : { Pier(); } }
+}
+
+// A deep reveal reads as a real office window from street level. The default
+// reveal is shallow, which suits a house and not a tower.
+rule Storey {
+    split(x) { repeat { 2.4 : { OfficeBay(); } } }
+}
+
+rule OfficeBay {
+    split(x) {
+        0.5 : { Mullion(); }
+        ~1.0 : { Glazing(); }
+    }
+}
+
+rule Glazing { window(0.0, 0.25); }
+rule Pier     {}
+rule Mullion  {}

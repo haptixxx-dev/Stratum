@@ -1,0 +1,122 @@
+// A church: nave, tower, spire, and a dome over the crossing.
+//
+// This one is about STACKING masses. A rule splits the plot along z into three
+// bands, and each band becomes a different building with a different roof, so
+// one seed rectangle produces four roof kinds in one generation.
+//
+// The spire is a steep `roof("pyramid", ...)` rather than a `taper`. Taper
+// insets by its HEIGHT on every edge, so a ten metre taper on a six metre
+// tower collapses the outline and is refused -- correctly. A pyramid takes a
+// PITCH, so the same six metre tower at 72 degrees gives a spire about 9 m
+// tall and cannot collapse.
+//
+// Seed: about 30 x 14 m, long axis along x.
+
+attr nave_height   : float = 9.0
+attr tower_height  : float = 18.0
+attr spire_pitch   : float = 72.0
+
+@start
+rule Church {
+    split(x) {
+        6.0  : { Tower(); }
+        ~1.0 : { Nave(); }
+        8.0  : { Apse(); }
+    }
+}
+
+// The tower rises, then its top face becomes the spire: a taper to a point,
+// which is a pyramid raised the hard way and is what `taper` is for.
+// The tower takes a square footprint out of its band, so the spire above it is
+// square too. A pyramid on a 6 x 14 plan would be a long hip, not a spire.
+rule Tower {
+    split(z) {
+        6.0  : { TowerMass(); }
+        ~1.0 : { Porch(); }
+    }
+}
+
+rule TowerMass {
+    extrude(tower_height);
+    select face {
+        vertical : { TowerWall(); }
+        top      : { Spire(); }
+    }
+}
+
+rule Spire {
+    align_scope("y_up");
+    roof("pyramid", spire_pitch);
+}
+
+rule Porch {
+    extrude(4.0);
+    select face { vertical : { Stone(); } top : { PorchRoof(); } }
+}
+
+rule PorchRoof {
+    align_scope("y_up");
+    roof("shed", 25.0);
+}
+
+rule TowerWall {
+    split(y) {
+        repeat { 6.0 : { TowerStage(); } }
+    }
+}
+
+// A belfry opening: tall, narrow, deeply recessed.
+rule TowerStage {
+    split(x) {
+        ~1.0 : { Stone(); }
+        0.9  : { Lancet(); }
+        ~1.0 : { Stone(); }
+    }
+}
+
+rule Nave {
+    extrude(nave_height);
+    select face {
+        front : { NaveWall(); }
+        back  : { NaveWall(); }
+        top   : { NaveRoof(); }
+    }
+}
+
+rule NaveRoof {
+    align_scope("y_up");
+    roof("gable", 55.0, 0.5);
+}
+
+rule NaveWall {
+    split(x) { repeat { 3.0 : { NaveBay(); } } }
+}
+
+rule NaveBay {
+    split(x) {
+        ~1.0 : { Buttress(); }
+        1.4  : { NaveWindow(); }
+        ~1.0 : { Buttress(); }
+    }
+}
+
+// The apse takes the dome. `roof("dome", rise)` reads its fourth argument as
+// the number of horizontal bands, so a low band count is a faceted cupola and
+// a high one is smooth.
+rule Apse {
+    extrude(7.0);
+    select face {
+        vertical : { Stone(); }
+        top      : { Dome(); }
+    }
+}
+
+rule Dome {
+    align_scope("y_up");
+    roof("dome", 5.0, 0.0, 12.0);
+}
+
+rule Lancet     { window(0.0, 0.25, 0.08, 0.05); }
+rule NaveWindow { window(0.0, 0.25, 0.08, 0.06); }
+rule Stone      { wall_panel(); }
+rule Buttress   { wall_panel(0.0, 0.3); }
