@@ -8,6 +8,7 @@
 #include "procgen/rules/op_facade.hpp"
 #include "procgen/rules/op_insert.hpp"
 #include "procgen/rules/op_mass.hpp"
+#include "procgen/rules/op_material.hpp"
 #include "procgen/rules/op_roof.hpp"
 
 namespace stratum::procgen::rules {
@@ -25,6 +26,7 @@ const OperationTable& full_operations() {
         register_mass_operations(t);
         register_facade_operations(t);
         register_insert_operations(t);
+        register_material_operations(t);
         return t;
     }();
     return table;

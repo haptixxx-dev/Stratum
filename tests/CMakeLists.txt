@@ -101,6 +101,7 @@ set(STRATUM_TEST_SOURCES
     procgen/test_op_control.cpp
     procgen/test_op_facade.cpp
     procgen/test_op_mass.cpp
+    procgen/test_op_material.cpp
     procgen/test_op_roof.cpp
     procgen/test_building_lod.cpp
     procgen/test_examples.cpp
@@ -154,6 +155,7 @@ set(STRATUM_TEST_SUITES
     OpControl
     OpFacade
     OpMass
+    OpMaterial
     OpRoof
     Registry
     RuleSeed

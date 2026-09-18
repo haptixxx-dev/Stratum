@@ -306,6 +306,18 @@ void Editor::run_rule_source() {
     // rule that stopped generating looks like a rule that still works.
     clear_rule_preview();
 
+    // One range per material, not one per facade part per window.
+    //
+    // facade_material() gives every part its own Wall variant -- panel 0,
+    // reveal 1, frame 2, glass 3, sill 4 -- and Mesh::append() only merges a
+    // range with the one before it. A facade emits those five in rotation, so
+    // nothing ever merges: ONE building of sixty windows comes out with 302
+    // submeshes, and a city of several hundred buildings with a draw call per
+    // window part.
+    //
+    // sort_submeshes_by_material() reorders the triangles so each material is
+    // one contiguous range, which is what it was written for.
+    combined.sort_submeshes_by_material();
     m_rule_preview_mesh = std::move(combined);
     if (m_rule_preview_mesh.vertices.empty() || !m_gpu_renderer) return;
 
@@ -500,6 +512,15 @@ void Editor::draw_rule_stats() {
                 "Past the Max buildings cap, or a footprint with fewer than "
                 "three usable points.");
         }
+    }
+
+    // The single most likely reason a carefully materialled building is grey.
+    // Said here rather than left in a header, because this is where the author
+    // is looking when they notice.
+    if (m_gpu_renderer && m_gpu_renderer->get_shader_mode() != ShaderMode::PBR &&
+        !m_rule_preview_mesh.vertices.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                           "Materials are only bound in PBR. Render Settings > Shader Mode.");
     }
 
     ImGui::Text("Preview: %zu vertices, %zu triangles",

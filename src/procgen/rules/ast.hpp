@@ -654,7 +654,7 @@ inline constexpr BuiltinOperation kBuiltinOperations[] = {
     {"footprint", 0, 0, "Replace the shape with its ground-plane outline"},
     {"inner_rect", 0, 0, "Replace the shape with its largest inscribed rectangle"},
     {"insert", 1, 1, "Insert an asset into the scope"},
-    {"material", 1, 1, "Assign a named material"},
+    {"material", 1, 2, "Assign a material slot and variant"},
     {"mirror", 1, 1, "Mirror the geometry about a scope plane"},
     {"mirror_scope", 1, 1, "Mirror the scope without moving the geometry"},
     {"normalize_uv", 0, 1, "Rescale a texture coordinate set into the unit square"},

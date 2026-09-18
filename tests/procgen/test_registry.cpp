@@ -170,10 +170,10 @@ TEST(Registry, the_tables_are_the_same_objects_every_call) {
 constexpr std::string_view kUnimplemented[] = {
     "center", "cleanup", "color", "convexify",
     "delete_holes", "delete_uv", "footprint", "inner_rect",
-    "material", "normalize_uv", "primitive", "project_uv",
-    "reduce", "report", "scale_uv", "scatter",
-    "setup_projection", "soften_normals", "texture", "tile_uv",
-    "translate_uv", "trim",
+    "normalize_uv", "primitive", "project_uv", "reduce",
+    "report", "scale_uv", "scatter", "setup_projection",
+    "soften_normals", "texture", "tile_uv", "translate_uv",
+    "trim",
 };
 
 TEST(Registry, the_unimplemented_catalogue_rows_are_exactly_the_expected_ones) {

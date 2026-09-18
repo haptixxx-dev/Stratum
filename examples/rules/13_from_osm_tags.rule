@@ -20,6 +20,12 @@
 //     osm.roof       string   flat, gable, hip, pyramid, shed, dome
 //     osm.name       string   only when the feature is named
 //
+// The walls and windows are already materialled without asking: wall_panel(),
+// window() and door() tag each part with its own variant of the Wall slot --
+// panel 0, reveal 1, frame 2, glass 3, sill 4 -- so the glass is separable
+// from the brick before any material() call. This file only overrides the
+// roof and the industrial cladding.
+//
 // `osm.roof` is deliberately spelled the way `roof()` spells its kinds. OSM
 // calls them skillion and pyramidal; the seeding translates, so a rule can
 // write `roof(attrs.get("osm.roof", "hip"))` with no lookup table of its own.
@@ -69,8 +75,14 @@ rule Cap {
     }
 }
 
-rule Pitched { roof(attrs.get("osm.roof", "hip"), 35.0, 0.3); }
-rule Deck    { wall_panel(0.0, 0.25); }
+rule Pitched { roof(attrs.get("osm.roof", "hip"), 35.0, 0.3); material("roof", 1); }
+// material(slot, variant) AFTER the geometry operation. wall_panel() tags its
+// own output through facade_material(), so a material set before it is thrown
+// away -- see src/procgen/rules/op_material.hpp.
+//
+// Nothing here is textured in Render Settings > Shader Mode > Simple. The
+// simple shader has no samplers at all; materials bind only in PBR.
+rule Deck    { wall_panel(0.0, 0.25); material("roof", 0); }
 
 // An industrial shed gets big openings and no domestic detail; everything else
 // gets storeys of windows.
@@ -122,4 +134,5 @@ rule Bay {
 rule Window     { window(0.0, 0.14, 0.05, 0.05); }
 rule RollerDoor { door(0.0, 0.10, 0.04, 0.02); }
 rule Wall       { wall_panel(); }
-rule Cladding   { wall_panel(); }
+// Industrial cladding reads as concrete rather than brick.
+rule Cladding   { wall_panel(); material("concrete", 0); }

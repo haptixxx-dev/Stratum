@@ -44,6 +44,33 @@ tagged `house` and 16,287 have a flat roof. About one in eight refuses a
 pitched roof because real outlines have spike corners — issue #133, waiting on
 `cleanup()`.
 
+## Materials
+
+`material(slot, variant)` tags the current shape's faces. The slots are
+`renderer/mesh.hpp`'s, lower-cased: `default`, `asphalt`, `concrete`, `curb`,
+`sidewalk`, `markings`, `gravel`, `dirt`, `grass`, `bridgedeck`, `parapet`,
+`wall`, `roof`.
+
+Three things worth knowing before you reach for it:
+
+- **The facade operations already assign materials.** `wall_panel()`,
+  `window()` and `door()` tag each part with its own variant of the `wall`
+  slot — panel 0, reveal 1, frame 2, glass 3, sill 4 — so the glass is already
+  separable from the brick without a single `material()` call.
+- **Order matters against them.** A `material()` call *before* `wall_panel()`
+  is thrown away, because the facade operation tags its own output.
+  `extrude`, `split` and `roof` leave the material alone; only the facade
+  family has this. Put `material()` after.
+- **Nothing is textured in `ShaderMode::Simple`.** The simple shader has no
+  samplers and no material uniform block, so the whole city draws flat grey
+  however carefully its materials are set. Render Settings → Shader Mode →
+  PBR. The rule editor says so when a preview exists and the mode is Simple.
+
+UVs are already a planar projection **in metres** in each face's own basis,
+with v running up the wall, so a texture tiles at real-world scale with no
+projection call. D8 (#45) adds control over that projection; it is not needed
+to have one.
+
 ## The recursive four
 
 These are the ones worth reading for what the language can actually do. None

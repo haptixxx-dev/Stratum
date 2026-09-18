@@ -212,6 +212,7 @@ add_library(stratum_core STATIC
     src/procgen/rules/op_facade.cpp
     src/procgen/rules/op_insert.cpp
     src/procgen/rules/op_mass.cpp
+    src/procgen/rules/op_material.cpp
     src/procgen/rules/op_roof.cpp
     src/procgen/rules/registry.cpp
     src/procgen/terrain_generator.cpp
