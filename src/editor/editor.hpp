@@ -108,6 +108,36 @@ private:
     void draw_render_settings();
     void draw_memory_panel();
 
+    /**
+     * @brief The rule editor: write a rule file, run it, see the building
+     *
+     * Defined in src/editor/panels/rule_panel.cpp, with the four helpers below.
+     * D1 to D4 built a language that until now could only be exercised from a
+     * test. This panel is the first place a person writes a rule and sees the
+     * geometry, which is the whole point of Track D.
+     */
+    void draw_rule_panel();
+
+    /// Source box, load/save, and the generate controls.
+    void draw_rule_source();
+
+    /// Every diagnostic from the last parse or run, with its caret line.
+    void draw_rule_diagnostics();
+
+    /// Terminal count, shape count, depth, caps hit, and the `print` log.
+    void draw_rule_stats();
+
+    /**
+     * @brief Parse the source, and run it when the parse allows
+     *
+     * Cheap enough to call on every edit for the parse; the RUN is what this
+     * guards. See m_rule_auto_run.
+     */
+    void run_rule_source();
+
+    /// Drop the preview mesh and its GPU handle. Safe to call with none.
+    void clear_rule_preview();
+
     // ------------------------------------------------------------------------
     // Colour-by-attribute viewport mode
     //
@@ -229,6 +259,7 @@ private:
     bool m_show_render_settings = false;
     bool m_show_memory_panel = false;
     bool m_show_material_panel = false;
+    bool m_show_rule_panel = false;
 
     // Render toggles
     bool m_render_areas = true;
@@ -496,6 +527,8 @@ private:
         MaterialOrm,     ///< ORM map for m_material_pick_key
         MaterialSetLoad, ///< A material set JSON to replace the whole library
         MaterialSetSave, ///< Destination to write the whole library to
+        RuleFileLoad,    ///< A .rule file to load into the rule editor
+        RuleFileSave,    ///< Destination to write the rule editor's source to
     };
     FilePickTarget m_file_pick_target = FilePickTarget::OsmFile;
 
@@ -1069,6 +1102,89 @@ private:
     procgen::TerrainTileManager m_terrain_tile_manager;
     procgen::TerrainTileConfig m_terrain_tile_config;
     bool m_use_chunked_terrain = true;  // Use new chunked system vs legacy single terrain
+
+    // ------------------------------------------------------------------------
+    // Rule editor (D10)
+    //
+    // Deliberately PLAIN types only. A RuleFile or a GenerationResult member
+    // would drag procgen/rules/ast.hpp and interpreter.hpp into every
+    // translation unit that includes editor.hpp, for a panel that parses on an
+    // edit and runs on a button. rule_panel.cpp holds both as locals and keeps
+    // only what it draws, which is the same discipline material_panel.cpp
+    // follows with MaterialLibrary.
+    // ------------------------------------------------------------------------
+
+    /// The rule text being edited. ImGui resizes it through a callback.
+    std::string m_rule_source;
+
+    /// Last path loaded or saved, shown in the header and used as the save default
+    std::string m_rule_path;
+
+    /// One line under the load/save row: what the last file action did
+    std::string m_rule_status;
+
+    /**
+     * @brief Re-run on every edit
+     *
+     * Off by default, and that is not timidity. A rule file is a program, and an
+     * author halfway through typing a recursive rule has written a program that
+     * does not terminate. The depth and shape caps bound it -- see
+     * InterpreterLimits -- so the worst case is a stall rather than a hang, but a
+     * stall on every keystroke makes the editor unusable. The PARSE runs on every
+     * edit regardless: it is cheap, it cannot loop, and it is what puts a caret
+     * under a typo while the author is still looking at it.
+     */
+    bool m_rule_auto_run = false;
+
+    /// Source changed since the last run. Drives the "stale" marker on the output.
+    bool m_rule_dirty = false;
+
+    /// The seed shape: a rectangle of this size on the ground plane, in metres
+    float m_rule_seed_width = 12.0f;
+    float m_rule_seed_depth = 10.0f;
+
+    /// GenerationOptions::seed. An int because ImGui has no uint64 scalar widget.
+    int m_rule_seed = 0;
+
+    /**
+     * @brief Diagnostics from the last parse or run, already rendered
+     *
+     * Rendered rather than stored as Diagnostic for the include reason above.
+     * Each entry is the full multi-line render_diagnostic() output, caret and
+     * all, so a parse error and a runtime error look identical to the reader --
+     * which is the promise interpreter.hpp makes.
+     */
+    std::vector<std::string> m_rule_diagnostics;
+
+    /// True when any diagnostic was Severity::Error. Colours the list header.
+    bool m_rule_has_error = false;
+
+    /// Lines the `print` operation wrote, in evaluation order
+    std::vector<std::string> m_rule_log;
+
+    /// GenerationStats from the last run, unpacked so no header is needed
+    uint32_t m_rule_terminals = 0;
+    uint32_t m_rule_shapes = 0;
+    uint32_t m_rule_rules_invoked = 0;
+    uint32_t m_rule_operations = 0;
+    uint32_t m_rule_max_depth = 0;
+    bool m_rule_depth_capped = false;
+    bool m_rule_shape_capped = false;
+
+    /// True once a run has happened, so the output pane can say "not run yet"
+    bool m_rule_has_run = false;
+
+    /**
+     * @brief The generated preview
+     *
+     * Uploaded as MeshOwner::Kind::Pinned, for the reason that kind exists:
+     * there is exactly one, the user pressed a button to make it, and it does
+     * not stream back in on its own. An eviction would make it vanish with no
+     * way to tell that from a rule that generated nothing.
+     */
+    Mesh m_rule_preview_mesh;
+    uint32_t m_rule_preview_gpu_id = 0;
+    bool m_render_rule_preview = true;
 };
 
 } // namespace stratum

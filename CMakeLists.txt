@@ -206,6 +206,7 @@ add_library(stratum_core STATIC
     src/procgen/rules/op_split.cpp
     src/procgen/rules/op_comp.cpp
     src/procgen/rules/op_control.cpp
+    src/procgen/rules/registry.cpp
     src/procgen/terrain_generator.cpp
     src/procgen/terrain_carve.cpp
     src/procgen/terrain_mesh_builder.cpp
@@ -289,6 +290,7 @@ add_library(stratum_editor_lib STATIC
     src/editor/im3d_impl.cpp
     src/editor/panels/procgen_panel.cpp
     src/editor/panels/material_panel.cpp
+    src/editor/panels/rule_panel.cpp
 )
 
 target_include_directories(stratum_editor_lib PUBLIC

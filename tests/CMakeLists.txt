@@ -99,6 +99,7 @@ set(STRATUM_TEST_SOURCES
     procgen/test_op_split.cpp
     procgen/test_op_comp.cpp
     procgen/test_op_control.cpp
+    procgen/test_registry.cpp
 
     # Attribute-mode colour tables: totality, determinism and separation.
     osm/test_attribute_palette.cpp
@@ -141,6 +142,7 @@ set(STRATUM_TEST_SUITES
     OpSplit
     OpComp
     OpControl
+    Registry
     StraightSkeleton
     LotsOffset
     GraphEdit

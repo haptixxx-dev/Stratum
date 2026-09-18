@@ -8,8 +8,9 @@ subsystem guides live in `docs/agents/`:
 | Guide | Covers | State |
 |---|---|---|
 | `docs/agents/build-test-run.md` | presets, build options, the test suite, submodules, Doxygen | complete |
-| `docs/agents/core-and-osm.md` | `src/core`, `src/osm` and the coordinate chain | `src/osm/road`, `src/geometry`, `src/procgen` still to be written |
+| `docs/agents/core-and-osm.md` | `src/core`, `src/osm` and the coordinate chain | `src/osm/road` and `src/geometry` still to be written |
 | `docs/agents/renderer-and-editor.md` | `src/renderer`, GPU resources, lighting v2 | shaders, `src/editor` and `src/editor/panels` still to be written |
+| `docs/agents/rules-and-procgen.md` | `src/procgen`, the rule engine, the operation catalogue, determinism | complete |
 
 Where a guide and this file disagree, the guide wins — it was written against
 the code more recently.
@@ -91,7 +92,10 @@ because they are absent.
   subdivision) and `graph_edit.*` (mutating the graph through the command stack).
 - `geometry/` — shared geometry utilities, including the ambient-occlusion baker.
 - `procgen/` — noise, heightmap terrain, terrain mesh building, tile management,
-  and heightmap import from PNG and PGM.
+  and heightmap import from PNG and PGM. `procgen/rules/` is the shape-grammar
+  engine — lexer, parser, interpreter, and the split/component/control
+  operations. It is the largest thing in `stratum_core`; read
+  `docs/agents/rules-and-procgen.md` before touching it.
 - `scene/` — the scene model, complete as of M2: the undo/redo command stack,
   the layer tree, typed attributes with layer inheritance, selection,
   georeferencing, and save/load. **Every mutation of the scene goes through
