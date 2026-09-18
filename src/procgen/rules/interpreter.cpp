@@ -6,13 +6,22 @@
  * @brief The evaluator, the D2 operation handlers and the D2 function library
  *
  * The reasoning is in interpreter.hpp. What is here is the machinery, plus the
- * local notes on the four places it is not obvious: the unwinding type, the
+ * local notes on the five places it is not obvious: the unwinding type, the
  * lazy symbol resolution that lets a constant and an attribute refer to each
  * other in either order, the per-site salt that keeps two `choose` statements in
- * one rule independent, and the argument coercion every handler shares.
+ * one rule independent, the argument coercion every handler shares, and
+ * begin_child(), through which every child shape in the language is born.
+ *
+ * The geometry of `split` and `select` is NOT here. It is in op_split.cpp and
+ * op_comp.cpp, and this file is the seat those two are wired into: the sizing
+ * solver, the slab cut and the component decomposition know nothing about
+ * frames, seeds or caps, and everything about frames, seeds and caps is here.
  */
 
 #include "procgen/rules/interpreter.hpp"
+
+#include "procgen/rules/op_comp.hpp"
+#include "procgen/rules/op_split.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -582,20 +591,29 @@ struct Interpreter::State {
      * The switch below has no `default:` so that -Wswitch names a StmtKind that
      * was added without a case here. A WARNING is not a guarantee: nothing in
      * this tree sets -Werror, so a missing case builds, and the fallthrough past
-     * the switch would then be a silent no-op -- exactly the failure that the
-     * `split` and `select` arms go out of their way to reject. Two things close
-     * that:
+     * the switch would then be a silent no-op -- a rule statement that does
+     * nothing at all, which is the failure this whole language most has to
+     * avoid. Two things close that:
      *
      *   - the static_assert below, which is a hard compile error the moment
      *     ast.hpp's StmtNode grows an alternative, and which says what to do;
      *   - the report past the switch, so that even a build which somehow got
      *     past both says so at the line that asked, once per site, instead of
      *     quietly producing a building with no floors in it.
+     *
+     * The arms are wired DIRECTLY, not through a registry. interpreter.hpp says
+     * why: a statement is a variant alternative, the population is `split`,
+     * `select` and a possible `scatter`, and a table of function pointers would
+     * buy indirection for three cases at the cost of the one file where control
+     * flow has to read top to bottom. What makes a fourth statement cheap is not
+     * a registry but begin_child() and run_statement_body(), which already own
+     * everything a statement child needs.
      */
     Flow exec(StmtId id, Shape& shape, Frame& frame) {
-        // D3 and D4 add StmtKinds. When one is added this assert fires, and the
-        // fix is to give the switch below a case for it -- not to widen the
-        // number. A statement with no case is a rule that silently does nothing.
+        // A later feature adds a StmtKind. When one is added this assert fires,
+        // and the fix is to give the switch below a case for it -- not to widen
+        // the number. A statement with no case is a rule that silently does
+        // nothing.
         static_assert(std::variant_size_v<StmtNode> == 9,
                       "ast.hpp gained a statement kind. Add its case to State::exec() "
                       "and then update this count.");
@@ -642,18 +660,9 @@ struct Interpreter::State {
             case StmtKind::Choose:
                 return exec_choose(std::get<ChooseStmt>(stmt.node), stmt, shape, frame);
             case StmtKind::Split:
-                // D3. Reported once per site rather than per shape, and evaluation
-                // CONTINUES: the rest of the rule still produces its geometry, so
-                // the author sees a building missing its floors rather than
-                // nothing at all.
-                report_once(Severity::Error, stmt.loc,
-                            "'split' is not implemented in this build");
-                return Flow::Continue;
+                return exec_split(std::get<SplitStmt>(stmt.node), stmt, shape, frame);
             case StmtKind::Select:
-                // D4, same treatment as split.
-                report_once(Severity::Error, stmt.loc,
-                            "'select' is not implemented in this build");
-                return Flow::Continue;
+                return exec_select(std::get<SelectStmt>(stmt.node), stmt, shape, frame);
             case StmtKind::Scope: {
                 const ScopeStmt& node = std::get<ScopeStmt>(stmt.node);
                 // The axes and the pivot are saved; the BOX is not, because under
@@ -805,19 +814,99 @@ struct Interpreter::State {
             args.push_back(eval(arg, shape));
         }
 
-        Shape child = shape;
-        child.rule = call.callee.name;
-        child.loc = stmt.loc;
-        child.depth = shape.depth + 1;
-        child.index = frame.children;
-        child.parent = shape.id;
-        // The child's address in the tree: its parent's address mixed with its
-        // own sibling index. Never a draw from a shared stream -- see the
-        // determinism note in interpreter.hpp.
-        child.seed_key =
-            seed_mix2(shape.seed_key, seed_mix2(kSaltChild, child.index));
+        // A rule call's child starts as a COPY of the caller's shape: the callee
+        // transforms what it was handed. A statement child starts as a slab or a
+        // component instead, which is the only difference between the three.
+        Shape child;
+        if (begin_child(shape, frame, shape, call.callee.name, stmt.loc, child) !=
+            ChildOutcome::Ready) {
+            return;
+        }
 
-        if (!allocate_shape(child, stmt.loc)) {
+        invoke_rule(call.rule, std::move(child), args, stmt.loc);
+    }
+
+    // ---- statement children ----
+
+    /**
+     * @brief What begin_child() did
+     *
+     * Only Ready leaves the caller anything to do. Both other outcomes have
+     * already reported and already done whatever the cap asks for, so a caller
+     * that treats them alike -- go on to the next sibling -- is correct.
+     */
+    enum class ChildOutcome : uint8_t {
+        Ready,     ///< @p out is a live child shape
+        Refused,   ///< The shape cap said no. Nothing was created, nothing emitted.
+        Truncated  ///< The depth cap cut it. The child was emitted as a terminal.
+    };
+
+    /**
+     * @brief Give a shape a child, or say why there is no body to run
+     *
+     * EVERY child in this language is born here. A rule call, a split slab and a
+     * `select` component are the same act -- one shape handing out an address in
+     * the tree -- and differ only in what content goes in and what runs against
+     * it afterwards. The four lines that carry the language's promises live here
+     * exactly once: the sibling index, the seed mix, the shape cap and the depth
+     * cap. A statement family that copied them instead would be a working split
+     * and a subtly different seed, which no test reads as a failure until a
+     * reproduction case stops reproducing.
+     *
+     * @param parent  Shape the child hangs off. Not modified.
+     * @param frame   The enclosing rule's frame. Its child counter IS the child's
+     *                sibling index, and is advanced here.
+     * @param content Geometry, scope and attributes for the child. Its tree
+     *                fields -- rule, loc, depth, index, parent, seed_key, id --
+     *                are all overwritten, so a caller passes the parent, a slab
+     *                or a component and does not have to know which fields
+     *                travel.
+     * @param role    Rule name to record: "Floor", "split[2]", "select.front[0]"
+     * @param loc     Where the rule asked, for the cap diagnostics
+     * @param out     Receives the child, and only when the result is Ready
+     */
+    /// How a child is addressed within its parent, which is what its seed is
+    /// mixed from.
+    ///
+    /// Sibling order is right for a rule call and for a split part: the third
+    /// slab is the third slab whatever else the rule does. It is WRONG for a
+    /// `select` arm. A component child is "face 3 of this solid", and keying it
+    /// by claim order means adding a `bottom:` arm renumbers every `front:`
+    /// child and reshuffles its random variation -- the author edits one arm and
+    /// the rest of the building changes. That is the same stable-identity
+    /// problem lots.cpp solves for lot ids, and it has the same answer: address
+    /// the thing by what it IS.
+    enum class ChildAddress { Sibling, Component };
+
+    ChildOutcome begin_child(const Shape& parent,
+                             Frame& frame,
+                             Shape content,
+                             std::string role,
+                             const SourceLoc& loc,
+                             Shape& out,
+                             ChildAddress addressing = ChildAddress::Sibling,
+                             uint32_t component_index = 0) {
+        content.rule = std::move(role);
+        content.loc = loc;
+        content.depth = parent.depth + 1;
+        content.index = frame.children;
+        content.parent = parent.id;
+        // The child's address in the tree: its parent's address mixed with its
+        // own address within the parent. Never a draw from a shared stream --
+        // see the determinism note in interpreter.hpp. Nothing outside this
+        // parent feeds the mix, so a split of four parts gives the same four
+        // keys on every run and whatever was generated before it.
+        //
+        // The salts differ so the two numbering schemes cannot collide:
+        // `rule Main { A(); select face { all : { P(); } } }` gives A index 0
+        // as a sibling and component 0 index 0 as a component, and they must
+        // not land on the same key.
+        content.seed_key =
+            addressing == ChildAddress::Component
+                ? seed_mix2(parent.seed_key, seed_mix2(kSaltComponent, component_index))
+                : seed_mix2(parent.seed_key, seed_mix2(kSaltChild, content.index));
+
+        if (!allocate_shape(content, loc)) {
             // The child does NOT count against the parent, so a parent whose
             // every child the cap refused is still a terminal and still emits
             // its own geometry. Counting it would turn "the output is
@@ -827,28 +916,294 @@ struct Interpreter::State {
             // No surviving shape's seed moves because of this: shapes_created
             // never decreases, so once one child is refused every later one is
             // too, and no shape that exists ever gets a different index.
-            return;
+            return ChildOutcome::Refused;
         }
         ++frame.children;
 
-        if (child.depth > options.limits.max_depth) {
+        // GenerationStats::max_depth_reached is NOT updated here. It counts the
+        // depth actually EVALUATED, and the child below has not been: a cap of 4
+        // that truncates at depth 5 reached 4. invoke_rule() and
+        // run_statement_body() record it, on the one path where the child is run.
+        if (content.depth > options.limits.max_depth) {
             if (!depth_reported) {
                 depth_reported = true;
                 result.stats.depth_limit_hit = true;
-                report(Severity::Error, stmt.loc,
-                       "the rule-call depth limit of " +
-                           std::to_string(options.limits.max_depth) + " was reached at '" +
-                           call.callee.name +
+                report(Severity::Error, loc,
+                       "the depth limit of " + std::to_string(options.limits.max_depth) +
+                           " was reached at '" + content.rule +
                            "'; the recursion was cut and the shape emitted as it stood");
             }
             // Emitted rather than dropped. Dropping it would leave a runaway
             // tower with no output at all, because every shape above it is
-            // non-terminal by virtue of having made a child.
-            emit_terminal(std::move(child));
-            return;
+            // non-terminal by virtue of having made a child. Statement children
+            // come through here for the same reason: a rule that splits and then
+            // calls itself runs away exactly as readily as one that only calls
+            // itself, and a cap that produced NO output would be the worse of
+            // the two failures in both cases.
+            emit_terminal(std::move(content));
+            return ChildOutcome::Truncated;
         }
 
-        invoke_rule(call.rule, std::move(child), args, stmt.loc);
+        out = std::move(content);
+        return ChildOutcome::Ready;
+    }
+
+    /**
+     * @brief Run a split part's or a `select` arm's body against its child shape
+     *
+     * This is invoke_rule() minus the two things that make a CALL a call, and
+     * the subtraction is the point.
+     *
+     * No parameters, because a body has none. And no move of State::frame_base,
+     * because a body is written inside the rule it belongs to and must read that
+     * rule's bindings: `split(y) { storey : { Floor(storey); } }` is the ordinary
+     * way to write a facade, and it only works if `storey` is still in view. Its
+     * OWN lets do not leak back out -- the language was dynamically scoped until
+     * two days ago, and a body that left its bindings behind would put half of
+     * that back on the error path without touching lookup_name().
+     *
+     * Two resizes do that, and only one of them can fire. A body is a BlockStmt,
+     * and exec()'s Block case pops its own mark when it ENDS, so the resize on
+     * the normal path below is a backstop for a body that is not a block -- there
+     * is none today, and no test can reach it. The resize in the CATCH is the one
+     * that matters: an abandoned body never reaches the end of its block, so
+     * without it the bindings it had pushed would still be on the stack for the
+     * next part to find.
+     *
+     * Everything else matches invoke_rule(). The body gets a Frame of its own, so
+     * rule calls inside it count as @p child's children rather than as the
+     * PARENT's -- without that, a slab whose body calls a rule would make its
+     * grandparent non-terminal and would hand the next slab the wrong sibling
+     * index. A body that makes no child and does not discard emits @p child as a
+     * terminal, which is what makes `1.0 : { }` a piece of wall. A body that
+     * discards, or that abandons, costs its own subtree and nothing else: one
+     * malformed slab must not cost the other floors of the facade.
+     *
+     * @param body      BlockStmt to run, or kNoNode for a part that has none
+     * @param child     The slab or component. Consumed.
+     * @param enclosing The frame the statement was written in, for its rule id
+     */
+    void run_statement_body(StmtId body, Shape child, const Frame& enclosing) {
+        result.stats.max_depth_reached = std::max(result.stats.max_depth_reached, child.depth);
+
+        Frame inner;
+        inner.rule = enclosing.rule;
+        inner.locals_base = locals.size();
+        try {
+            const Flow flow = body == kNoNode ? Flow::Continue : exec(body, child, inner);
+            locals.resize(inner.locals_base);
+            if (flow != Flow::Discard && inner.children == 0) {
+                emit_terminal(std::move(child));
+            }
+        } catch (const AbandonShape&) {
+            locals.resize(inner.locals_base);
+            abandon_requested = false;
+        }
+    }
+
+    // ---- split ----
+
+    /**
+     * @brief `split(y) { 4.0 : { Shopfront(); } repeat { 2.0 : { Floor(); } } }`
+     *
+     * The solver and the cut are op_split.cpp's, and this is the wiring block
+     * its file header asks for. What is decided HERE, and nowhere else:
+     *
+     *   - The sizes are evaluated against the shape being split, in the frame
+     *     that wrote the statement, BEFORE any slab exists. So a size reads the
+     *     enclosing rule's bindings and never a slab's, and `shape.sy` in a size
+     *     is the height being divided rather than the height of a piece of it.
+     *   - A size that is not a number abandons the whole shape rather than one
+     *     slab. The layout cannot be solved at all when one row of it is
+     *     unreadable, so there is no truncated facade to fall back to.
+     *   - Each slab is a child, with the caps and the seed mix every other child
+     *     gets, and its body runs in the current frame.
+     */
+    Flow exec_split(const SplitStmt& node, const Stmt& stmt, Shape& shape, Frame& frame) {
+        const ScopeAxis axis = to_scope_axis(node.axis);
+
+        const std::vector<SplitPart> parts =
+            split_parts_from_statement(node, [&](ExprId id, const SourceLoc& at) {
+                return want_number(eval(id, shape), at, "a split size");
+            });
+
+        const SplitLayout layout = solve_split(parts, shape.scope.extent(axis));
+        for (const std::string& note : layout.notes) {
+            // Once per site, not once per shape. A split inside a recursive rule
+            // reports the same overflow at every storey otherwise, and one
+            // mistake fills a diagnostic cap that then hides everything else.
+            report_once(Severity::Warning, stmt.loc, note);
+        }
+
+        std::vector<Shape> slabs = split_shape(shape, axis, layout);
+        // split_shape() promises one slab per piece. Indexing the shorter of the
+        // two anyway costs one comparison and turns a broken promise into a short
+        // facade rather than into a read past the end.
+        const size_t count = std::min(slabs.size(), layout.pieces.size());
+        for (size_t i = 0; i < count; ++i) {
+            Shape child;
+            if (begin_child(shape, frame, std::move(slabs[i]),
+                            "split[" + std::to_string(i) + "]", stmt.loc,
+                            child) != ChildOutcome::Ready) {
+                continue;
+            }
+            // The body is a StmtId and not a rule call, so it runs in the frame
+            // that wrote it rather than through invoke_rule().
+            run_statement_body(split_body_for(node, layout.pieces[i]), std::move(child), frame);
+        }
+        return Flow::Continue;
+    }
+
+    // ---- select ----
+
+    /**
+     * @brief Turn what the decomposition found into diagnostics
+     *
+     * A function of its own, and not a block inside exec_select(), because the
+     * SEVERITIES are a policy decision rather than an implementation detail. The
+     * sentences are op_comp.cpp's -- ComponentSplitReport hands out finished
+     * message fragments precisely so two callers cannot word them differently --
+     * but the policy here is NOT emit_components()'s, in two deliberate ways:
+     *
+     *   - **Once per site, not once per shape.** A `select` inside a recursive
+     *     rule meets the same bent facade at every storey, and four thousand lots
+     *     would fill GenerationResult's diagnostic cap with one mistake and hide
+     *     everything else behind it. emit_components() reports every time because
+     *     its caller is an operation the rule invoked on purpose, once per call.
+     *
+     *   - **"this shape has no geometry" is a Warning here, not an Error.**
+     *     op_comp.hpp argues that everything in ComponentSplitReport::problems is
+     *     a mistake in the RULE, and for a caller that chose the shape it is. A
+     *     `select` inside a split part did not choose its shape: op_split.cpp
+     *     deliberately produces zero-length slabs when the fixed parts overrun the
+     *     extent, and deliberately runs their bodies against the empty shape. A
+     *     lot narrower than its own piers is a Warning-grade event -- the split
+     *     solver already calls it one -- so an Error here would turn an ordinary
+     *     facade on a narrow lot into a generation that ok() reports as failed.
+     *     Every OTHER problem stays an Error, because an unimplemented domain, an
+     *     index past the end and an empty angle range are all things the rule text
+     *     asked for and got wrong.
+     *
+     * The empty-shape test mirrors split_components()' own condition rather than
+     * matching the sentence it produces. Matching the text would break silently
+     * the day someone rewords it. Mirroring the condition can drift instead, and
+     * that drift is safe in the one direction that matters: the worst it does is
+     * report an Error where a Warning was meant, which is the old behaviour and is
+     * loud. Downgrading every problem is downgrading exactly one, because
+     * split_components() pushes the no-geometry sentence and returns immediately,
+     * so an empty shape on an implemented domain cannot carry a second problem.
+     *
+     * @param split_report What split_components() found. Not named `report`,
+     *                     which would shadow State::report() inside this body.
+     * @param shape        The shape that was decomposed, for the empty-shape test
+     * @param domain       What it was decomposed into
+     * @param loc          The `select` statement, so every message lands on it
+     */
+    void report_component_split(const ComponentSplitReport& split_report,
+                                const Shape& shape,
+                                ComponentDomain domain,
+                                const SourceLoc& loc) {
+        const bool domain_implemented =
+            domain == ComponentDomain::Face || domain == ComponentDomain::Edge;
+        const bool shape_is_empty =
+            shape.geometry.faces.empty() || shape.geometry.positions.empty();
+        const Severity problem_severity =
+            domain_implemented && shape_is_empty ? Severity::Warning : Severity::Error;
+
+        for (const std::string& problem : split_report.problems) {
+            report_once(problem_severity, loc, problem);
+        }
+        if (split_report.degenerate > 0) {
+            // A Warning: a degenerate face is something the INPUT geometry did,
+            // not something the rule author wrote. The same argument
+            // emit_components() makes, and the same sentence.
+            report_once(Severity::Warning, loc,
+                        std::to_string(split_report.degenerate) +
+                            " components were dropped for having no area, no length or no "
+                            "direction");
+        }
+        if (split_report.non_planar > 0) {
+            report_once(Severity::Warning, loc,
+                        std::to_string(split_report.non_planar) +
+                            " of these faces do not lie flat; the worst is out of plane by " +
+                            format_number(split_report.worst_planarity) +
+                            ", which is the depth of its component scope");
+        }
+    }
+
+    /**
+     * @brief `select face { front : { Facade(); } top : { Roof(); } }`
+     *
+     * The decomposition is op_comp.cpp's. What is decided here is the mapping
+     * from components to arms, and it is the half that is easy to get wrong.
+     *
+     * The shape is decomposed ONCE, with no selector, and the arms are applied to
+     * the result. Calling split_components() once per arm instead would decompose
+     * the shape once per arm, and would visit the children in ARM order: two files
+     * that say the same thing with `side:` above `top:` and below it would then
+     * hand every child a different sibling index and a different seed_key.
+     * Decomposing once buys exactly that -- the children are visited in
+     * op_comp.hpp's canonical component order, so the ORDER the arms are written
+     * in moves no key at all.
+     *
+     * What it does NOT buy is worth stating, because the obvious reading of the
+     * paragraph above claims more than the code does. A child's sibling index is
+     * the number of components CLAIMED before it, not Component::index. So adding
+     * an arm that claims a component earlier in the canonical order -- a `bottom:`
+     * arm to a file that had only `front:` -- shifts every later child by one and
+     * re-keys it. That is an edit to the rule TEXT, which is allowed to change the
+     * output; it is recorded here because it changes more of the output than it
+     * looks like it should, and because the alternative is not free either:
+     * keying a child by Component::index would collide with the rule calls made
+     * before the `select`, which are numbered from the same counter.
+     * `select_children_are_addressed_by_claim_count_so_adding_an_arm_re_keys_them`
+     * in test_rule_statements.cpp pins it either way. Nothing OUTSIDE this
+     * `select` moves: a key is mixed from the parent and the index and is never
+     * drawn from a shared stream.
+     *
+     * Each component goes to the FIRST arm that admits it. The six direction
+     * words partition the components, so a file listing all six covers the shape
+     * with nothing counted twice; the words that overlap -- `side`, `vertical`,
+     * `all` -- are resolved by source order, which is the only reading an author
+     * can predict from the text. A component no arm claims makes no child, which
+     * is how `select face { top : Roof(); }` says it wants the roof and nothing
+     * else.
+     */
+    Flow exec_select(const SelectStmt& node, const Stmt& stmt, Shape& shape, Frame& frame) {
+        ComponentSplitReport split_report;
+        std::vector<Component> components =
+            split_components(shape, node.domain, ComponentSelection{}, &split_report);
+
+        report_component_split(split_report, shape, node.domain, stmt.loc);
+
+        for (Component& component : components) {
+            const SelectCase* arm = nullptr;
+            for (const SelectCase& candidate : node.cases) {
+                if (selector_admits(candidate.selector, component.normal)) {
+                    arm = &candidate;
+                    break;
+                }
+            }
+            if (arm == nullptr) {
+                continue;
+            }
+
+            std::string role = "select." +
+                               std::string{component_selector_name(arm->selector)} + "[" +
+                               std::to_string(component.index) + "]";
+            Shape child;
+            // Addressed by WHICH COMPONENT it is, not by claim order. Adding a
+            // `bottom:` arm must not renumber the `front:` children and
+            // reshuffle their variation; see ChildAddress.
+            const uint32_t component_index = component.index;
+            if (begin_child(shape, frame, std::move(component.shape), std::move(role), stmt.loc,
+                            child, ChildAddress::Component, component_index)
+                != ChildOutcome::Ready) {
+                continue;
+            }
+            run_statement_body(arm->body, std::move(child), frame);
+        }
+        return Flow::Continue;
     }
 
     // ---- rules ----

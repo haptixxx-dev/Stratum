@@ -177,6 +177,18 @@ namespace stratum::procgen::rules {
 enum : uint64_t {
     kSaltRoot = 0x01,    ///< The root shape's key, mixed with the run seed
     kSaltChild = 0x02,   ///< A child's key, mixed with its sibling index
+
+    /// A component child's key, mixed with its COMPONENT index
+    ///
+    /// Distinct from kSaltChild on purpose. A `select` child is addressed by
+    /// which component it is -- face 3 of the solid -- rather than by how many
+    /// children the parent happened to make before it. Without a separate salt
+    /// the two numbering schemes share a counter, so
+    ///
+    ///     rule Main { A(); select face { all : { P(); } } }
+    ///
+    /// would give A and component 0 the same index and therefore the same key.
+    kSaltComponent = 0x06,
     kSaltChoose = 0x03,  ///< The weighted pick in a `choose` statement
     kSaltOp = 0x04       ///< Reserved for an operation that needs its own draw
 };

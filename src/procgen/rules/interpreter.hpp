@@ -23,7 +23,9 @@
  * in order against that shape, mutating it: an operation transforms the shape, a
  * `let` binds a name, an `if` chooses a branch. A statement that calls another
  * RULE snapshots the shape as it stands at that point, makes it a child, and
- * recurses. So two rule calls in one body produce two children, and the second
+ * recurses. `split` and `select` make children too -- a slab per part, a shape
+ * per component -- and run a BODY against each instead of a rule, which is the
+ * only difference: the body stays in the frame that wrote it. So two rule calls in one body produce two children, and the second
  * sees the operations that ran between them -- which is what makes
  * `translate(1,0,0); A(); translate(2,0,0); B();` put A and B in different
  * places. When the body ends, a shape that produced no children and was not
@@ -37,6 +39,13 @@
  * supplied the name. Call ARGUMENTS are evaluated in the caller's frame, before
  * the callee exists, which is what keeps `Floor(height - 1)` meaning the
  * caller's `height`.
+ *
+ * A `split` part's body and a `select` arm's body are NOT rules and do not move
+ * the frame. They see the enclosing rule's parameters and lets -- which is what
+ * makes `split(y) { storey : { Floor(storey); } }` work -- and their own lets
+ * are dropped when the body ends, so one part cannot bind a name the next part
+ * or the rest of the rule can read. A split SIZE is evaluated one step earlier
+ * still, against the shape being divided and before any slab exists.
  *
  * ================================================================================
  * THE THREE THINGS THAT ARE EASY TO GET WRONG
@@ -128,10 +137,27 @@
  * implementation has not landed yet.
  *
  * STATEMENTS are a closed set -- they are variant alternatives in ast.hpp -- so
- * `split`, `repeat` and `select` cannot be registered and are implemented in
- * interpreter.cpp when D3 and D4 land. Until then they report themselves the same
- * way, once per source location, and evaluation continues so that the rest of the
- * rule still produces its geometry.
+ * `split` and `select` cannot be registered, and they are wired directly into
+ * State::exec() alongside `if`, `choose` and `scope`. That is the design, not a
+ * gap in it. The whole population is `split`, `select` and a possible future
+ * `scatter`; a function-pointer registry would buy indirection for three cases
+ * and cost clarity in the one file where control flow has to read top to bottom.
+ *
+ * What makes a fourth statement family cheap is not a registry but two helpers
+ * in interpreter.cpp that every child shape already goes through:
+ *
+ *   - **begin_child()** -- the copy, the sibling index, the seed mix, the shape
+ *     cap and the depth cap. A rule call, a split slab and a `select` component
+ *     are the same act and differ only in what content goes in.
+ *   - **run_statement_body()** -- invoke_rule() minus the parameters and minus
+ *     the move of the lexical frame base, because a statement body belongs to
+ *     the rule that wrote it and must read that rule's bindings without leaking
+ *     its own back out.
+ *
+ * A statement family is then a short function: solve it, cut it, and hand each
+ * piece to those two. The GEOMETRY belongs elsewhere -- op_split.cpp owns the
+ * sizing solver and the slab cut, op_comp.cpp owns the component decomposition,
+ * and neither knows what a frame, a seed or a cap is.
  *
  * ### Adding a statement kind: what actually protects you
  *
@@ -175,11 +201,16 @@ class Interpreter;
  */
 struct InterpreterLimits {
     /**
-     * @brief Deepest rule-call nesting
+     * @brief Deepest child nesting
      *
      * A 60-storey tower written as a recursive rule is 60 deep. 64 leaves room
      * for the facade rules beneath it without letting an unbounded recursion run
      * long enough to matter.
+     *
+     * Counted over every child, not only over rule calls: a split slab is one
+     * level deeper than the shape it was cut from, because a rule that splits
+     * and recurses runs away exactly as readily as one that only recurses, and a
+     * cap that only watched rule calls would not catch it.
      */
     uint32_t max_depth = 64;
 
@@ -238,11 +269,12 @@ struct GenerationOptions {
 
 /// What one generation did, for the status bar and for a test
 struct GenerationStats {
-    uint32_t shapes_created = 0;     ///< Every shape, including the root and the terminals
+    uint32_t shapes_created = 0;     ///< Every shape: the root, the terminals, and every
+                                     ///< split slab and `select` component
     uint32_t terminals = 0;          ///< Shapes that produced no children
-    uint32_t rules_invoked = 0;      ///< Rule bodies run
+    uint32_t rules_invoked = 0;      ///< Rule bodies run. A statement body is not one.
     uint32_t operations_applied = 0; ///< Built-in operations that ran
-    uint32_t max_depth_reached = 0;  ///< Deepest rule-call nesting actually used
+    uint32_t max_depth_reached = 0;  ///< Deepest child nesting actually used
     bool depth_limit_hit = false;    ///< InterpreterLimits::max_depth stopped a recursion
     bool shape_limit_hit = false;    ///< InterpreterLimits::max_shapes stopped a recursion
 };

@@ -173,9 +173,26 @@
  *     catalogue does not carry is unreachable. The catalogue deliberately has no
  *     `comp` row, because `comp` was always going to be a statement.
  *
- * So emit_components() below is the whole body of the missing
- * `case StmtKind::Select:`, minus the two lines that run each arm's block. When
- * that case is written, it calls this; nothing else about this file changes.
+ * So emit_components() below was written as the whole body of the missing
+ * `case StmtKind::Select:`, minus the two lines that run each arm's block.
+ *
+ * ### What actually happened, and what emit_components() is now
+ *
+ * D2.5 wrote that case, and it does NOT call emit_components(). It could not:
+ * this function emits every component as a TERMINAL, and a `select` arm has a
+ * body to run against its component instead, so the one line the prediction above
+ * called "minus two lines" is the whole difference between a leaf and a subtree.
+ * interpreter.cpp's exec_select() therefore calls split_components() directly and
+ * reports the ComponentSplitReport itself, in report_component_split(), at
+ * severities that are deliberately not the ones below -- once per site rather
+ * than once per shape, and a Warning rather than an Error for a shape with no
+ * geometry, because a split slab did not choose to be empty. That function's
+ * comment carries the argument.
+ *
+ * emit_components() is still the entry point for an OPERATION handler that wants
+ * a shape's components and nothing run against them, which is what
+ * test_op_comp.cpp exercises it as. It is not the interpreter's `select` path,
+ * and a test of it is not a test of `select`.
  */
 
 #pragma once
@@ -357,9 +374,19 @@ struct ComponentSplitReport {
      *
      * FAULTS, not observations: a domain this build does not implement, an empty
      * angle range, an index past the end, a shape with no geometry. Every one of
-     * them is a mistake in the rule, so emit_components() reports them as
-     * Errors. The degenerate and non-planar COUNTS above are observations about
-     * the input geometry, are not entered here, and are reported as Warnings.
+     * them is a mistake in the rule for a caller that CHOSE the shape, so
+     * emit_components() reports them as Errors. The degenerate and non-planar
+     * COUNTS above are observations about the input geometry, are not entered
+     * here, and are reported as Warnings.
+     *
+     * A caller that did not choose the shape reads the list differently, and
+     * interpreter.cpp's report_component_split() is that caller: a zero-length
+     * slab out of `split` reaches `select` with no geometry through no fault of
+     * the rule, so it downgrades that one sentence to a Warning. The severity is
+     * therefore the CALLER's, not this struct's. Note for anyone adding a problem
+     * here: that caller downgrades on the CONDITION -- the shape being empty --
+     * and not on the text, so a second problem raised for an empty shape on an
+     * implemented domain would be downgraded with it.
      */
     std::vector<std::string> problems;
 };
@@ -501,10 +528,14 @@ struct ComponentSplitReport {
 /**
  * @brief Split @p shape and emit every selected component as a terminal child
  *
- * This is the body of the `case StmtKind::Select:` that interpreter.cpp does not
- * yet have, minus running each arm's block on the component. Every fault the
- * split found is reported at @p loc through the interpreter, so a bad index or a
- * bent facade turns into the same caret a syntax error gets.
+ * NOT the interpreter's `select` path. State::exec() has had a
+ * `case StmtKind::Select:` since D2.5 and it decomposes, reports and runs each
+ * arm's body itself -- see the section on this in the file comment above, and
+ * interpreter.cpp's report_component_split() for why the severities differ. What
+ * is left here is the entry point for an operation handler that wants a shape's
+ * components as terminals with nothing run against them. Every fault the split
+ * found is reported at @p loc through the interpreter, so a bad index or a bent
+ * facade turns into the same caret a syntax error gets.
  *
  * Each child is given its address in the tree by
  * Interpreter::emit_derived_terminal(), which derives its seed_key from the
