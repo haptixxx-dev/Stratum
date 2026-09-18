@@ -88,6 +88,7 @@ using stratum::procgen::rules::GenerationOptions;
 using stratum::procgen::rules::GenerationResult;
 using stratum::procgen::rules::generate;
 using stratum::procgen::rules::geometry_area;
+using stratum::procgen::rules::geometry_bounds;
 using stratum::procgen::rules::geometry_volume;
 using stratum::procgen::rules::mirror_scope_shape;
 using stratum::procgen::rules::mirror_shape;
@@ -475,6 +476,57 @@ TEST(Interpreter, a_taper_that_eats_the_outline_is_refused_and_names_the_height)
     CHECK_NEAR(geometry_area(shape.geometry), 1.0, 1e-12);
 }
 
+TEST(Interpreter, shape_from_rings_rewinds_a_hole_handed_in_the_wrong_way) {
+    // shape.hpp calls the winding fix "the one place that has to be right",
+    // and every test that builds a holed shape hands it a CORRECTLY wound hole
+    // -- so the fix itself was never exercised. Deleting it passed the whole
+    // suite. That matters more now than it used to: E2 carries courtyards
+    // through the massing and D5 reads interior rings, so a hole wound the
+    // wrong way is a wrong building rather than a wrong number.
+    //
+    // The face contract is outer counter-clockwise, holes clockwise, because
+    // that is what puts the material on the LEFT of every directed edge and
+    // lets one offset rule serve both rings.
+    const std::vector<glm::dvec2> outer = {{0.0, 0.0}, {10.0, 0.0}, {10.0, 10.0}, {0.0, 10.0}};
+
+    // Clockwise, which is what a hole should be.
+    const std::vector<glm::dvec2> hole_cw = {{3.0, 3.0}, {3.0, 7.0}, {7.0, 7.0}, {7.0, 3.0}};
+    // The same ring the other way round. An author, or an importer, can hand
+    // either; the result must not depend on which.
+    const std::vector<glm::dvec2> hole_ccw = {{3.0, 3.0}, {7.0, 3.0}, {7.0, 7.0}, {3.0, 7.0}};
+
+    const Shape from_cw = shape_from_rings(outer, {hole_cw});
+    const Shape from_ccw = shape_from_rings(outer, {hole_ccw});
+
+    // 100 - 16 either way. Area alone is not enough -- it is a signed sum, and
+    // a hole left wound the wrong way ADDS instead of subtracting, so this is
+    // the assertion that bites.
+    CHECK_NEAR(geometry_area(from_cw.geometry), 84.0, 1e-12);
+    CHECK_NEAR(geometry_area(from_ccw.geometry), 84.0, 1e-12);
+
+    CHECK_EQ(from_cw.geometry.faces.size(), size_t{1});
+    CHECK_EQ(from_ccw.geometry.faces.size(), size_t{1});
+    CHECK_EQ(from_cw.geometry.faces[0].holes.size(), size_t{1});
+    CHECK_EQ(from_ccw.geometry.faces[0].holes.size(), size_t{1});
+
+    // And it survives the operation that reads the winding. An inset of the
+    // face draws the outer in by 1 on each side and pushes the hole out by 1 on
+    // each side, so 10x10 with a 4x4 hole becomes 8x8 with a 6x6 hole:
+    // 64 - 36 = 28.
+    Shape a = from_cw;
+    Shape b = from_ccw;
+    CHECK_TRUE(taper_shape(a, 1.0).ok);
+    CHECK_TRUE(taper_shape(b, 1.0).ok);
+    const int top_a = only_face_facing(a.geometry, glm::dvec3{0.0, 1.0, 0.0}, 1e-9);
+    const int top_b = only_face_facing(b.geometry, glm::dvec3{0.0, 1.0, 0.0}, 1e-9);
+    CHECK((top_a) >= 0);
+    CHECK((top_b) >= 0);
+    if (top_a >= 0 && top_b >= 0) {
+        CHECK_NEAR(face_area(a.geometry, a.geometry.faces[static_cast<size_t>(top_a)]), 28.0, 1e-9);
+        CHECK_NEAR(face_area(b.geometry, b.geometry.faces[static_cast<size_t>(top_b)]), 28.0, 1e-9);
+    }
+}
+
 TEST(Interpreter, taper_grows_a_hole_while_it_shrinks_the_outline) {
     // The case no taper test covered, and the one that was wrong. Every taper
     // test above uses shape_from_rect, which has no hole, so the per-ring
@@ -702,6 +754,45 @@ TEST(Interpreter, setback_partitions_a_footprint_that_is_not_on_the_grid) {
     CHECK_NEAR(inner + removed, total, 1e-3);
 }
 
+TEST(Interpreter, a_positive_offset_through_each_selector) {
+    // The existing positive-offset test only ever passes OffsetSelector::Inside,
+    // so the Border and All paths had no coverage at all -- which is why
+    // replacing the border's Xor with a Difference passed the whole suite.
+    //
+    // 10x10 grown by 1 on every side is 12x12 = 144, and the ring between the
+    // two outlines is 144 - 100 = 44.
+    {
+        Shape shape = shape_from_rect(10.0, 10.0);
+        CHECK_TRUE(offset_shape(shape, 1.0, OffsetSelector::Inside).ok);
+        CHECK_NEAR(geometry_area(shape.geometry), 144.0, 1e-9);
+        CHECK_EQ(shape.geometry.faces.size(), size_t{1});
+        CHECK_EQ(shape.geometry.faces[0].holes.size(), size_t{0});
+    }
+    {
+        Shape shape = shape_from_rect(10.0, 10.0);
+        CHECK_TRUE(offset_shape(shape, 1.0, OffsetSelector::Border).ok);
+        CHECK_NEAR(geometry_area(shape.geometry), 44.0, 1e-9);
+        // The ring is ONE face with the original outline as a hole, not two
+        // faces or four quads. That is what makes it usable as a shape.
+        CHECK_EQ(shape.geometry.faces.size(), size_t{1});
+        CHECK_EQ(shape.geometry.faces[0].holes.size(), size_t{1});
+    }
+    {
+        // All hands back both pieces as separate faces: 144 + 44 = 188.
+        //
+        // Note that for a POSITIVE distance those two OVERLAP -- the grown
+        // 12x12 outline contains the ring -- so the total is not the area of
+        // anything. That is only a partition for a NEGATIVE distance, which is
+        // the case setback() is built on and the case
+        // offset_inside_and_offset_border_partition_the_original_face covers.
+        // Pinned here so the difference is recorded rather than discovered.
+        Shape shape = shape_from_rect(10.0, 10.0);
+        CHECK_TRUE(offset_shape(shape, 1.0, OffsetSelector::All).ok);
+        CHECK_EQ(shape.geometry.faces.size(), size_t{2});
+        CHECK_NEAR(geometry_area(shape.geometry), 188.0, 1e-9);
+    }
+}
+
 TEST(Interpreter, a_positive_offset_grows_the_outline) {
     Shape shape = shape_from_rect(1.0, 1.0);
     CHECK_TRUE(offset_shape(shape, 0.5, OffsetSelector::Inside).ok);
@@ -745,6 +836,38 @@ TEST(Interpreter, rotate_turns_the_geometry_and_leaves_the_axes_alone) {
     check_vec3(shape.scope.size, glm::dvec3{4.0, 0.0, 2.0}, 1e-12);
     check_vec3(shape.scope.origin, glm::dvec3{0.0, 0.0, -2.0}, 1e-12);
     CHECK_NEAR(geometry_area(shape.geometry), 8.0, 1e-12);
+}
+
+TEST(Interpreter, a_compound_rotation_applies_the_axes_in_the_stated_order) {
+    // Every other rotation test turns about ONE axis, where the order does not
+    // matter and euler_matrix() could compose rz*ry*rx or rx*ry*rz and pass
+    // either way. The header states an order; nothing held it to it.
+    //
+    // 90 degrees about x then 90 about y. The two orders send the SAME point to
+    // DIFFERENT places, which is the whole reason a fixed order has to be
+    // stated:
+    //
+    //   rz*ry*rx applied to (0,0,1):  rx sends it to (0,-1,0), then ry leaves
+    //                                 y alone -> (0,-1,0)
+    //   rx*ry*rz applied to (0,0,1):  ry sends it to (1,0,0), then rx sends
+    //                                 x to x -> (1,0,0)
+    //
+    // So probing the image of the local +z corner separates them outright.
+    Shape shape = shape_from_rect(2.0, 2.0);
+    // A point at the far corner of the footprint, before any rotation:
+    // shape_from_rect lays the rectangle on the ground plane, so take the
+    // world-space bounds after the turn rather than guessing an index.
+    rotate_shape(shape, glm::dvec3{90.0, 90.0, 0.0});
+
+    glm::dvec3 low{0.0};
+    glm::dvec3 high{0.0};
+    CHECK_TRUE(geometry_bounds(shape.geometry, low, high));
+
+    // A 2x2 ground rectangle has extent (2, 0, 2). Turning 90 about x makes it
+    // (2, 2, 0); then 90 about y makes it (0, 2, 2). The other composition
+    // order gives (2, 2, 0) instead, so the extent alone tells them apart.
+    const glm::dvec3 extent = high - low;
+    check_vec3(extent, glm::dvec3{0.0, 2.0, 2.0}, 1e-9);
 }
 
 TEST(Interpreter, rotate_scope_turns_the_frame_and_leaves_the_geometry_in_the_world) {
