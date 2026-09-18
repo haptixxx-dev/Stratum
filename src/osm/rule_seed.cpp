@@ -89,10 +89,53 @@ using procgen::rules::Value;
     return "unknown";
 }
 
+/**
+ * @brief OSM local metres to the rule engine's ground plane
+ *
+ * THE Y IS NEGATED, and this is the whole reason this function exists rather
+ * than passing the footprint straight through.
+ *
+ * `shape_from_rings()` lifts a 2D point to `{p.x, y, p.y}`. Every mesh builder
+ * in src/osm and src/osm/road lifts it to `{p.x, height, -p.y}` --
+ * mesh_builder.cpp:506, junction_polygon.cpp:225, corridor.cpp:107 and the
+ * rest, without exception. The 2D plane is x-east/y-north and world space is
+ * Y-up with north along -z, which is the convention documented in
+ * osm/coordinates.hpp.
+ *
+ * Handing a footprint over unchanged therefore MIRRORS the generated building
+ * about the z axis. It is not subtle at city scale: the generated blocks sit
+ * on the roads instead of beside them, and the whole district reads as a
+ * north-south flip of the real one. That is exactly what the first version of
+ * this file did.
+ *
+ * Negating y reverses the ring's winding, which is fine and deliberate:
+ * shape_from_rings() fixes the winding rather than trusting it, so a face that
+ * arrives clockwise still comes out with its normal pointing up.
+ */
+[[nodiscard]] std::vector<glm::dvec2> to_rule_plane(const std::vector<glm::dvec2>& ring) {
+    std::vector<glm::dvec2> out;
+    out.reserve(ring.size());
+    for (const glm::dvec2& p : ring) {
+        out.push_back(glm::dvec2{p.x, -p.y});
+    }
+    return out;
+}
+
+[[nodiscard]] std::vector<std::vector<glm::dvec2>> to_rule_plane(
+    const std::vector<std::vector<glm::dvec2>>& rings) {
+    std::vector<std::vector<glm::dvec2>> out;
+    out.reserve(rings.size());
+    for (const std::vector<glm::dvec2>& ring : rings) {
+        out.push_back(to_rule_plane(ring));
+    }
+    return out;
+}
+
 } // namespace
 
 Shape seed_from_building(const Building& building, double y) {
-    Shape shape = procgen::rules::shape_from_rings(building.footprint, building.holes, y);
+    Shape shape = procgen::rules::shape_from_rings(to_rule_plane(building.footprint),
+                                                   to_rule_plane(building.holes), y);
 
     shape.attributes[kSeedOsmId] = Value::number(static_cast<double>(building.osm_id));
     shape.attributes["osm.kind"] = Value::text("building");
@@ -117,7 +160,8 @@ Shape seed_from_building(const Building& building, double y) {
 }
 
 Shape seed_from_area(const Area& area, double y) {
-    Shape shape = procgen::rules::shape_from_rings(area.polygon, area.holes, y);
+    Shape shape = procgen::rules::shape_from_rings(to_rule_plane(area.polygon),
+                                                   to_rule_plane(area.holes), y);
     shape.attributes[kSeedOsmId] = Value::number(static_cast<double>(area.osm_id));
     shape.attributes["osm.kind"] = Value::text("area");
     shape.attributes["osm.area_type"] = Value::text(area_type_word(area.type));

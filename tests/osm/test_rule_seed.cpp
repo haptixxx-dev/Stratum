@@ -21,6 +21,7 @@
 
 #include "framework.hpp"
 
+#include "osm/mesh_builder.hpp"
 #include "osm/rule_seed.hpp"
 #include "procgen/rules/parser.hpp"
 #include "procgen/rules/registry.hpp"
@@ -115,6 +116,90 @@ TEST(RuleSeed, a_degenerate_footprint_yields_a_seed_with_no_geometry) {
     CHECK_TRUE(seed.geometry.faces.empty());
     const auto found = seed.attributes.find(kSeedOsmId);
     CHECK_TRUE(found != seed.attributes.end());
+}
+
+// ============================================================================
+// Alignment with the rest of the scene
+// ============================================================================
+
+TEST(RuleSeed, a_seeded_building_lands_where_the_imported_mesh_does) {
+    // THE TEST THIS FILE MOST NEEDED AND DID NOT HAVE.
+    //
+    // shape_from_rings() lifts a 2D point to {p.x, y, p.y}. Every mesh builder
+    // in src/osm and src/osm/road lifts it to {p.x, height, -p.y}, without
+    // exception -- the 2D plane is x-east/y-north and world space is Y-up with
+    // north along -z.
+    //
+    // Seeding without that negation mirrors every generated building about the
+    // z axis. At the scale of one building it looks like a building; at the
+    // scale of a city the generated blocks sit ON the roads instead of beside
+    // them, which is how it was actually spotted.
+    //
+    // So this asserts against MeshBuilder rather than against a literal: the
+    // two are required to agree, and if either convention is ever changed the
+    // other has to change with it.
+    Building b = make_building();
+    // Deliberately not symmetric about either axis. A footprint that is
+    // symmetric in y survives the mirror unchanged and proves nothing.
+    b.footprint = {{2.0, 1.0}, {12.0, 1.0}, {12.0, 5.0}, {7.0, 9.0}, {2.0, 5.0}};
+    b.height = 8.0f;
+    // Flat, so MeshBuilder raises a plain box and the rule's bare extrude is
+    // comparable. The fixture is Hipped, and MeshBuilder would put a roof on
+    // top of it -- a real difference, and not the one under test here.
+    b.roof_type = RoofType::Flat;
+
+    const stratum::Mesh imported = MeshBuilder::build_building_mesh(b);
+    CHECK_FALSE(imported.vertices.empty());
+
+    const Shape seed = seed_from_building(b);
+    const GenerationResult generated = run_on(seed, "@start\nrule M { extrude(8.0); }\n");
+    CHECK_TRUE(generated.ok());
+    CHECK_EQ(generated.terminals.size(), size_t{1});
+    if (generated.terminals.empty()) return;
+
+    const stratum::Mesh built = generated.build_mesh();
+    CHECK_FALSE(built.vertices.empty());
+
+    // Same footprint, same height, so the same world bounding box.
+    CHECK_NEAR(static_cast<double>(built.bounds.min.x),
+               static_cast<double>(imported.bounds.min.x), 1e-4);
+    CHECK_NEAR(static_cast<double>(built.bounds.min.y),
+               static_cast<double>(imported.bounds.min.y), 1e-4);
+    CHECK_NEAR(static_cast<double>(built.bounds.min.z),
+               static_cast<double>(imported.bounds.min.z), 1e-4);
+    CHECK_NEAR(static_cast<double>(built.bounds.max.x),
+               static_cast<double>(imported.bounds.max.x), 1e-4);
+    CHECK_NEAR(static_cast<double>(built.bounds.max.y),
+               static_cast<double>(imported.bounds.max.y), 1e-4);
+    CHECK_NEAR(static_cast<double>(built.bounds.max.z),
+               static_cast<double>(imported.bounds.max.z), 1e-4);
+
+    // The bounding box alone would survive a mirror about the footprint's own
+    // centre, so pin the asymmetric corner too: the apex at y = 9 in OSM
+    // metres must land at z = -9 in world space, not +9.
+    double most_negative_z = 1e18;
+    for (const stratum::Vertex& v : built.vertices) {
+        most_negative_z = std::min(most_negative_z, static_cast<double>(v.position.z));
+    }
+    CHECK_NEAR(most_negative_z, -9.0, 1e-4);
+}
+
+TEST(RuleSeed, a_seeded_area_lands_where_its_imported_mesh_does) {
+    Area area;
+    area.osm_id = 11;
+    area.polygon = {{0.0, 0.0}, {20.0, 0.0}, {20.0, 6.0}, {10.0, 14.0}, {0.0, 6.0}};
+    area.type = AreaType::Park;
+
+    const Shape seed = seed_from_area(area);
+    // Shoelace over the five points: 200, not the 220 I first wrote.
+    CHECK_NEAR(geometry_area(seed.geometry), 200.0, 1e-9);
+
+    // North in OSM metres is -z in world space, so the far corner is at -14.
+    double most_negative_z = 1e18;
+    for (const glm::dvec3& p : seed.geometry.positions) {
+        most_negative_z = std::min(most_negative_z, seed.scope.to_world(p).z);
+    }
+    CHECK_NEAR(most_negative_z, -14.0, 1e-9);
 }
 
 // ============================================================================
