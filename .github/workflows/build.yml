@@ -4,8 +4,11 @@ on:
   push:
     branches: [ "master", "main" ]
     tags: [ "v*" ]
+  # No branch filter. A pull request targeting ANY base runs the suite, which is
+  # what makes a stack of pull requests usable: with `branches: [master, main]`
+  # only the bottom of a stack was ever built, and every PR above it merged on
+  # the strength of a green check that had never run against its own code.
   pull_request:
-    branches: [ "master", "main" ]
   workflow_dispatch:
 
 # A new push to the same ref supersedes the one in flight. Tags are never
