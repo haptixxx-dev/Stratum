@@ -75,22 +75,29 @@ int rule_source_resize(ImGuiInputTextCallbackData* data) {
 /**
  * @brief The rule file a fresh editor opens with
  *
- * Not a comment saying "write a rule here". This is the file from
- * tests/procgen/test_rule_statements.cpp that produces 37 terminals and 12
- * windows, so the first thing a person sees after opening the panel and
- * pressing Generate is a facade -- which teaches the language faster than any
- * placeholder, and fails loudly if a regression breaks it.
+ * Not a comment saying "write a rule here". It is a whole building -- floors,
+ * a facade split into bays, windows with reveals and a hipped roof -- so the
+ * first thing a person sees after pressing Generate is the thing the language
+ * is for.
+ *
+ * It was the facade from tests/procgen/test_rule_statements.cpp, which checks
+ * the split ARITHMETIC and nothing else: every one of its terminals is an
+ * empty rule, so every terminal is a coplanar quad on the wall plane and the
+ * whole thing renders as a flat wall. Correct as a test, useless as a demo.
+ * `window()` is what gives an opening its depth, and this file now calls it.
  */
 constexpr const char* kDefaultRuleSource =
     "// A shopfront with four floors of bays above it.\n"
-    "// 37 terminals, 12 windows. Edit and press Generate.\n"
+    "// Press Generate, then change a number and press it again.\n"
     "\n"
     "@start\n"
     "rule Main {\n"
-    "    extrude(10.0);\n"
-    "    select face { front : { Facade(); } }\n"
+    "    floors(4, 3.0);\n"
+    "    select face { front : { Facade(); } top : { Roof(); } }\n"
     "}\n"
     "\n"
+    "// The wall is 12 m tall, so the shopfront takes 4 and the repeat tiles\n"
+    "// the remaining 8. Give the shopfront all 12 and the repeat gets nothing.\n"
     "rule Facade {\n"
     "    split(y) {\n"
     "        4.0 : { Shopfront(); }\n"
@@ -111,9 +118,16 @@ constexpr const char* kDefaultRuleSource =
     "    }\n"
     "}\n"
     "\n"
+    "// window() cuts a real opening with a reveal, a frame and a sill.\n"
+    "// An empty `rule Window {}` only marks the region, and renders flat.\n"
+    "rule Window { window(); }\n"
+    "\n"
+    "// A face from `select face` has its normal along local z, so the frame\n"
+    "// has to be turned before a roof can rise on it.\n"
+    "rule Roof { align_scope(\"y_up\"); roof(\"hip\", 35.0); }\n"
+    "\n"
     "rule Shopfront {}\n"
-    "rule Pier {}\n"
-    "rule Window {}\n";
+    "rule Pier {}\n";
 
 } // namespace
 

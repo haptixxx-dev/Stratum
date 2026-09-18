@@ -931,8 +931,25 @@ void expand_repeat(SplitLayout& layout,
 
     if (!(span > 0.0)) {
         // No room at all. Emitting a zero-length copy would put an empty bay in
-        // the shape tree for a group the split had no space for, and the note
-        // about the overflow already says why there was none.
+        // the shape tree for a group the split had no space for.
+        //
+        // This used to return silently in EVERY case, on the reasoning that the
+        // overflow note already said why there was no room. It does -- when the
+        // split overflows. It says nothing when the fixed parts fit EXACTLY, and
+        // that is the likelier mistake by far: `extrude(5.0)` with
+        // `split(y) { 5.0 : Shopfront(); repeat { 3.0 : Floor(); } }` leaves the
+        // repeat precisely zero, produces one quad, and reported nothing at all.
+        // The author sees a flat wall and has no thread to pull.
+        //
+        // So the note is added only when there was no overflow to explain it,
+        // which keeps the overflow case at one note rather than two saying the
+        // same thing.
+        if (!(layout.overflow > 0.0)) {
+            add_note(layout,
+                     "a repeat group in this split was left no room: the fixed parts "
+                     "use the whole extent of " +
+                         format_number(extent) + ", so the repeat produces nothing");
+        }
         return;
     }
 
