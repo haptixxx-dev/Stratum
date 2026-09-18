@@ -41,6 +41,7 @@
 #include "procgen/rules/registry.hpp"
 #include "procgen/rules/shape.hpp"
 
+#include <cstdio>
 #include <string>
 #include <string_view>
 
@@ -155,6 +156,64 @@ TEST(Registry, the_tables_are_the_same_objects_every_call) {
     // thing that is only ever noticed in a profile.
     CHECK_TRUE(&full_operations() == &full_operations());
     CHECK_TRUE(&full_functions() == &full_functions());
+}
+
+/**
+ * @brief Which catalogue rows still have no handler
+ *
+ * Sorted, as kBuiltinOperations is. Updating this list is the LAST step of
+ * landing an operation family, and the test below is what makes forgetting it
+ * impossible: register a handler without wiring the family into registry.cpp
+ * and the name stays here, so the list still matches and nothing tells you.
+ * Wire it in and the list stops matching, which is the reminder.
+ */
+constexpr std::string_view kUnimplemented[] = {
+    "center",     "cleanup",     "color",            "convexify",
+    "courtyard",  "delete_holes", "delete_uv",       "door",
+    "floors",     "footprint",   "inner_rect",       "insert",
+    "material",   "normalize_uv", "podium",          "primitive",
+    "project_uv", "reduce",      "report",           "roof",
+    "scale_uv",   "scatter",     "setup_projection", "soften_normals",
+    "texture",    "tile_uv",     "translate_uv",     "trim",
+    "wall_panel", "window",
+};
+
+TEST(Registry, the_unimplemented_catalogue_rows_are_exactly_the_expected_ones) {
+    // Two directions, because one alone is half a test.
+    //
+    // A name in kBuiltinOperations with no handler is not a bug -- ast.hpp's
+    // catalogue is the PUBLISHED surface of the language and a row is a promise
+    // with a date on it, reported at the call site as "not implemented in this
+    // build". What IS a bug is a family that registered its handlers and was
+    // never added to registry.cpp: every one of its operations then reports
+    // exactly that message, in a build where they demonstrably work, and
+    // nothing else goes wrong to point at the cause.
+    for (size_t i = 0; i < kBuiltinOperationCount; ++i) {
+        const std::string_view name = kBuiltinOperations[i].name;
+        bool expected_missing = false;
+        for (const std::string_view listed : kUnimplemented) {
+            if (listed == name) { expected_missing = true; break; }
+        }
+        const bool actually_missing = full_operations().find(name) == nullptr;
+        if (expected_missing != actually_missing) {
+            // The name is the whole point of the message: "17 != 18" sends the
+            // reader to count rows, and the answer is one word.
+            std::printf("  operation '%.*s': expected %s, found %s\n",
+                        static_cast<int>(name.size()), name.data(),
+                        expected_missing ? "no handler" : "a handler",
+                        actually_missing ? "none" : "one");
+        }
+        CHECK_EQ(expected_missing, actually_missing);
+    }
+}
+
+TEST(Registry, every_unimplemented_name_is_a_real_catalogue_row) {
+    // Guards the list above against a typo. Without this, misspelling a name in
+    // kUnimplemented makes the test above demand a handler for a row that does
+    // not exist, and the failure names a row nobody can find.
+    for (const std::string_view listed : kUnimplemented) {
+        CHECK_TRUE(find_builtin_operation(listed) != kNoNode);
+    }
 }
 
 TEST(Registry, the_full_tables_are_not_the_standard_tables) {
