@@ -8,6 +8,112 @@ Releases map to the milestones in `docs/plans/milestones.md`.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-18
+
+Milestones **M3 (blocks and lots)** and **M4 (rule engine)** complete, plus
+three of the seven M5 items. `0.5.0` was never tagged; this release carries M3
+with M4 rather than back-dating one.
+
+**Stratum stops being a viewer that edits and starts being a generator.** A
+rule file now turns a lot into a building: floors, a facade split into bays,
+windows with reveals, and a hipped roof.
+
+```
+rule Main    { floors(4, 3.0);
+               select face { front : { Facade(); } top : { Roof(); } } }
+rule Facade  { split(y) { repeat { 3.0 : { Floor(); } } } }
+rule Floor   { split(x) { repeat { 2.0 : { Bay(); } } } }
+rule Bay     { split(x) { 0.5 : { Pier(); } 1.0 : { Opening(); }
+                          ~1.0 : { Pier(); } } }
+rule Opening { window(); }
+rule Roof    { align_scope("y_up"); roof("hip", 35.0); }
+```
+
+### Added
+
+- **The rule language** (`src/procgen/rules/`) — lexer, AST, parser and a
+  deterministic interpreter over a shape tree. Purpose-built rather than a
+  CGA reader, which was decision Q3: conforming to CGA would make its limits
+  our ceiling. Section 8 of the CityEngine inventory is a coverage checklist,
+  not a conformance target.
+
+  Names are **lexically** scoped: a rule sees its own parameters and lets, the
+  file's attributes and constants, and nothing of its caller. A rule whose
+  meaning depended on who called it could not be read on its own.
+
+  Determinism is structural. A shape's random state comes from its **address
+  in the tree**, never from a shared stream, so adding one `choose` arm at the
+  top of a file does not move every shape generated after it.
+
+- **`split` and `select`** — absolute, relative and floating (`~`) sizes,
+  `repeat`, nested splits, and component selection by direction. The floating
+  size is what makes a facade absorb its remainder into the last pier.
+- **Roof operations** — one `roof(kind, pitch, overhang)` with the kind as an
+  argument, so a rule can compute which roof to raise. Six kinds: gable, hip,
+  pyramid, ridge, shed, dome. Four go through the shared straight skeleton, so
+  a hip has a real ridge rather than an apex.
+- **Mass modelling** — `floors`, `courtyard` and `podium`. A building as
+  stacked floors rather than one extrusion, so the structure a later
+  `split(y)` needs survives.
+- **Facade operations** — `window`, `door` and `wall_panel`, each with a
+  reveal. A window drawn flat on the wall plane is the clearest tell of
+  generated architecture.
+- **The rule editor panel** — write a rule, run it, see the building. Runtime
+  errors render through the same caret a parse error gets, and a cap that was
+  hit is called out in red rather than left to look like success.
+- **Straight skeleton** (`src/geometry/straight_skeleton.*`) — shared by lot
+  subdivision and the roof operations, which is why it sits under
+  `src/geometry/` rather than under `road/`.
+- **Lots, lot edges and zoning** (`osm/road/lots.*`) — blocks subdivided into
+  lots with street-side classification.
+- **`full_operations()` / `full_functions()`** (`procgen/rules/registry.*`) —
+  the union of every operation family, in core rather than in the editor,
+  because the Python bindings and any headless path need the same table.
+- **Working Python bindings** — `stratum_python` builds and the bindings run.
+
+### Fixed
+
+- **`taper` on a footprint with a courtyard sloped the hole wall the wrong
+  way.** The offset normal was flipped by each ring's signed area, so a face
+  inset shrank its holes instead of growing them: over a 20×20 slab with a 4×4
+  lightwell, `taper(1.0)` left a 2×2 hole where 6×6 is correct, and the volume
+  came out 352 against the prismatoid integral's 336. The same bug then
+  refused `taper(3.0)` — an ordinary frustum — as a collapse.
+- **A mirrored scope emitted every triangle inside out.** The renderer culled
+  the front faces and lit the back ones. Both operation orders were broken for
+  opposite reasons, so both halves of the fix are needed.
+- **`offset` and `setback` reported success having done nothing** for any
+  distance between 2e-9 and about 5e-6 — a dead band between the point epsilon
+  and the Clipper2 integer grid. `setback` also handed back an empty border
+  while claiming to have removed one.
+- **`scale` was a silent no-op on a shape with no geometry**, which is exactly
+  the case reserved so a rule can build a scope and then insert an asset into
+  it.
+- **Every wall of a box got a different texture orientation.** The UV basis
+  seeded itself from the face normal alone, so a wall facing x had its texture
+  rotated a quarter turn against one facing z, and three of four ran negative.
+- The GPU test suites crashed at exit, and a test that bailed early counted as
+  a pass. The framework now has `skip_test()` and `register_teardown()`.
+- CI ran the suite only on pull requests targeting `master`, so every stacked
+  pull request merged on a green tick that had never run against its own code.
+
+### Changed
+
+- `src/procgen/rules/ast.hpp`'s `kBuiltinOperations` is the parse-time name
+  catalogue: a name absent from it does not resolve, so registering a handler
+  is only half of adding an operation. A test pins which rows still have no
+  handler, so wiring a family in and forgetting `registry.cpp` cannot pass
+  quietly.
+
+### Known limitations
+
+- The straight skeleton does not handle interior rings, so five of the six
+  roof kinds refuse a courtyard footprint rather than emit geometry over land
+  that does not exist (#127).
+- `shapeL`, `shapeU` and `shapeO` were never implemented (#129).
+- Texturing operations have nowhere to store a UV: `ShapeGeometry` carries no
+  UV set, and `shape_to_mesh()` projects at triangulation time (#45).
+
 ## [0.4.0] — 2026-09-16
 
 Milestone **M2 (scene foundations)** complete, plus the first of M3, M7 and M8.
