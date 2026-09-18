@@ -195,7 +195,9 @@ add_library(stratum_core STATIC
 
     # Procedural Generation
     src/procgen/noise.cpp
+    src/procgen/building_lod.cpp
     src/procgen/heightmap_io.cpp
+    src/procgen/instances.cpp
 
     # The rule language. D1 is the lexer, AST and parser; the interpreter
     # (D2-D6) lands alongside them here.
@@ -207,6 +209,7 @@ add_library(stratum_core STATIC
     src/procgen/rules/op_comp.cpp
     src/procgen/rules/op_control.cpp
     src/procgen/rules/op_facade.cpp
+    src/procgen/rules/op_insert.cpp
     src/procgen/rules/op_mass.cpp
     src/procgen/rules/op_roof.cpp
     src/procgen/rules/registry.cpp

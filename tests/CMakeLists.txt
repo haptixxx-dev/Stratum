@@ -102,6 +102,8 @@ set(STRATUM_TEST_SOURCES
     procgen/test_op_facade.cpp
     procgen/test_op_mass.cpp
     procgen/test_op_roof.cpp
+    procgen/test_building_lod.cpp
+    procgen/test_instances.cpp
     procgen/test_registry.cpp
 
     # Attribute-mode colour tables: totality, determinism and separation.
@@ -144,6 +146,8 @@ set(STRATUM_TEST_SUITES
     RuleStatements
     OpSplit
     OpComp
+    BuildingLod
+    Instances
     OpControl
     OpFacade
     OpMass
