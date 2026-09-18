@@ -121,6 +121,7 @@ add_library(stratum_core STATIC
     src/osm/coordinates.cpp
     src/osm/mesh_builder.cpp
     src/osm/quadtree.cpp
+    src/osm/rule_seed.cpp
     src/osm/scene_export.cpp
     src/osm/attribute_palette.cpp
     src/osm/building_collision.cpp

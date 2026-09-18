@@ -62,7 +62,7 @@ namespace {
 
 /// How many .rule files examples/rules/ holds. See the header: this is pinned
 /// on purpose, so adding one is a deliberate act rather than an accident.
-constexpr size_t kExampleCount = 12;
+constexpr size_t kExampleCount = 13;
 
 struct Example {
     const char* file;
@@ -92,6 +92,10 @@ constexpr Example kExamples[] = {
     {"10_recursive_district.rule", 120.0, 80.0, 1500, 15000},
     {"11_fractal_tower.rule",     32.0, 32.0, 1200, 25000},
     {"12_stacked_modules.rule",   24.0, 14.0, 100,  1200},
+    // Written for an OSM seed, where it reads the feature's tags. On the test
+    // rectangle it still runs and takes every default, which is the fallback
+    // path and worth holding to as well.
+    {"13_from_osm_tags.rule",     16.0, 12.0, 100,  1200},
 };
 
 [[nodiscard]] std::filesystem::path examples_dir() {

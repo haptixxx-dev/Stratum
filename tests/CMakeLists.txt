@@ -109,6 +109,7 @@ set(STRATUM_TEST_SOURCES
 
     # Attribute-mode colour tables: totality, determinism and separation.
     osm/test_attribute_palette.cpp
+    osm/test_rule_seed.cpp
 
     # Building footprints to closed collision prisms.
     osm/test_building_collision.cpp
@@ -155,6 +156,7 @@ set(STRATUM_TEST_SUITES
     OpMass
     OpRoof
     Registry
+    RuleSeed
     StraightSkeleton
     LotsOffset
     GraphEdit

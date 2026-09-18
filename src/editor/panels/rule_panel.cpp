@@ -23,6 +23,18 @@
  * 3. **See the building.** The terminals, merged into one mesh and drawn in the
  *    viewport with the rest of the opaque scene.
  *
+ * ### What the rule is pointed AT
+ *
+ * A test rectangle, or every building in the OSM import. The second is the
+ * workflow the project exists for -- import an extract and generate over what
+ * came back -- and until it existed the rule engine could only ever be aimed
+ * at a rectangle.
+ *
+ * An imported seed carries its feature's tags as shape attributes, so a rule
+ * reads `attrs.get("osm.levels", 3)` and builds the height the survey
+ * recorded rather than a number written into the rule file. osm/rule_seed.hpp
+ * lists the names.
+ *
  * ### Parse on every edit; RUN on a button
  *
  * The parse is cheap, cannot loop, and is what puts a caret under a typo while
@@ -46,6 +58,8 @@
 
 #include "procgen/rules/interpreter.hpp"
 #include "procgen/rules/parser.hpp"
+#include "osm/parser.hpp"
+#include "osm/rule_seed.hpp"
 #include "procgen/rules/registry.hpp"
 #include "procgen/rules/shape.hpp"
 #include "renderer/gpu_renderer.hpp"
@@ -61,6 +75,29 @@ namespace stratum {
 namespace {
 
 using namespace stratum::procgen::rules;
+
+/// Diagnostics kept from ONE run, across every seed it generated
+constexpr size_t kMaxRunDiagnostics = 40;
+
+/// `print` lines kept from one run. A city extract can emit one per building.
+constexpr size_t kMaxRunLogLines = 200;
+
+/**
+ * @brief Append one generation's mesh onto @p combined
+ *
+ * Mesh::append() does the work -- it renumbers the indices, expands the
+ * bounds, and materialises the implicit whole-mesh submesh range so the
+ * geometry already there keeps its identity. Rebuilding that here would be a
+ * second copy of logic that is already right.
+ *
+ * Every building is attributed to one material, so a preview of a thousand of
+ * them is one draw call rather than a thousand tiny ones.
+ */
+void append_result_to_mesh(const GenerationResult& result, Mesh& combined) {
+    const Mesh piece = result.build_mesh();
+    if (piece.vertices.empty() || piece.indices.empty()) return;
+    combined.append(piece, MaterialId::Concrete);
+}
 
 /// ImGui resize callback for an InputTextMultiline over a std::string
 int rule_source_resize(ImGuiInputTextCallbackData* data) {
@@ -179,25 +216,88 @@ void Editor::run_rule_source() {
     GenerationOptions options;
     options.seed = static_cast<uint64_t>(static_cast<uint32_t>(m_rule_seed));
 
-    const Shape seed = shape_from_rect(static_cast<double>(m_rule_seed_width),
-                                       static_cast<double>(m_rule_seed_depth));
+    // Every seed the run will use. One rectangle, or one per imported
+    // building -- the loop below is the same either way, which is what keeps
+    // the two paths from drifting apart.
+    std::vector<Shape> seeds;
+    m_rule_buildings_built = 0;
+    m_rule_buildings_skipped = 0;
 
-    const GenerationResult result =
-        generate(parsed.file, seed, options, &full_operations(), &full_functions());
-
-    for (const Diagnostic& diagnostic : result.diagnostics) {
-        m_rule_diagnostics.push_back(render_diagnostic(diagnostic, m_rule_source, parsed.filename));
-        if (diagnostic.severity == Severity::Error) m_rule_has_error = true;
+    if (m_rule_seed_source == RuleSeedSource::ImportedBuildings && m_osm_parser.has_data()) {
+        const auto& buildings = m_osm_parser.get_data().buildings;
+        const size_t limit = m_rule_building_limit > 0
+                                 ? static_cast<size_t>(m_rule_building_limit)
+                                 : buildings.size();
+        for (const osm::Building& building : buildings) {
+            if (seeds.size() >= limit) {
+                ++m_rule_buildings_skipped;
+                continue;
+            }
+            Shape seed = osm::seed_from_building(building);
+            // A degenerate footprint seeds an empty shape. Running a rule on
+            // it produces nothing and costs a diagnostic per building, which
+            // on a city extract buries every message that matters.
+            if (seed.geometry.faces.empty()) {
+                ++m_rule_buildings_skipped;
+                continue;
+            }
+            seeds.push_back(std::move(seed));
+        }
+    } else {
+        seeds.push_back(shape_from_rect(static_cast<double>(m_rule_seed_width),
+                                        static_cast<double>(m_rule_seed_depth)));
     }
-    m_rule_log = result.log;
 
-    m_rule_terminals = result.stats.terminals;
-    m_rule_shapes = result.stats.shapes_created;
-    m_rule_rules_invoked = result.stats.rules_invoked;
-    m_rule_operations = result.stats.operations_applied;
-    m_rule_max_depth = result.stats.max_depth_reached;
-    m_rule_depth_capped = result.stats.depth_limit_hit;
-    m_rule_shape_capped = result.stats.shape_limit_hit;
+    GenerationStats totals{};
+    Mesh combined;
+    size_t diagnostics_shown = 0;
+
+    for (const Shape& seed : seeds) {
+        const GenerationResult result =
+            generate(parsed.file, seed, options, &full_operations(), &full_functions());
+
+        // One building's diagnostics are worth reading; four hundred copies of
+        // the same one are not. The budget is the same idea as
+        // GenerationResult's own cap, applied across the run rather than
+        // within it.
+        for (const Diagnostic& diagnostic : result.diagnostics) {
+            if (diagnostics_shown < kMaxRunDiagnostics) {
+                m_rule_diagnostics.push_back(
+                    render_diagnostic(diagnostic, m_rule_source, parsed.filename));
+                ++diagnostics_shown;
+            }
+            if (diagnostic.severity == Severity::Error) m_rule_has_error = true;
+        }
+        for (const std::string& line : result.log) {
+            if (m_rule_log.size() < kMaxRunLogLines) m_rule_log.push_back(line);
+        }
+
+        totals.terminals += result.stats.terminals;
+        totals.shapes_created += result.stats.shapes_created;
+        totals.rules_invoked += result.stats.rules_invoked;
+        totals.operations_applied += result.stats.operations_applied;
+        totals.max_depth_reached =
+            std::max(totals.max_depth_reached, result.stats.max_depth_reached);
+        totals.depth_limit_hit = totals.depth_limit_hit || result.stats.depth_limit_hit;
+        totals.shape_limit_hit = totals.shape_limit_hit || result.stats.shape_limit_hit;
+
+        append_result_to_mesh(result, combined);
+        ++m_rule_buildings_built;
+    }
+
+    if (diagnostics_shown >= kMaxRunDiagnostics) {
+        m_rule_diagnostics.push_back(
+            "... more diagnostics were produced and are not shown. Fix these first,\n"
+            "or switch the seed back to the test rectangle to read one building's.\n");
+    }
+
+    m_rule_terminals = totals.terminals;
+    m_rule_shapes = totals.shapes_created;
+    m_rule_rules_invoked = totals.rules_invoked;
+    m_rule_operations = totals.operations_applied;
+    m_rule_max_depth = totals.max_depth_reached;
+    m_rule_depth_capped = totals.depth_limit_hit;
+    m_rule_shape_capped = totals.shape_limit_hit;
     m_rule_has_run = true;
     m_rule_dirty = false;
 
@@ -206,7 +306,7 @@ void Editor::run_rule_source() {
     // rule that stopped generating looks like a rule that still works.
     clear_rule_preview();
 
-    m_rule_preview_mesh = result.build_mesh();
+    m_rule_preview_mesh = std::move(combined);
     if (m_rule_preview_mesh.vertices.empty() || !m_gpu_renderer) return;
 
     MeshOwner owner;
@@ -243,11 +343,46 @@ void Editor::draw_rule_source() {
 
     ImGui::Separator();
 
-    ImGui::SetNextItemWidth(120.0f);
-    ImGui::DragFloat("Width (m)", &m_rule_seed_width, 0.1f, 0.5f, 500.0f, "%.2f");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(120.0f);
-    ImGui::DragFloat("Depth (m)", &m_rule_seed_depth, 0.1f, 0.5f, 500.0f, "%.2f");
+    // Where the seeds come from. The imported option is disabled rather than
+    // hidden when there is no import, so the feature is discoverable before
+    // anyone has loaded an extract.
+    const bool have_import = m_osm_parser.has_data() &&
+                             !m_osm_parser.get_data().buildings.empty();
+
+    int source = static_cast<int>(m_rule_seed_source);
+    ImGui::SetNextItemWidth(200.0f);
+    if (ImGui::Combo("Seed from", &source, "Test rectangle\0Imported buildings\0")) {
+        if (source == 1 && !have_import) {
+            source = 0;
+        }
+        m_rule_seed_source = static_cast<RuleSeedSource>(source);
+        m_rule_dirty = true;
+    }
+    if (!have_import) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(no OSM import loaded)");
+    } else if (m_rule_seed_source == RuleSeedSource::ImportedBuildings) {
+        ImGui::SameLine();
+        ImGui::Text("%zu available", m_osm_parser.get_data().buildings.size());
+    }
+
+    if (m_rule_seed_source == RuleSeedSource::ImportedBuildings) {
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::InputInt("Max buildings", &m_rule_building_limit);
+        if (m_rule_building_limit < 1) m_rule_building_limit = 1;
+        ImGui::SetItemTooltip(
+            "A city extract holds tens of thousands of footprints. Generating "
+            "all of them makes a mesh no preview can hold and an editor that "
+            "looks hung. What was skipped is reported under Output.");
+        // The rectangle's size is meaningless here, so it is not drawn. A
+        // control that does nothing is worse than a missing one.
+    } else {
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::DragFloat("Width (m)", &m_rule_seed_width, 0.1f, 0.5f, 500.0f, "%.2f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::DragFloat("Depth (m)", &m_rule_seed_depth, 0.1f, 0.5f, 500.0f, "%.2f");
+    }
     ImGui::SetNextItemWidth(160.0f);
     ImGui::InputInt("Seed", &m_rule_seed);
     ImGui::SetItemTooltip(
@@ -351,6 +486,20 @@ void Editor::draw_rule_stats() {
     if (m_rule_shape_capped) {
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
                            "Shape cap hit - output is truncated.");
+    }
+
+    if (m_rule_seed_source == RuleSeedSource::ImportedBuildings) {
+        ImGui::Text("Buildings: %u generated", m_rule_buildings_built);
+        if (m_rule_buildings_skipped > 0) {
+            // Said, not swallowed. A city that is missing a third of itself
+            // because of a cap looks exactly like a city that finished.
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "| %u skipped",
+                               m_rule_buildings_skipped);
+            ImGui::SetItemTooltip(
+                "Past the Max buildings cap, or a footprint with fewer than "
+                "three usable points.");
+        }
     }
 
     ImGui::Text("Preview: %zu vertices, %zu triangles",

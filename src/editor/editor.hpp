@@ -1139,6 +1139,38 @@ private:
     /// Source changed since the last run. Drives the "stale" marker on the output.
     bool m_rule_dirty = false;
 
+    /**
+     * @brief Where the rule gets its seed shapes from
+     *
+     * TestRectangle is a single rectangle on the ground plane, which is what
+     * the panel opens with and what every example in examples/rules/ is
+     * written against.
+     *
+     * ImportedBuildings runs the rule once per building in the OSM import,
+     * seeded from the real footprint with the feature's tags as shape
+     * attributes -- so a rule can read `attrs.get("osm.levels")` and build the
+     * height the survey recorded. That is the workflow the whole project is
+     * for, and until this existed the rule engine could only ever be pointed
+     * at a test rectangle.
+     */
+    enum class RuleSeedSource { TestRectangle = 0, ImportedBuildings };
+    RuleSeedSource m_rule_seed_source = RuleSeedSource::TestRectangle;
+
+    /**
+     * @brief Cap on how many imported buildings one run generates
+     *
+     * A city extract holds tens of thousands of footprints, and a rule that
+     * makes a few hundred triangles each would produce a mesh no preview can
+     * hold and take long enough that the editor looks hung. The cap is
+     * REPORTED when it bites, the same way InterpreterLimits reports its own,
+     * because a partial city that looks finished is the thing to avoid.
+     */
+    int m_rule_building_limit = 250;
+
+    /// Buildings the last run actually generated, and how many it skipped
+    uint32_t m_rule_buildings_built = 0;
+    uint32_t m_rule_buildings_skipped = 0;
+
     /// The seed shape: a rectangle of this size on the ground plane, in metres
     float m_rule_seed_width = 12.0f;
     float m_rule_seed_depth = 10.0f;

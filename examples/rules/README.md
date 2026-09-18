@@ -18,6 +18,32 @@ headlessly through `full_operations()`.
 | `07_by_attribute.rule` | 16 × 12 | One file, four building types, chosen by an `attr`. Copy this for a rule pack. |
 | `08_stochastic_street.rule` | 60 × 14 | Variety that reproduces exactly. `choose`, `random.*`, and why the seeding works |
 
+## Running rules on an imported city
+
+`13_from_osm_tags.rule` is the one to point at an OSM import rather than at a
+rectangle. In the rule editor set **Seed from** to **Imported buildings**; the
+rule then runs once per footprint in the extract, seeded from the real outline
+with the feature's tags attached as shape attributes.
+
+| attribute | type | |
+|---|---|---|
+| `osm.id` | int | the OSM way or relation id |
+| `osm.height` | float | metres, as mapped or as defaulted on import |
+| `osm.levels` | int | storeys |
+| `osm.type` | string | `house`, `apartments`, `retail`, `warehouse`, … |
+| `osm.roof` | string | `flat`, `gable`, `hip`, `pyramid`, `shed`, `dome` |
+| `osm.name` | string | only when the feature is named |
+
+`osm.roof` is spelled the way `roof()` spells its kinds — OSM's *skillion* and
+*pyramidal* are translated at the seam, so a rule writes
+`roof(attrs.get("osm.roof", "hip"))` with no lookup table of its own. The full
+list is in `src/osm/rule_seed.hpp`.
+
+Measured against the Lucan extract: 24,576 buildings, of which 20,598 are
+tagged `house` and 16,287 have a flat roof. About one in eight refuses a
+pitched roof because real outlines have spike corners — issue #133, waiting on
+`cleanup()`.
+
 ## The recursive four
 
 These are the ones worth reading for what the language can actually do. None
