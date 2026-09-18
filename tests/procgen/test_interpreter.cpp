@@ -109,6 +109,8 @@ using stratum::procgen::rules::Severity;
 using stratum::procgen::rules::Shape;
 using stratum::procgen::rules::ShapeGeometry;
 using stratum::procgen::rules::shape_from_rect;
+using stratum::procgen::rules::shape_from_polygon;
+using stratum::procgen::rules::shape_from_rings;
 using stratum::procgen::rules::taper_shape;
 using stratum::procgen::rules::translate_shape;
 using stratum::procgen::rules::Value;
@@ -269,6 +271,14 @@ void world_bounds(const Shape& shape, glm::dvec3& min_out, glm::dvec3& max_out) 
 [[nodiscard]] GenerationResult run_square(const std::string& source,
                                           const GenerationOptions& options = {}) {
     return run_on(source, shape_from_rect(1.0, 1.0), options);
+}
+
+/// run_on() against a rectangle, for anything that needs the two ground axes
+/// to differ -- a square cannot tell a u that runs along x from one along z.
+[[nodiscard]] GenerationResult run_rect(double size_x, double size_z,
+                                        const std::string& source,
+                                        const GenerationOptions& options = {}) {
+    return run_on(source, shape_from_rect(size_x, size_z), options);
 }
 
 /**
@@ -465,6 +475,98 @@ TEST(Interpreter, a_taper_that_eats_the_outline_is_refused_and_names_the_height)
     CHECK_NEAR(geometry_area(shape.geometry), 1.0, 1e-12);
 }
 
+TEST(Interpreter, taper_grows_a_hole_while_it_shrinks_the_outline) {
+    // The case no taper test covered, and the one that was wrong. Every taper
+    // test above uses shape_from_rect, which has no hole, so the per-ring
+    // normal in miter_inset() could point the wrong way for holes and the whole
+    // suite stayed green.
+    //
+    // A 20x20 slab with a 4x4 lightwell at (8,8)-(12,12), tapered by 1 m. The
+    // sides rise at 45 degrees, so every edge moves 1 m into the MATERIAL: the
+    // outer draws in to 18x18, and the hole boundary pushes out to 6x6. A hole
+    // that shrank would mean its wall overhung the void.
+    const std::vector<glm::dvec2> outer = {{0.0, 0.0}, {20.0, 0.0}, {20.0, 20.0}, {0.0, 20.0}};
+    const std::vector<std::vector<glm::dvec2>> holes = {
+        {{8.0, 8.0}, {12.0, 8.0}, {12.0, 12.0}, {8.0, 12.0}}};
+    Shape shape = shape_from_rings(outer, holes);
+    CHECK_NEAR(geometry_area(shape.geometry), 400.0 - 16.0, 1e-9);
+
+    CHECK_TRUE(taper_shape(shape, 1.0).ok);
+
+    const int top = only_face_facing(shape.geometry, glm::dvec3{0.0, 1.0, 0.0}, 1e-9);
+    CHECK((top) >= 0);
+    if (top >= 0) {
+        // 18*18 - 6*6 = 288. The broken version shrank the hole to 2x2 and gave
+        // 18*18 - 2*2 = 320, so this number alone separates the two.
+        CHECK_NEAR(face_area(shape.geometry, shape.geometry.faces[static_cast<size_t>(top)]),
+                   288.0, 1e-9);
+        CHECK_EQ(shape.geometry.faces[static_cast<size_t>(top)].holes.size(), size_t{1});
+    }
+
+    // Derived independently of the implementation: for a prismatoid whose cross
+    // section at height t is (20-2t)^2 - (4+2t)^2, the volume is
+    // integral over [0,1] of (384 - 96t) dt = 384 - 48 = 336. A shrinking hole
+    // integrates (384 - 64t) dt = 352 instead.
+    CHECK_NEAR(geometry_volume(shape.geometry), 336.0, 1e-9);
+}
+
+TEST(Interpreter, a_taper_deeper_than_half_a_hole_is_still_allowed) {
+    // The other half of the same bug: with the hole shrinking, the fold check
+    // fired on legitimate input and refused any taper past half the smallest
+    // hole width. On a 20x20 slab with a 4x4 hole, taper(3.0) is an ordinary
+    // frustum -- outer 14x14, hole 10x10 -- and must be accepted.
+    const std::vector<glm::dvec2> outer = {{0.0, 0.0}, {20.0, 0.0}, {20.0, 20.0}, {0.0, 20.0}};
+    const std::vector<std::vector<glm::dvec2>> holes = {
+        {{8.0, 8.0}, {12.0, 8.0}, {12.0, 12.0}, {8.0, 12.0}}};
+    Shape shape = shape_from_rings(outer, holes);
+
+    const OpResult result = taper_shape(shape, 3.0);
+    CHECK_TRUE(result.ok);
+
+    const int top = only_face_facing(shape.geometry, glm::dvec3{0.0, 1.0, 0.0}, 1e-9);
+    CHECK((top) >= 0);
+    if (top >= 0) {
+        // 14*14 - 10*10 = 96.
+        CHECK_NEAR(face_area(shape.geometry, shape.geometry.faces[static_cast<size_t>(top)]),
+                   96.0, 1e-9);
+    }
+}
+
+TEST(Interpreter, scale_sets_the_size_of_a_shape_that_has_no_geometry) {
+    // shape.hpp reserves the geometry-less shape so that a rule can build a
+    // scope and then insert an asset into it. refit_scope() leaves such a scope
+    // alone by design, so `scale` is the only operation that can set its size --
+    // and it used to derive the size from geometry that was not there, return
+    // success, and change nothing.
+    Shape shape;
+    shape.scope.size = glm::dvec3{1.0, 1.0, 1.0};
+    CHECK_TRUE(shape.geometry.positions.empty());
+
+    const OpResult result = scale_shape(shape, glm::dvec3{10.0, 3.0, 8.0});
+    CHECK_TRUE(result.ok);
+    check_vec3(shape.scope.size, glm::dvec3{10.0, 3.0, 8.0}, 1e-12);
+
+    // From a zero scope too -- that is what a freshly constructed Scope is, and
+    // it is what a rule building a scope from nothing starts with.
+    Shape fresh;
+    CHECK_TRUE(scale_shape(fresh, glm::dvec3{2.0, 4.0, 6.0}).ok);
+    check_vec3(fresh.scope.size, glm::dvec3{2.0, 4.0, 6.0}, 1e-12);
+
+    // Still no geometry: scale sets the frame, it does not invent a box.
+    CHECK_TRUE(fresh.geometry.positions.empty());
+}
+
+TEST(Interpreter, scale_names_the_axes_it_skipped_in_the_plural) {
+    // A flat footprint has no thickness to multiply, and the message has to say
+    // so. With geometry present the per-axis refusal still applies -- this is
+    // only about it reading as English when more than one axis is skipped.
+    Shape shape = shape_from_rect(2.0, 2.0);
+    const OpResult result = scale_shape(shape, glm::dvec3{4.0, 1.0, 4.0});
+    CHECK_FALSE(result.ok);
+    CHECK_TRUE(says(result.message, "that axis"));
+    CHECK_FALSE(says(result.message, "those axes"));
+}
+
 TEST(Interpreter, a_taper_of_a_non_positive_height_is_refused) {
     Shape shape = shape_from_rect(1.0, 1.0);
     CHECK_FALSE(taper_shape(shape, 0.0).ok);
@@ -533,6 +635,71 @@ TEST(Interpreter, offset_inside_and_offset_border_partition_the_original_face) {
     CHECK_TRUE(offset_shape(all, -0.1, OffsetSelector::All).ok);
     CHECK_EQ(all.geometry.faces.size(), size_t{2});
     CHECK_NEAR(geometry_area(all.geometry), 1.0, 1e-9);
+}
+
+TEST(Interpreter, an_offset_too_small_to_move_anything_is_refused) {
+    // Everything here goes through Clipper2 on a 1e-5 integer grid, so a
+    // distance below one count rounds both outlines onto the same grid points
+    // and changes nothing. That used to be ACCEPTED: the guard was
+    // kPointEpsilon at 1e-9, leaving a dead band three and a half orders of
+    // magnitude wide where the call reported success, the result was non-empty
+    // so no "removed everything" guard fired, and the shape was untouched.
+    for (const double tiny : {1e-8, 1e-7, 1e-6, 4e-6}) {
+        Shape shape = shape_from_rect(10.0, 10.0);
+        const OpResult result = offset_shape(shape, -tiny, OffsetSelector::Inside);
+        CHECK_FALSE(result.ok);
+        // The message names the resolution, because "too small" sends the
+        // author looking for a bug in their own arithmetic.
+        CHECK_TRUE(says(result.message, "1e-5"));
+        CHECK_NEAR(geometry_area(shape.geometry), 100.0, 1e-12);
+    }
+
+    // Just above one count still works, and actually removes something.
+    Shape shape = shape_from_rect(10.0, 10.0);
+    CHECK_TRUE(offset_shape(shape, -2e-5, OffsetSelector::Inside).ok);
+    CHECK((geometry_area(shape.geometry)) < 100.0);
+}
+
+TEST(Interpreter, a_setback_too_small_to_remove_anything_is_refused) {
+    // Same dead band, and worse here: setback_shape's contract is that it hands
+    // the removed border back. Succeeding with an empty border while
+    // keep_border is true is a lie about what the operation did.
+    ShapeGeometry border;
+    for (const double tiny : {1e-8, 1e-6, 4e-6}) {
+        Shape shape = shape_from_rect(10.0, 10.0);
+        const OpResult result = setback_shape(shape, tiny, border, true);
+        CHECK_FALSE(result.ok);
+        CHECK_TRUE(says(result.message, "1e-5"));
+        CHECK_TRUE(border.faces.empty());
+        CHECK_NEAR(geometry_area(shape.geometry), 100.0, 1e-12);
+    }
+}
+
+TEST(Interpreter, setback_partitions_a_footprint_that_is_not_on_the_grid) {
+    // Every other partition test uses dimensions that are exact multiples of the
+    // 1e-5 Clipper grid, so the quantisation is invisible to them and the 1e-9
+    // tolerance they assert is free. A real footprint is not grid-aligned.
+    //
+    // This pins the actual precision rather than pretending it is exact: the
+    // partition holds to a fraction of a square millimetre on a 234 m plot,
+    // which is what a 10 micrometre coordinate grid buys. A test asserting
+    // 1e-9 here would fail, and a test with no non-grid case at all -- which is
+    // what existed -- hides the limit entirely.
+    const std::vector<glm::dvec2> ring = {
+        {0.0, 0.0}, {18.374829175, 0.0}, {19.203718264, 11.847261935},
+        {7.918273645, 14.372615908}, {0.0, 9.283746152}};
+    Shape shape = shape_from_polygon(ring);
+    const double total = geometry_area(shape.geometry);
+    CHECK((total) > 200.0);
+
+    ShapeGeometry border;
+    CHECK_TRUE(setback_shape(shape, 1.5, border, true).ok);
+
+    const double inner = geometry_area(shape.geometry);
+    const double removed = geometry_area(border);
+    CHECK((inner) > 0.0);
+    CHECK((removed) > 0.0);
+    CHECK_NEAR(inner + removed, total, 1e-3);
 }
 
 TEST(Interpreter, a_positive_offset_grows_the_outline) {
@@ -1116,6 +1283,147 @@ TEST(Interpreter, build_mesh_writes_world_space_normals_and_real_tangents) {
     CHECK_EQ(axis_aligned, 24);
     CHECK_EQ(unit_tangents, 24);
     CHECK_EQ(perpendicular_tangents, 24);
+
+    // Counting "axis aligned" is not enough, and this is where the test used to
+    // stop. Forcing every one of the 24 normals to (0,1,0) scores 24/24 on all
+    // three counters above -- it is unit, it is axis aligned, and (1,0,0) is
+    // perpendicular to it. So pin WHICH axes, with their multiplicity: a box has
+    // six faces, one per world axis direction, four vertices each.
+    int per_direction[6] = {0, 0, 0, 0, 0, 0};
+    for (const stratum::Vertex& vertex : mesh.vertices) {
+        const glm::dvec3 n{vertex.normal.x, vertex.normal.y, vertex.normal.z};
+        if (n.x > 0.5) ++per_direction[0];
+        if (n.x < -0.5) ++per_direction[1];
+        if (n.y > 0.5) ++per_direction[2];
+        if (n.y < -0.5) ++per_direction[3];
+        if (n.z > 0.5) ++per_direction[4];
+        if (n.z < -0.5) ++per_direction[5];
+    }
+    for (const int count : per_direction) {
+        CHECK_EQ(count, 4);
+    }
+
+    // And that each shaded normal agrees with the WINDING of a triangle that
+    // uses it. A normal can name the right axis and point the wrong way along
+    // it -- which is what happens to every triangle of a mirrored scope, where
+    // the geometry is emitted inside out and the renderer culls the front faces.
+    int inside_out = 0;
+    for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+        const stratum::Vertex& a = mesh.vertices[mesh.indices[i]];
+        const stratum::Vertex& b = mesh.vertices[mesh.indices[i + 1]];
+        const stratum::Vertex& c = mesh.vertices[mesh.indices[i + 2]];
+        const glm::dvec3 pa{a.position.x, a.position.y, a.position.z};
+        const glm::dvec3 pb{b.position.x, b.position.y, b.position.z};
+        const glm::dvec3 pc{c.position.x, c.position.y, c.position.z};
+        const glm::dvec3 wound = glm::cross(pb - pa, pc - pa);
+        const glm::dvec3 shaded{a.normal.x, a.normal.y, a.normal.z};
+        if (glm::dot(glm::normalize(wound), shaded) < 0.0) {
+            ++inside_out;
+        }
+    }
+    CHECK_EQ(inside_out, 0);
+}
+
+TEST(Interpreter, a_mirrored_scope_still_emits_outward_facing_triangles) {
+    // mirror_scope() makes the frame left-handed on purpose. A reflection
+    // reverses orientation, so without a compensating flip every triangle of
+    // the solid comes out wound against its own shaded normal: the renderer
+    // culls the front faces, lights the back ones, and compute_tangents()
+    // derives handedness from the wrong normal. A mirrored building renders as
+    // a hole in the world.
+    //
+    // BOTH orders are checked, and they used to fail for opposite reasons --
+    // after `extrude; mirror_scope` the winding was right and the normal
+    // inverted; after `mirror_scope; extrude` the normal was right and the
+    // winding inverted. A patch to only one of reframe() or
+    // append_shape_to_mesh() fixes one order and cancels itself out on the
+    // other, which is why this test runs both.
+    const char* sources[] = {
+        "@start\nrule Main { extrude(3.0); }\n",
+        "@start\nrule Main { extrude(3.0); mirror_scope(\"x\"); }\n",
+        "@start\nrule Main { mirror_scope(\"x\"); extrude(3.0); }\n",
+    };
+
+    for (const char* source : sources) {
+        const GenerationResult result = run_rect(4.0, 2.0, source);
+        CHECK_TRUE(result.ok());
+        const Mesh mesh = result.build_mesh();
+        CHECK_EQ(mesh.indices.size(), size_t{36});
+
+        int inside_out = 0;
+        for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+            const stratum::Vertex& a = mesh.vertices[mesh.indices[i]];
+            const stratum::Vertex& b = mesh.vertices[mesh.indices[i + 1]];
+            const stratum::Vertex& c = mesh.vertices[mesh.indices[i + 2]];
+            const glm::dvec3 pa{a.position.x, a.position.y, a.position.z};
+            const glm::dvec3 pb{b.position.x, b.position.y, b.position.z};
+            const glm::dvec3 pc{c.position.x, c.position.y, c.position.z};
+            const glm::dvec3 wound = glm::cross(pb - pa, pc - pa);
+            if (glm::length(wound) < 1e-12) continue;
+            const glm::dvec3 shaded{a.normal.x, a.normal.y, a.normal.z};
+            if (glm::dot(glm::normalize(wound), shaded) < 0.0) {
+                ++inside_out;
+            }
+        }
+        CHECK_EQ(inside_out, 0);
+    }
+}
+
+TEST(Interpreter, every_wall_of_a_box_gets_the_same_texture_orientation) {
+    // UVs are a planar projection in metres, so a texture tiles at real-world
+    // scale. That claim is only worth anything if the four walls agree on which
+    // way is up: a facade texture has brick courses, and a wall whose texture is
+    // rotated a quarter turn is the most visible defect a generated building
+    // can have.
+    //
+    // The old basis seeded itself from the normal alone -- "the world axis the
+    // normal is least aligned with" -- which is a DIFFERENT axis for a wall
+    // facing x than for one facing z. Measured on this box it gave three
+    // different orientations across four walls, and three of the four ran
+    // negative.
+    //
+    // This also pins the UVs to the geometry at all. Replacing the projection
+    // with any fixed function of the local position -- {x*7+3, z*7+3}, say --
+    // used to pass the whole suite.
+    const GenerationResult result = run_rect(4.0, 2.0, "@start\nrule Main { extrude(3.0); }\n");
+    CHECK_TRUE(result.ok());
+
+    const Mesh mesh = result.build_mesh();
+    CHECK_EQ(mesh.vertices.size(), size_t{24});
+
+    // For each of the four walls, v must run up the wall: the two vertices at
+    // the top of the box must have a greater v than the two at the bottom, and
+    // the difference must be the wall's height in metres.
+    int walls_checked = 0;
+    for (const glm::dvec3 facing : {glm::dvec3{1, 0, 0}, glm::dvec3{-1, 0, 0},
+                                    glm::dvec3{0, 0, 1}, glm::dvec3{0, 0, -1}}) {
+        double v_at_bottom = 0.0;
+        double v_at_top = 0.0;
+        double u_min = 1e9;
+        double u_max = -1e9;
+        int bottom = 0;
+        int top = 0;
+        for (const stratum::Vertex& vertex : mesh.vertices) {
+            const glm::dvec3 n{vertex.normal.x, vertex.normal.y, vertex.normal.z};
+            if (glm::dot(n, facing) < 0.9) continue;
+            u_min = std::min(u_min, static_cast<double>(vertex.uv.x));
+            u_max = std::max(u_max, static_cast<double>(vertex.uv.x));
+            if (vertex.position.y < 0.001) { v_at_bottom += vertex.uv.y; ++bottom; }
+            else { v_at_top += vertex.uv.y; ++top; }
+        }
+        CHECK_EQ(bottom, 2);
+        CHECK_EQ(top, 2);
+        if (bottom == 2 && top == 2) {
+            // v increases upwards, by exactly the 3 m the box was extruded.
+            CHECK_NEAR(v_at_top / 2.0 - v_at_bottom / 2.0, 3.0, 1e-5);
+            // u spans the wall's width in metres: 4 m on the z-facing walls,
+            // 2 m on the x-facing ones. Metres, not a normalised 0..1.
+            const double expected_width = std::fabs(facing.x) > 0.5 ? 2.0 : 4.0;
+            CHECK_NEAR(u_max - u_min, expected_width, 1e-5);
+            ++walls_checked;
+        }
+    }
+    CHECK_EQ(walls_checked, 4);
 }
 
 // ============================================================================
@@ -2139,7 +2447,19 @@ TEST(Interpreter, every_registered_operation_reaches_its_own_handler) {
     }
 
     // mirror_scope negates a scope AXIS and leaves every vertex in the world, so
-    // the frame turns left-handed and the signed volume changes sign with it.
+    // the frame turns left-handed. The HANDEDNESS lives in the frame and only in
+    // the frame: the local loops keep the Face contract -- wound
+    // counter-clockwise seen from outside -- so the local signed volume stays
+    // POSITIVE, and reframe() re-winds them to make that true.
+    //
+    // This used to assert -1.0, pinning the opposite. A reflection reverses
+    // orientation, so leaving the loops alone left every local loop violating
+    // the invariant every consumer of ShapeGeometry reads, and
+    // append_shape_to_mesh() then emitted all twelve triangles of the box
+    // inside out -- culled front-first and lit from behind. The sign of a local
+    // volume is not the thing to pin; whether the world triangles agree with
+    // their own normals is, and that is asserted in
+    // a_mirrored_scope_still_emits_outward_facing_triangles below.
     const GenerationResult flipped_frame =
         run_square("@start\nrule Main { extrude(1.0); mirror_scope(\"x\"); }\n");
     CHECK_TRUE(flipped_frame.ok());
@@ -2149,7 +2469,7 @@ TEST(Interpreter, every_registered_operation_reaches_its_own_handler) {
         world_bounds(flipped_frame.terminals[0], low, high);
         check_vec3(low, glm::dvec3{0.0, 0.0, 0.0}, 1e-12);
         check_vec3(high, glm::dvec3{1.0, 1.0, 1.0}, 1e-12);
-        CHECK_NEAR(geometry_volume(flipped_frame.terminals[0].geometry), -1.0, 1e-12);
+        CHECK_NEAR(geometry_volume(flipped_frame.terminals[0].geometry), 1.0, 1e-12);
         check_vec3(flipped_frame.terminals[0].scope.axes[0], glm::dvec3{-1.0, 0.0, 0.0}, 0.0);
     }
 

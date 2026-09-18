@@ -71,6 +71,22 @@ constexpr double kDirectionEpsilon = 1e-12;
 constexpr double kClipperScale = 1e5;
 
 /**
+ * @brief The smallest offset distance that can move anything, in scope units
+ *
+ * One Clipper count. Below this, to_path()'s llround puts both the original
+ * outline and the offset one on the same integer grid point, Clipper2 hands
+ * back what it was given, and the operation reports success having changed
+ * nothing -- with a non-empty result, so no "removed everything" guard fires
+ * either.
+ *
+ * Guarding on kPointEpsilon instead left a dead band three and a half orders of
+ * magnitude wide: every distance from 2e-9 up to about 5e-6 was accepted and
+ * silently ignored. An author insetting by a value they computed, and getting
+ * it wrong by a factor of a million, saw success and an unchanged building.
+ */
+constexpr double kMinOffsetDistance = 1.0 / kClipperScale;
+
+/**
  * @brief Miter limit for Clipper2 offsets
  *
  * 2.0 is Clipper2's own default. A sharper spike than twice the offset distance
@@ -175,6 +191,61 @@ struct FaceBasis {
     basis.n = n;
     basis.u = u;
     basis.v = glm::cross(n, u);
+    basis.valid = true;
+    return basis;
+}
+
+/**
+ * @brief A plane frame for TEXTURING, with v pointing up the wall
+ *
+ * basis_from_normal() picks its seed from the normal alone. That is right for
+ * the Clipper2 projection, which only needs some consistent plane frame and
+ * must not depend on anything but the geometry -- but it is wrong for UVs,
+ * because "the world axis the normal is least aligned with" is a different axis
+ * for a wall facing x than for a wall facing z.
+ *
+ * Measured on a plain 4x3x2 box, that gave the four walls THREE different
+ * texture orientations: +z got u=+x v=+y, +-x got u=+y (the texture rotated a
+ * quarter turn), -z got v=-y (flipped), and three of the four ran negative,
+ * which breaks any clamped sampler or atlas rectangle. The file header's claim
+ * that UVs are "a planar projection in the face's own basis, in metres, so a
+ * texture tiles at real-world scale" was true only of the +z wall.
+ *
+ * So for anything that is not near-horizontal, v is world up projected into the
+ * plane and u completes a right-handed frame. Brick courses then run across
+ * every wall of a building the same way, which is the only orientation a facade
+ * texture can be authored against.
+ *
+ * A near-horizontal face -- a roof deck, a floor -- has no "up" in its plane,
+ * so it falls back to the normal-seeded rule. The tie-break stays a pure
+ * function of the normal either way, so the same face always gets the same UVs.
+ */
+[[nodiscard]] FaceBasis texture_basis(const glm::dvec3& origin, const glm::dvec3& normal) {
+    const glm::dvec3 n = safe_normalize(normal);
+    if (length_of(n) <= 0.5) {
+        return FaceBasis{};
+    }
+
+    // 0.999 rather than 1 - epsilon: a roof pitched by less than about 2.6
+    // degrees is flat enough that projecting world up into it gives a direction
+    // dominated by rounding.
+    const glm::dvec3 up{0.0, 1.0, 0.0};
+    if (std::fabs(glm::dot(n, up)) >= 0.999) {
+        return basis_from_normal(origin, normal);
+    }
+
+    const glm::dvec3 v = safe_normalize(up - n * glm::dot(n, up));
+    if (length_of(v) <= 0.5) {
+        return basis_from_normal(origin, normal);
+    }
+
+    FaceBasis basis;
+    basis.origin = origin;
+    basis.n = n;
+    basis.v = v;
+    // u = v x n, not n x v: this order makes (u, v, n) right-handed, so u runs
+    // left-to-right when the wall is seen from outside.
+    basis.u = glm::cross(v, n);
     basis.valid = true;
     return basis;
 }
@@ -441,12 +512,24 @@ size_t paths_to_faces(const Clipper2Lib::Paths64& paths,
     if (std::fabs(area) <= kPointEpsilon) {
         return false;
     }
-    // A counter-clockwise ring (positive area) has its material on the LEFT of
-    // each edge, so the inward normal is the edge direction turned a quarter
-    // turn anticlockwise. A hole is wound the other way and its material is on
-    // the right, so the sign flips -- which is what makes an inset of the FACE
-    // grow the hole, as it must.
-    const double side = area > 0.0 ? 1.0 : -1.0;
+    // The face's rings are wound so that the MATERIAL IS ON THE LEFT of every
+    // directed edge: the outer ring counter-clockwise, every hole clockwise.
+    // That is the whole point of the opposite winding (shape.hpp on Face), and
+    // it means one rule covers both rings -- the left normal
+    // `{-dir.y, dir.x}` points into the material either way.
+    //
+    // Moving every edge along that normal therefore shrinks the MATERIAL, which
+    // is what an inset of the face is. On the outer ring that draws the outline
+    // in; on a hole it pushes the hole boundary out, so the hole GROWS. A hole
+    // that shrank would mean its wall sloped the wrong way and overhung the
+    // void.
+    //
+    // There is deliberately no per-ring sign here. One used to flip the normal
+    // by the ring's signed area, which made both rings shrink: `taper(1.0)` on a
+    // 20x20 slab with a 4x4 lightwell left a 2x2 hole where 6x6 was correct
+    // (volume 352 against the prismatoid integral's 336), and any taper deeper
+    // than half the smallest hole width was refused as a collapse. The signed
+    // area is still read above, but only to reject a degenerate ring.
 
     struct Line {
         glm::dvec2 normal{0.0};
@@ -467,7 +550,7 @@ size_t paths_to_faces(const Clipper2Lib::Paths64& paths,
         const glm::dvec2 dir = d / len;
         Line& line = lines[i];
         line.direction = dir;
-        line.normal = glm::dvec2{-dir.y, dir.x} * side;
+        line.normal = glm::dvec2{-dir.y, dir.x};
         line.offset = glm::dot(a, line.normal) + distance;
         line.degenerate = false;
     }
@@ -766,6 +849,26 @@ void reframe(Shape& shape, const glm::dmat3& new_axes) {
         for (glm::dvec3& p : shape.geometry.positions) {
             const glm::dvec3 world = shape.scope.to_world(p);
             p = inverse * (world - target.origin);
+        }
+    }
+
+    // A HANDEDNESS change reverses orientation, so a loop that was wound
+    // counter-clockwise seen from outside is now clockwise seen from outside,
+    // and the Face contract in shape.hpp is broken in local space. Re-winding
+    // here restores it, which is what keeps every later consumer -- the
+    // triangulation, the offset projection, the mesh -- reading the same
+    // convention regardless of how the frame got here.
+    //
+    // mirror_scope() makes the axes left-handed on purpose and
+    // Scope::orthonormalise() preserves that on purpose; neither is the bug.
+    // The bug was leaving the loops alone afterwards, which emitted every
+    // triangle of a mirrored shape inside out. See the companion flip in
+    // append_shape_to_mesh() -- BOTH are needed, because the two orders
+    // (`extrude; mirror_scope` and `mirror_scope; extrude`) fail for opposite
+    // reasons and a one-sided patch cancels itself out.
+    if (glm::determinant(shape.scope.axes) * glm::determinant(target.axes) < 0.0) {
+        for (Face& face : shape.geometry.faces) {
+            reverse_face(face);
         }
     }
 
@@ -1091,8 +1194,12 @@ OpResult offset_shape(Shape& shape, double distance, OffsetSelector selector) {
     if (shape.geometry.faces.empty()) {
         return OpResult::failure("the shape has no faces to offset");
     }
-    if (std::fabs(distance) <= kPointEpsilon) {
-        return OpResult::failure("the offset distance is zero");
+    if (std::fabs(distance) < kMinOffsetDistance) {
+        // Name the resolution. "too small" sends the author looking for a bug in
+        // their arithmetic; the number tells them which way to move.
+        return OpResult::failure(
+            "an offset of " + format_number(distance) +
+            " is below the 1e-5 resolution this works at, so it would change nothing");
     }
 
     ShapeGeometry out;
@@ -1121,10 +1228,15 @@ OpResult setback_shape(Shape& shape, double distance, ShapeGeometry& border, boo
     if (shape.geometry.faces.empty()) {
         return OpResult::failure("the shape has no faces to set back");
     }
-    if (!(distance > kPointEpsilon)) {
+    if (!(distance > 0.0)) {
         // A setback that grows the shape has no removed border to hand back, so
         // the operation would silently become offset() with a misleading name.
         return OpResult::failure("the setback distance must be positive");
+    }
+    if (distance < kMinOffsetDistance) {
+        return OpResult::failure(
+            "a setback of " + format_number(distance) +
+            " is below the 1e-5 resolution this works at, so it would remove nothing");
     }
 
     ShapeGeometry inner;
@@ -1351,6 +1463,21 @@ OpResult scale_shape(Shape& shape, const glm::dvec3& new_size) {
         return OpResult::failure("a scope size cannot be negative");
     }
 
+    // A shape with NO geometry is the case shape.hpp reserves so that a rule can
+    // build a scope and then insert an asset into it -- refit_scope() leaves
+    // such a scope alone by design, and `scale` is the only operation that can
+    // set its size. So set it directly: there are no positions to multiply, the
+    // factor loop would iterate zero times, and the per-axis "no extent"
+    // refusal below is about geometry that cannot be scaled, which is not this.
+    //
+    // Deriving the size from the geometry instead made this a silent no-op --
+    // it returned success and left the scope exactly as it found it, which is
+    // indistinguishable from working until an asset lands at the wrong size.
+    if (shape.geometry.positions.empty()) {
+        shape.scope.size = new_size;
+        return OpResult::success();
+    }
+
     glm::dvec3 factor{1.0};
     std::string skipped;
     for (int i = 0; i < 3; ++i) {
@@ -1375,8 +1502,12 @@ OpResult scale_shape(Shape& shape, const glm::dvec3& new_size) {
     refit_scope(shape);
 
     if (!skipped.empty()) {
+        // Plural when more than one axis was skipped: "no extent on x, y, z, so
+        // that axis" reads as a bug in the message itself.
+        const bool many = skipped.find(',') != std::string::npos;
         return OpResult::failure("the shape has no extent on " + skipped +
-                                 ", so that axis was left alone");
+                                 (many ? ", so those axes were left alone"
+                                       : ", so that axis was left alone"));
     }
     return OpResult::success();
 }
@@ -1537,6 +1668,14 @@ void append_shape_to_mesh(const Shape& shape, Mesh& mesh) {
         const FaceBasis basis = face_basis(shape.geometry, face);
         const glm::vec3 normal = glm::vec3(shape.scope.axes * basis.n);
 
+        // A SEPARATE frame for the texture coordinates. `basis` is the plane
+        // frame the triangulation and the Clipper2 projection use and must stay
+        // a pure function of the normal; UVs additionally need to know which way
+        // is up, or the four walls of one box get three texture orientations.
+        // Both share an origin, so a UV of (0,0) is still the face's first
+        // vertex.
+        const FaceBasis uv_basis = texture_basis(basis.origin, basis.n);
+
         // Vertices are duplicated per face, which gives flat shading. A wall
         // meets a roof at a crease; sharing a vertex between them would average
         // the two normals and round the crease off.
@@ -1550,7 +1689,7 @@ void append_shape_to_mesh(const Shape& shape, Mesh& mesh) {
             Vertex vertex;
             vertex.position = glm::vec3(shape.scope.to_world(local));
             vertex.normal = normal;
-            const glm::dvec2 uv = basis.project(local);
+            const glm::dvec2 uv = uv_basis.valid ? uv_basis.project(local) : basis.project(local);
             vertex.uv = glm::vec2(static_cast<float>(uv.x), static_cast<float>(uv.y));
             const auto slot = static_cast<uint32_t>(mesh.vertices.size());
             mesh.vertices.push_back(vertex);
@@ -1558,9 +1697,17 @@ void append_shape_to_mesh(const Shape& shape, Mesh& mesh) {
             return slot;
         };
 
+        // A left-handed scope reflects, and a reflection reverses orientation:
+        // the local winding that means "outward" maps to a world winding that
+        // means "inward". Emitting the triple reversed puts it back, so a
+        // mirrored building is not culled front-face-first and lit from behind.
+        const bool flipped = glm::determinant(shape.scope.axes) < 0.0;
+
         const auto range_start = static_cast<uint32_t>(mesh.indices.size());
-        for (const uint32_t index : tri) {
-            mesh.indices.push_back(vertex_for(index));
+        for (size_t t = 0; t + 2 < tri.size(); t += 3) {
+            mesh.indices.push_back(vertex_for(tri[t]));
+            mesh.indices.push_back(vertex_for(tri[flipped ? t + 2 : t + 1]));
+            mesh.indices.push_back(vertex_for(tri[flipped ? t + 1 : t + 2]));
         }
 
         if (face.material.material != MaterialId::Default || face.material.variant != 0) {
