@@ -1,0 +1,91 @@
+// Stacked housing modules that cantilever over each other.
+//
+// Habitat 67: identical boxes, stacked with a deliberate offset so each one
+// overhangs the one below and the stack reads as a hillside rather than a
+// tower. The whole effect comes from `translate` -- one operation, applied to
+// a module before it is built, so the geometry moves out of its own footprint.
+//
+// This is the example that shows a shape LEAVING ITS PLOT. Everything else in
+// this folder builds inside the rectangle it was given. A cantilever does not,
+// and the scope follows the geometry rather than the plot, which is why the
+// module above still lands correctly on the one below.
+//
+// Seed: about 24 x 14 m.
+
+attr stories : float = 6.0
+attr module  : float = 3.2
+attr reach   : float = 1.6
+
+@start
+rule Terraces {
+    split(x) { repeat { 8.0 : { Stack(stories); } } }
+}
+
+rule Stack(n: float) {
+    Module(n);
+}
+
+// Each module is a box. Before the next one goes on top, the plan slides
+// sideways and back by a fraction of a module, so the stack steps as it rises.
+// The direction alternates by depth, which is what keeps the pile leaning
+// rather than marching off in one direction.
+rule Module(n: float) {
+    extrude(module);
+    select face {
+        vertical : { Face(); }
+        top      : { Above(n); }
+    }
+}
+
+rule Above(n: float) {
+    align_scope("y_up");
+    if (n > 1.0) {
+        Step(n);
+    } else {
+        RoofDeck();
+    }
+}
+
+rule Step(n: float) {
+    if (random.chance(0.5)) {
+        Shift(n, reach, 0.0 - reach * 0.5);
+    } else {
+        Shift(n, 0.0 - reach, reach * 0.5);
+    }
+}
+
+// translate(x, y, z) moves the geometry INSIDE its scope, and refit_scope then
+// draws the box back around where the geometry ended up. So the module above
+// genuinely overhangs: it is not a taller box with a texture on it.
+rule Shift(n: float, dx: float, dz: float) {
+    translate(dx, 0.0, dz);
+    Module(n - 1.0);
+}
+
+// The faces that end up looking out over the module below get a balcony rail;
+// the rest get a window. A rule cannot tell which is which -- there is no
+// function that reads position -- so this is a draw, and the same draw every
+// run.
+rule Face {
+    if (random.chance(0.35)) {
+        Balcony();
+    } else {
+        Wall();
+    }
+}
+
+rule Balcony {
+    split(x) {
+        ~1.0 : { Glazing(); }
+        0.25 : { Rail(); }
+    }
+}
+
+rule Wall {
+    split(x) { ~1.0 : { Panel(); } 1.3 : { Glazing(); } ~1.0 : { Panel(); } }
+}
+
+rule Glazing  { window(0.0, 0.16, 0.05, 0.04); }
+rule Rail     { wall_panel(0.0, 0.12); }
+rule Panel    { wall_panel(); }
+rule RoofDeck { wall_panel(); }

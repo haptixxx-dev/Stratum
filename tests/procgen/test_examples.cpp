@@ -62,7 +62,7 @@ namespace {
 
 /// How many .rule files examples/rules/ holds. See the header: this is pinned
 /// on purpose, so adding one is a deliberate act rather than an accident.
-constexpr size_t kExampleCount = 8;
+constexpr size_t kExampleCount = 12;
 
 struct Example {
     const char* file;
@@ -85,6 +85,13 @@ constexpr Example kExamples[] = {
     {"06_warehouse.rule",         48.0, 24.0,  40,  500},
     {"07_by_attribute.rule",      16.0, 12.0, 100, 2000},
     {"08_stochastic_street.rule", 60.0, 14.0, 150, 1500},
+    // The recursive four. Their floors are set well under what they produce,
+    // because a recursion's output moves with any change to its termination
+    // test and a tight bound here would be a brittle golden value.
+    {"09_twisting_tower.rule",    10.0, 10.0, 200,  4000},
+    {"10_recursive_district.rule", 120.0, 80.0, 1500, 15000},
+    {"11_fractal_tower.rule",     32.0, 32.0, 1200, 25000},
+    {"12_stacked_modules.rule",   24.0, 14.0, 100,  1200},
 };
 
 [[nodiscard]] std::filesystem::path examples_dir() {

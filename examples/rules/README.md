@@ -18,6 +18,19 @@ headlessly through `full_operations()`.
 | `07_by_attribute.rule` | 16 × 12 | One file, four building types, chosen by an `attr`. Copy this for a rule pack. |
 | `08_stochastic_street.rule` | 60 × 14 | Variety that reproduces exactly. `choose`, `random.*`, and why the seeding works |
 
+## The recursive four
+
+These are the ones worth reading for what the language can actually do. None
+of them has a loop, a counter of floors, or a list of buildings — the shape of
+the output falls out of a rule calling itself.
+
+| File | Seed | Output | What it is for |
+|---|---|---|---|
+| `09_twisting_tower.rule` | 10 × 10 | 377 terminals, 7.5k tris, 49.8 m | A helix. `rotate` vs `rotate_scope` is the whole trick |
+| `10_recursive_district.rule` | 120 × 80 | 3539 terminals, 37k tris, 23 buildings | A district that subdivides itself into plots |
+| `11_fractal_tower.rule` | 32 × 32 | 3907 terminals, 76k tris, 40.8 m | Quarters itself and branches; 139 terraces where branches stopped |
+| `12_stacked_modules.rule` | 24 × 14 | 195 terminals, 2.5k tris | Habitat 67. Modules that cantilever out past their own plot |
+
 ## Three things the examples are trying to teach
 
 **The `~` floating size is what makes a facade work.** A bay is `0.4` of pier,
@@ -31,6 +44,20 @@ eighteenth. Position comes from WHERE IT SITS IN THE SPLIT: the ground floor is
 the ground floor because it is the first part of `split(y)`. Put `door()`
 somewhere else in that split and you get a door into thin air.
 `01_office_tower.rule` says why it has no entrance for exactly this reason.
+
+**Recursion is how you write a tall thing.** There is no loop. `Level` calls
+itself with one less to go and the building is however deep the recursion
+went; change one attribute from 14 to 40 and you have a skyscraper. The depth
+and shape caps in `InterpreterLimits` sit behind that, and both report an
+Error rather than truncating quietly.
+
+**A recursion that shrinks its own input must stop on the GEOMETRY.** A
+counter assumes every branch shrinks at the same rate, and a split with a
+floating part does not. `11_fractal_tower.rule` at depth 12 is the same
+40.8 m tower as at depth 5 — 4336 terminals against 3907 — because every
+branch has already quartered itself past the size floor. `10_recursive_district.rule` says the same thing from the
+other side: subdivision always makes a few slivers, and `offset(-1.5)` on a
+sliver removes the whole shape and reports an error.
 
 **`window()` is what makes a window.** An empty `rule Window {}` marks a region
 of the wall and nothing more, so every terminal is a coplanar quad and the
@@ -51,3 +78,9 @@ against 1540.
   `roof("pyramid", 72)` instead, which takes a pitch and cannot collapse.
 - **A reveal deeper than the wall is cut back**, with a warning naming both
   numbers.
+- **`comp.size` does not measure in the same axes `split` divides.** `split(z)`
+  uses the shape scope's z. `comp.size` measures a COMPONENT in its own frame,
+  where a face's two in-plane axes are x and y and z is its thickness. On a
+  ground footprint `comp.size("all","z")` is therefore **0**, and a recursion
+  guarded on it terminates immediately with no error anywhere.
+  `10_recursive_district.rule` has the table.
