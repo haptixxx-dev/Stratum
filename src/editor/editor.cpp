@@ -18,9 +18,11 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <utility>
 
 namespace stratum {
@@ -223,6 +225,7 @@ void Editor::render() {
     if (m_show_render_settings) draw_render_settings();
     if (m_show_memory_panel) draw_memory_panel();
     if (m_show_material_panel) draw_material_panel();
+    if (m_show_rule_panel) draw_rule_panel();
 }
 
 void Editor::setup_dockspace() {
@@ -372,6 +375,7 @@ void Editor::draw_menu_bar() {
             ImGui::MenuItem("Render Settings", nullptr, &m_show_render_settings);
             ImGui::MenuItem("GPU Memory", nullptr, &m_show_memory_panel);
             ImGui::MenuItem("Materials", nullptr, &m_show_material_panel);
+            ImGui::MenuItem("Rule Editor", nullptr, &m_show_rule_panel);
             ImGui::Separator();
             ImGui::MenuItem("ImGui Demo", nullptr, &m_show_demo_window);
             ImGui::MenuItem("Style Editor", nullptr, &m_show_style_editor);
@@ -2263,6 +2267,10 @@ void Editor::open_file_dialog(FilePickTarget target) {
         { "Stratum material set", "json" },
         { "All files",            "*" },
     };
+    static const SDL_DialogFileFilter kRuleFilters[] = {
+        { "Stratum rule file", "rule" },
+        { "All files",         "*" },
+    };
 
     const SDL_DialogFileFilter* filters = kOsmFilters;
     int filter_count = static_cast<int>(SDL_arraysize(kOsmFilters));
@@ -2277,6 +2285,11 @@ void Editor::open_file_dialog(FilePickTarget target) {
         case FilePickTarget::MaterialSetSave:
             filters = kMaterialSetFilters;
             filter_count = static_cast<int>(SDL_arraysize(kMaterialSetFilters));
+            break;
+        case FilePickTarget::RuleFileLoad:
+        case FilePickTarget::RuleFileSave:
+            filters = kRuleFilters;
+            filter_count = static_cast<int>(SDL_arraysize(kRuleFilters));
             break;
         case FilePickTarget::OsmFile:
             break;
@@ -2310,7 +2323,12 @@ void Editor::open_file_dialog(FilePickTarget target) {
 
     auto* parent = static_cast<SDL_Window*>(m_window_handle);  // for modality
 
-    if (target == FilePickTarget::MaterialSetSave) {
+    if (target == FilePickTarget::RuleFileSave) {
+        // Same argument as the material set below: start where the file came
+        // from, so a re-save lands beside the rule file rather than in $HOME.
+        SDL_ShowSaveFileDialog(callback, this, parent, filters, filter_count,
+                               m_rule_path.empty() ? nullptr : m_rule_path.c_str());
+    } else if (target == FilePickTarget::MaterialSetSave) {
         // Start in the directory the set was last saved to or loaded from, so a
         // re-save lands beside its textures rather than in the home directory --
         // the paths inside the file are written RELATIVE to it.
@@ -2349,8 +2367,19 @@ void Editor::poll_file_dialog() {
                  error.c_str());
         m_console_buffer.append(msg);
         m_console_scroll_to_bottom = true;
-        if (m_file_pick_target != FilePickTarget::OsmFile) {
-            m_material_set_status = "file dialog unavailable: " + error;
+        // Report into the panel that opened the dialog. Before the rule targets
+        // existed this was "anything but OSM means the material panel", which
+        // would now put a rule-file failure under the material set.
+        switch (m_file_pick_target) {
+            case FilePickTarget::RuleFileLoad:
+            case FilePickTarget::RuleFileSave:
+                m_rule_status = "file dialog unavailable: " + error;
+                break;
+            case FilePickTarget::OsmFile:
+                break;
+            default:
+                m_material_set_status = "file dialog unavailable: " + error;
+                break;
         }
         return;
     }
@@ -2409,6 +2438,43 @@ void Editor::poll_file_dialog() {
             } else {
                 m_material_set_status = "save failed - see console";
             }
+            break;
+        }
+
+        case FilePickTarget::RuleFileLoad: {
+            std::ifstream in(path, std::ios::binary);
+            if (!in) {
+                m_rule_status = "could not open " + path;
+                break;
+            }
+            std::ostringstream buffer;
+            buffer << in.rdbuf();
+            m_rule_source = buffer.str();
+            m_rule_path = path;
+            m_rule_status = "loaded " + path;
+            // A loaded file is a different program, so nothing from the last one
+            // still describes it. Clearing rather than leaving it stale is the
+            // point: a diagnostic pointing at line 40 of a file that is now 12
+            // lines long is worse than no diagnostic.
+            m_rule_dirty = true;
+            run_rule_source();
+            break;
+        }
+
+        case FilePickTarget::RuleFileSave: {
+            std::ofstream out(path, std::ios::binary);
+            if (!out) {
+                m_rule_status = "could not write " + path;
+                break;
+            }
+            out << m_rule_source;
+            if (!out) {
+                m_rule_status = "write failed - see console";
+                spdlog::error("Rule file write failed: {}", path);
+                break;
+            }
+            m_rule_path = path;
+            m_rule_status = "saved to " + path;
             break;
         }
     }
@@ -4043,6 +4109,15 @@ void Editor::render_3d(GPURenderer& renderer) {
         if (m_render_water && m_water_gpu_id != 0) {
             renderer.draw_mesh(m_water_gpu_id, model, glm::vec4(1.0f));
         }
+    }
+
+    // The rule editor's preview, drawn with the rest of the opaque scene so it
+    // lights and shadows like a building rather than floating as debug geometry.
+    // Concrete because a rule that sets no material should still look like a
+    // massing model, not like untextured default grey.
+    if (m_render_rule_preview && m_rule_preview_gpu_id != 0) {
+        renderer.draw_mesh(m_rule_preview_gpu_id, model, glm::vec4(1.0f),
+                           MaterialKey{MaterialId::Concrete, 0});
     }
 
     // Im3d debug geometry last, so it depth-tests against the opaque scene above.
