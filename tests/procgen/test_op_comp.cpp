@@ -65,6 +65,16 @@
  *     and asserted to be an Error that fails the run, and a degenerate face is
  *     asserted to be a Warning that does not.
  *
+ *     That path is the OPERATION path and not the `select` statement's. Since
+ *     D2.5, interpreter.cpp's exec_select() calls split_components() directly and
+ *     reports the ComponentSplitReport in report_component_split(), once per site
+ *     and with a shape that has no geometry downgraded to a Warning, because a
+ *     zero-length slab out of `split` did not choose to be empty. So the
+ *     severities asserted below are emit_components()' own, they are deliberately
+ *     not the ones `select` produces, and the statement's are asserted in
+ *     test_rule_statements.cpp. Reading a test here as coverage of `select` is
+ *     the mistake this paragraph exists to stop.
+ *
  * Nothing here needs a GPU, a window or a file on disk, so nothing here skips.
  */
 
@@ -1794,26 +1804,34 @@ TEST(OpComp, an_emitted_split_reports_a_bent_face_as_a_warning) {
 }
 
 // ============================================================================
-// The gap in the extension point
+// The extension point, now that the gap is closed
 // ============================================================================
 
-TEST(OpComp, the_select_statement_still_has_no_seat_in_the_interpreter) {
-    // This test pins the gap op_comp.hpp reports rather than describing it in a
-    // comment nobody runs. `select` is a STATEMENT, ast.hpp's StmtNode is a
-    // closed variant, and State::exec() switches over it -- so a component split
-    // written the way the language spells it cannot be reached without editing
-    // interpreter.cpp, which this feature was asked not to do.
+TEST(OpComp, the_select_statement_now_has_its_seat_in_the_interpreter) {
+    // This test used to pin the gap: `select` is a STATEMENT, ast.hpp's StmtNode
+    // is a closed variant, and State::exec() switches over it, so a component
+    // split written the way the language spells it could not be reached without
+    // editing interpreter.cpp. Its own comment said the expectation would flip
+    // when the case was written. D2.5 wrote it, so it has.
     //
-    // When that case is written, this expectation flips: the assertion becomes
-    // that the components were produced. Until then, an interpreter that stayed
-    // SILENT about an unimplemented statement would be the worse failure, and
-    // that is what is asserted here.
+    // The case does NOT call emit_components(): a `select` arm has a body to run
+    // against its component, and this file's function emits every component as a
+    // terminal instead. So nothing else in this suite covers the interpreter's
+    // path, and this assertion is the only one here that touches it -- the rest of
+    // that path is tested in test_rule_statements.cpp, including the diagnostics,
+    // which exec_select() reports at severities of its own.
     const GenerationResult result = run_on(
         "@start\n"
         "rule Main { extrude(3); select face { front: Facade(); } }\n"
         "rule Facade() { }\n",
         shape_from_rect(2.0, 4.0));
 
-    CHECK_FALSE(result.ok());
-    CHECK_TRUE(has_message(result, Severity::Error, "'select' is not implemented in this build"));
+    CHECK_TRUE(result.ok());
+    CHECK_FALSE(has_message(result, Severity::Error, "'select' is not implemented in this build"));
+    // One front face became one shape, and Facade ran against it. The other five
+    // faces answer to no arm and make no children.
+    CHECK_EQ(result.terminals.size(), size_t{1});
+    if (!result.terminals.empty()) {
+        CHECK_EQ(result.terminals[0].rule, std::string{"Facade"});
+    }
 }

@@ -1679,7 +1679,17 @@ TEST(Interpreter, an_operation_with_no_handler_reports_once_per_site) {
     CHECK_EQ(result.terminals.size(), size_t{3});
 }
 
-TEST(Interpreter, split_and_select_report_rather_than_doing_nothing_quietly) {
+TEST(Interpreter, split_and_select_run_rather_than_reporting_a_gap) {
+    // This test used to pin the gap: `split` and `select` were variant
+    // alternatives in ast.hpp with no case in State::exec(), and what was asserted
+    // was that the interpreter SAID so rather than doing nothing quietly. Its own
+    // comment said the expectation would flip when the cases were written. D2.5
+    // wrote them, so it has flipped, and what is asserted now is that both
+    // statements reach their operations and make children.
+    //
+    // The wiring itself -- frames, seeds, caps, the slab cut and the component
+    // decomposition -- belongs to test_rule_statements.cpp. What is here is only
+    // that this SWITCH dispatches them, which is this suite's subject.
     const GenerationResult split = run_square(
         "@start\n"
         "rule Main {\n"
@@ -1687,12 +1697,13 @@ TEST(Interpreter, split_and_select_report_rather_than_doing_nothing_quietly) {
         "    extrude(1.0);\n"
         "}\n"
         "rule A { extrude(1.0); }\n");
-    CHECK_FALSE(split.ok());
-    CHECK_TRUE(has_error_saying(split, "'split' is not implemented in this build"));
-    // The rest of the rule still ran: a missing floor points at the mistake, an
-    // empty viewport does not.
+    CHECK_TRUE(split.ok());
+    CHECK_FALSE(has_error_saying(split, "'split' is not implemented in this build"));
+    // One slab, whose body called A, which extruded it. Main itself made a child
+    // and is therefore not a terminal, so the one output is A's.
     CHECK_EQ(split.terminals.size(), size_t{1});
     if (!split.terminals.empty()) {
+        CHECK_EQ(split.terminals[0].rule, std::string{"A"});
         CHECK_NEAR(geometry_volume(split.terminals[0].geometry), 1.0, 1e-12);
     }
 
@@ -1703,9 +1714,14 @@ TEST(Interpreter, split_and_select_report_rather_than_doing_nothing_quietly) {
         "    select face { top : { A(); } }\n"
         "}\n"
         "rule A { taper(0.1); }\n");
-    CHECK_FALSE(select.ok());
-    CHECK_TRUE(has_error_saying(select, "'select' is not implemented in this build"));
+    CHECK_TRUE(select.ok());
+    CHECK_FALSE(has_error_saying(select, "'select' is not implemented in this build"));
+    // The one top face of the cube became a shape, and A tapered it. The five
+    // faces no arm claimed made no children at all.
     CHECK_EQ(select.terminals.size(), size_t{1});
+    if (!select.terminals.empty()) {
+        CHECK_EQ(select.terminals[0].rule, std::string{"A"});
+    }
 }
 
 TEST(Interpreter, an_operation_argument_of_the_wrong_kind_is_reported_at_its_call) {

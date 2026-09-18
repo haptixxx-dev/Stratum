@@ -95,6 +95,7 @@ set(STRATUM_TEST_SOURCES
     procgen/test_heightmap_io.cpp
     procgen/test_rule_parser.cpp
     procgen/test_interpreter.cpp
+    procgen/test_rule_statements.cpp
     procgen/test_op_split.cpp
     procgen/test_op_comp.cpp
     procgen/test_op_control.cpp
@@ -136,6 +137,7 @@ set(STRATUM_TEST_SUITES
     SegmentAttrs
     RuleParser
     Interpreter
+    RuleStatements
     OpSplit
     OpComp
     OpControl
