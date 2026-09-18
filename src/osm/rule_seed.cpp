@@ -118,6 +118,27 @@ using procgen::rules::Value;
     for (const glm::dvec2& p : ring) {
         out.push_back(glm::dvec2{p.x, -p.y});
     }
+
+    // THE CLOSING POINT GOES. An OSM way is closed by repeating its first node
+    // as its last, and the parser keeps that node, so `Building::footprint`
+    // arrives with its first point repeated at the end. `Face::loop` is the
+    // opposite convention -- shape.hpp says the first vertex is NOT repeated --
+    // so passing it through leaves a zero-length edge at the wrap.
+    //
+    // That edge has no direction, so no normal, so no corner, and it is exactly
+    // what `roof()` refuses with "corner 0 of the outline is a spike with no
+    // mitre". Measured over 400 buildings of the Lucan extract: 53 refusals,
+    // every one of them this. It is also the "1 components were dropped for
+    // having no area, no length or no direction" warning that appeared once per
+    // building, 400 times.
+    //
+    // Compared exactly rather than within a tolerance: this is the SAME node
+    // written twice, not two nodes that happen to be close, and a tolerance
+    // here would quietly merge two real survey points a millimetre apart.
+    // Anything less exact is `cleanup()`'s job, which a rule asks for.
+    while (out.size() >= 4 && out.front() == out.back()) {
+        out.pop_back();
+    }
     return out;
 }
 

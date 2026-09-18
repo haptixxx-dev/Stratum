@@ -118,6 +118,49 @@ TEST(RuleSeed, a_degenerate_footprint_yields_a_seed_with_no_geometry) {
     CHECK_TRUE(found != seed.attributes.end());
 }
 
+TEST(RuleSeed, the_closing_point_of_an_osm_way_is_dropped) {
+    // An OSM way is closed by repeating its first node as its last, and the
+    // parser keeps it, so Building::footprint arrives with its first point
+    // repeated at the end. Face::loop is the opposite convention -- shape.hpp
+    // says the first vertex is NOT repeated.
+    //
+    // Passing it through leaves a zero-length edge at the wrap, which has no
+    // direction, so no normal, so no corner. That is exactly what roof()
+    // refuses with "corner 0 of the outline is a spike with no mitre": 53 of
+    // 400 Lucan buildings, plus a dropped-component warning on every single
+    // one of the 400.
+    Building b = make_building();
+    b.footprint = {{0.0, 0.0}, {10.0, 0.0}, {10.0, 8.0}, {0.0, 8.0}, {0.0, 0.0}};
+
+    const Shape seed = seed_from_building(b);
+    CHECK_EQ(seed.geometry.faces.size(), size_t{1});
+    CHECK_EQ(seed.geometry.faces[0].loop.size(), size_t{4});
+    CHECK_NEAR(geometry_area(seed.geometry), 80.0, 1e-9);
+
+    // And the roof it used to refuse is raised.
+    const GenerationResult result = run_on(seed,
+        "@start\n"
+        "rule M { extrude(6.0); select face { top : { R(); } } }\n"
+        "rule R { align_scope(\"y_up\"); roof(\"gable\", 35.0, 0.3); }\n");
+    CHECK_TRUE(result.ok());
+    for (const Diagnostic& d : result.diagnostics) {
+        CHECK_TRUE(d.message.find("spike with no mitre") == std::string::npos);
+    }
+}
+
+TEST(RuleSeed, two_survey_points_a_millimetre_apart_are_both_kept) {
+    // The closing point is dropped by an EXACT comparison, not a tolerance.
+    // These are the same node written twice, not two nodes that happen to be
+    // close -- and merging real survey points is cleanup()'s job, which a rule
+    // asks for rather than having done to it at the seam.
+    Building b = make_building();
+    b.footprint = {{0.0, 0.0}, {10.0, 0.0}, {10.0, 8.0}, {10.0, 8.001}, {0.0, 8.0}};
+
+    const Shape seed = seed_from_building(b);
+    CHECK_EQ(seed.geometry.faces.size(), size_t{1});
+    CHECK_EQ(seed.geometry.faces[0].loop.size(), size_t{5});
+}
+
 // ============================================================================
 // Alignment with the rest of the scene
 // ============================================================================

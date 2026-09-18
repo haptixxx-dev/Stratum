@@ -97,6 +97,7 @@ set(STRATUM_TEST_SOURCES
     procgen/test_interpreter.cpp
     procgen/test_rule_statements.cpp
     procgen/test_op_split.cpp
+    procgen/test_op_cleanup.cpp
     procgen/test_op_comp.cpp
     procgen/test_op_control.cpp
     procgen/test_op_facade.cpp
@@ -148,6 +149,7 @@ set(STRATUM_TEST_SUITES
     Interpreter
     RuleStatements
     OpSplit
+    OpCleanup
     OpComp
     BuildingLod
     Examples

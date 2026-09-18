@@ -33,18 +33,17 @@
 // Seed: an OSM import. On the test rectangle it still runs, and takes every
 // default, which is a fair way to see the fallback path.
 //
-// ONE KNOWN LIMIT, MEASURED. Run this over a real extract and about one
-// building in eight comes out with walls and no pitched roof, reporting
-// "corner 0 of the outline is a spike with no mitre". Real survey outlines
-// have repeated vertices and spurs that double back, and roof() cannot mitre
-// those corners. Over 400 buildings of the Lucan extract: 53 such refusals.
+// No `cleanup()` call is needed here, and that is worth knowing because this
+// file used to need one. An OSM way is closed by repeating its first node as
+// its last, and that repeat used to reach the seed shape as a zero-length edge
+// -- which has no corner, which is what `roof()` refuses with "corner 0 of the
+// outline is a spike with no mitre". Over 400 buildings of the Lucan extract
+// that was 53 refusals and 400 dropped-component warnings.
 //
-// The fix is `cleanup()`, which is a row in the operation catalogue with no
-// implementation behind it yet -- issue #133. When it lands, `Cap` becomes
-// `cleanup(0.05); align_scope("y_up"); ...` and the refusals go. Until then a
-// flat deck is the reliable cap for imported footprints, which is what the
-// majority of them are tagged as anyway: the extract is 16287 flat to 2903
-// gabled to 1154 hipped.
+// osm/rule_seed.cpp now drops the closing point, because that is an OSM
+// convention and the seam is where OSM conventions belong. `cleanup()` is
+// still there for a footprint that needs more than that -- a spur that doubles
+// back, or points a millimetre apart -- and a rule asks for it.
 
 attr storey : float = 3.1
 
@@ -67,6 +66,10 @@ rule Massing(levels: float) {
 // The roof kind comes straight from the tag. `flat` is not a roof() kind, so
 // it is the one case that needs a branch -- a flat roof is a deck.
 rule Cap {
+    // cleanup() FIRST. A surveyed outline repeats vertices and carries spurs
+    // that double back, and the skeleton behind roof() cannot mitre a corner
+    // whose edges are opposite or zero length. Without this line about one
+    // building in eight comes out with walls and no roof.
     align_scope("y_up");
     if (attrs.get("osm.roof", "flat") == "flat") {
         Deck();

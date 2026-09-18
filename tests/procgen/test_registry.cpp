@@ -168,8 +168,8 @@ TEST(Registry, the_tables_are_the_same_objects_every_call) {
  * Wire it in and the list stops matching, which is the reminder.
  */
 constexpr std::string_view kUnimplemented[] = {
-    "center", "cleanup", "color", "convexify",
-    "delete_holes", "delete_uv", "footprint", "inner_rect",
+    "center", "color", "convexify", "delete_holes",
+    "delete_uv", "footprint", "inner_rect",
     "normalize_uv", "primitive", "project_uv", "reduce",
     "report", "scale_uv", "scatter", "setup_projection",
     "soften_normals", "texture", "tile_uv", "translate_uv",

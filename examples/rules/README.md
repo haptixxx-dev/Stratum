@@ -126,6 +126,10 @@ against 1540.
 
 ## Limits you will meet
 
+- **`cleanup()` repairs a footprint; it does not simplify one.** It merges
+  points within a tolerance, drops spurs that double back, and drops collinear
+  vertices — all of which enclose no area, so the footprint is unchanged. For
+  fewer vertices at the cost of shape, that is `reduce()`, a different row.
 - **No pitched roof over a courtyard.** The straight skeleton does not handle
   interior rings, so `shed` is the only kind that carries a hole. The others
   refuse rather than roof over land that does not exist — issue #127.
