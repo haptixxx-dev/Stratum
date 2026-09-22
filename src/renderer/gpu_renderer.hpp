@@ -1079,6 +1079,12 @@ public:
     SDL_GPUTexture* get_swapchain_texture() const { return m_swapchain_texture; }
     SDL_GPUTextureFormat get_swapchain_format() const;
 
+    // Swapchain extent in PIXELS, tracked from the acquired swapchain texture.
+    // Anything handing this class a viewport or scissor must be in these units --
+    // ImGui works in logical points, which differ by the pixel density on HiDPI.
+    uint32_t get_swapchain_width() const { return m_swapchain_width; }
+    uint32_t get_swapchain_height() const { return m_swapchain_height; }
+
     // === Scene state getters ===
     const SceneUniforms& get_scene_uniforms() const { return m_scene_uniforms; }
 
