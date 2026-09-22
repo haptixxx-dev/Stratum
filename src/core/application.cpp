@@ -60,6 +60,18 @@ bool Application::init() {
 
     // Style tweaks
     ImGuiStyle& style = ImGui::GetStyle();
+
+    // Pin the layout font size rather than letting it default. Since 1.92 ImGui
+    // derives every widget metric from style.FontSizeBase, which it back-fills on
+    // the first frame from the first font -- ImFontConfig::SizePixels above only
+    // seeds that, it does not decide it. Setting it here makes the UI scale one
+    // number under our control instead of a default that moved between versions.
+    //
+    // Nothing else is scaled for DPI on purpose: ImGui already lays out in
+    // logical points and the SDL_GPU backend maps that onto the framebuffer via
+    // io.DisplayFramebufferScale, which it also feeds to the font rasterizer -- so
+    // text bakes at native Retina density without a second scale factor here.
+    style.FontSizeBase = 16.0f;
     style.WindowRounding = 4.0f;
     style.FrameRounding = 2.0f;
     style.ScrollbarRounding = 4.0f;

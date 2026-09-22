@@ -583,8 +583,18 @@ void Editor::draw_viewport() {
     const char* text_overlay = "3D Viewport";
     draw_list->AddText(ImVec2(pos.x + 10, pos.y + 10), IM_COL32(200, 200, 200, 255), text_overlay);
 
-    // Toolbar overlay
-    ImGui::SetCursorPos(ImVec2(10, 30));
+    // Toolbar overlay, stacked under the label above.
+    //
+    // Both are placed in SCREEN space off `pos`. The label is drawn through the
+    // draw list, which only takes screen coordinates, so positioning the toolbar
+    // with SetCursorPos() -- which is window-LOCAL -- measured the two from
+    // different origins, and the gap between them silently became "whatever the
+    // tab bar height happens to be". At a small enough font the label landed on
+    // top of the buttons. Measuring both from `pos` and spacing them by the
+    // actual text line height keeps them apart at any font size or dock state.
+    ImGui::SetCursorScreenPos(ImVec2(pos.x + 10,
+                                     pos.y + 10 + ImGui::GetTextLineHeight() +
+                                         ImGui::GetStyle().ItemSpacing.y));
     ImGui::BeginGroup();
     if (ImGui::Button("Translate")) {}
     ImGui::SameLine();
@@ -3906,21 +3916,59 @@ void Editor::render_3d(GPURenderer& renderer) {
         return;
     }
 
+    // s_viewport_rect comes from ImGui, which lays out in LOGICAL POINTS.
+    // SDL_GPUViewport and SDL_SetGPUScissor address the swapchain, which is sized
+    // in PIXELS (gpu_renderer.cpp, SDL_GetWindowSizeInPixels). The two coincide
+    // only where the pixel density is 1: on a Retina Mac it is 2, and passing
+    // points through unconverted scissors the 3D pass to a rect half as wide and
+    // half as tall as the panel, anchored at half its offset. Most of that rect
+    // then falls under the left dock panel and the tab bar, which the ImGui pass
+    // paints over afterwards -- so the scene appears squeezed into the top-left
+    // corner of the viewport. Linux never showed it because density is 1 there.
+    //
+    // DisplayFramebufferScale is the same factor the ImGui backend uses to map
+    // its draw data onto the swapchain (imgui_impl_sdlgpu3.cpp: fb_width =
+    // DisplaySize * FramebufferScale), so scaling by it keeps the 3D pass aligned
+    // with the panel ImGui draws around it, whatever the backend reports.
+    const ImGuiIO& io = ImGui::GetIO();
+    const float scale_x = io.DisplayFramebufferScale.x > 0.0f ? io.DisplayFramebufferScale.x : 1.0f;
+    const float scale_y = io.DisplayFramebufferScale.y > 0.0f ? io.DisplayFramebufferScale.y : 1.0f;
+
+    const float px_x = s_viewport_rect.x * scale_x;
+    const float px_y = s_viewport_rect.y * scale_y;
+    const float px_w = s_viewport_rect.z * scale_x;
+    const float px_h = s_viewport_rect.w * scale_y;
+
     // Set Viewport
     SDL_GPUViewport viewport;
-    viewport.x = s_viewport_rect.x;
-    viewport.y = s_viewport_rect.y;
-    viewport.w = s_viewport_rect.z;
-    viewport.h = s_viewport_rect.w;
+    viewport.x = px_x;
+    viewport.y = px_y;
+    viewport.w = px_w;
+    viewport.h = px_h;
     viewport.min_depth = 0.0f;
     viewport.max_depth = 1.0f;
     renderer.set_viewport(viewport);
 
+    // The scissor must stay inside the render target -- a rect that pokes past
+    // the edge is a Vulkan validation error, and the panel can hang off the
+    // window edge mid-resize drag. The viewport above needs no such clamp: it
+    // only defines the clip-space mapping, and the scissor is what clips.
+    const int fb_w = static_cast<int>(renderer.get_swapchain_width());
+    const int fb_h = static_cast<int>(renderer.get_swapchain_height());
+    const int x0 = std::clamp(static_cast<int>(px_x), 0, fb_w);
+    const int y0 = std::clamp(static_cast<int>(px_y), 0, fb_h);
+    const int x1 = std::clamp(static_cast<int>(px_x + px_w), x0, fb_w);
+    const int y1 = std::clamp(static_cast<int>(px_y + px_h), y0, fb_h);
+    if (x1 <= x0 || y1 <= y0) {
+        return;  // scrolled fully off-screen: nothing to draw, and a zero-area
+                 // scissor is a validation error
+    }
+
     SDL_Rect scissor;
-    scissor.x = (int)s_viewport_rect.x;
-    scissor.y = (int)s_viewport_rect.y;
-    scissor.w = (int)s_viewport_rect.z;
-    scissor.h = (int)s_viewport_rect.w;
+    scissor.x = x0;
+    scissor.y = y0;
+    scissor.w = x1 - x0;
+    scissor.h = y1 - y0;
     if (renderer.get_render_pass()) {
         SDL_SetGPUScissor(renderer.get_render_pass(), &scissor);
     }
