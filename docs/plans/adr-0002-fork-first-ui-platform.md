@@ -118,7 +118,7 @@ These rules apply:
    `imgui`. Constraint 1 requires this. The kit and the extensions link to
    the target `imgui`. An alias target `chroma::imgui` is optional.
 2. **The project identity carries the name.** The repository is
-   `synesthesia/chroma`. The tag pattern is `1.92.x-chroma.n`. The
+   `Synaesthesia-Group/chroma`. The tag pattern is `1.92.x-chroma.n`. The
    documentation, the CI names and the release notes use "Chroma".
 3. **The README states the origin in the first sentence.** "Chroma is a
    superset fork of Dear ImGui." The MIT licence file keeps the upstream
@@ -227,7 +227,7 @@ Harder:
 2. The second product. Recorded: likely 3D-related software. The fork covers
    general use.
 3. Sync model. Recorded: track upstream on each release.
-4. Name. Recorded: the fork is Chroma. Repository `synesthesia/chroma`.
+4. Name. Recorded: the fork is Chroma. Repository `Synaesthesia-Group/chroma`.
    Tags `1.92.x-chroma.n`. Open: the kit name.
 5. Location of the reference app. Recorded: the kit repository, at
    `apps/refapp`.

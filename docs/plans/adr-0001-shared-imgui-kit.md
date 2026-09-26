@@ -157,7 +157,7 @@ seconds. Stratum has 1.4 GB of submodules. Apply the seven conditions below.
 | Repository | Licence | Contents | Consumers |
 |---|---|---|---|
 | `synesthesia/imgui` (fork) | MIT | upstream docking plus gated topic branches; parity and extension-compat CI | kit, Stratum, future products |
-| `synesthesia/ui-kit` | Apache-2.0 | theme, fonts, widgets, layout, harness, gallery; **no copy of ImGui** | Stratum, future products |
+| `Synaesthesia-Group/chroma-kit` | Apache-2.0 | theme, fonts, widgets, layout, harness, gallery; **no copy of ImGui** | Stratum, future products |
 | `haptixxx/stratum` | Apache-2.0 | product; `external/imgui` submodule points at the fork; `external/ui-kit` submodule | |
 
 Conditions:
