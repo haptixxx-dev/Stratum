@@ -9,37 +9,6 @@
 
 namespace stratum {
 
-void Editor::handle_window_drag() {
-    // Handle window dragging on menu bar
-    if (m_window_handle) {
-        ImVec2 mouse_pos = ImGui::GetMousePos();
-        ImVec2 bar_min = ImGui::GetWindowPos();
-        ImVec2 bar_max = ImVec2(bar_min.x + ImGui::GetWindowWidth(), bar_min.y + ImGui::GetFrameHeight());
-
-        bool mouse_in_bar = mouse_pos.x >= bar_min.x && mouse_pos.x < bar_max.x &&
-                            mouse_pos.y >= bar_min.y && mouse_pos.y < bar_max.y;
-
-        if (mouse_in_bar && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-            m_dragging_window = true;
-            m_drag_start_mouse = mouse_pos;
-            SDL_GetWindowPosition(static_cast<SDL_Window*>(m_window_handle),
-                                  &m_drag_start_window_x, &m_drag_start_window_y);
-        }
-
-        if (m_dragging_window) {
-            if (ImGui::IsMouseDown(0)) {
-                ImVec2 delta = ImVec2(mouse_pos.x - m_drag_start_mouse.x,
-                                      mouse_pos.y - m_drag_start_mouse.y);
-                SDL_SetWindowPosition(static_cast<SDL_Window*>(m_window_handle),
-                                      m_drag_start_window_x + (int)delta.x,
-                                      m_drag_start_window_y + (int)delta.y);
-            } else {
-                m_dragging_window = false;
-            }
-        }
-    }
-}
-
 void Editor::toggle_fullscreen() {
     if (!m_window_handle) return;
 
