@@ -1,0 +1,89 @@
+{
+
+  "file": "rural_track.osm",
+  "sha256": "9ebc666f748d4e5aac616f4de10a9fa060c882ef9b0a31106e3a9c8ac465b0b2",
+  "parser": {
+
+    "nodes": 3,
+    "ways": 1,
+    "relations": 0,
+    "buildings": 0,
+    "roads": 1,
+    "areas": 0
+  },
+  "road_graph": {
+
+    "nodes": 2,
+    "edges": 1,
+    "junctions": 0,
+    "dead_ends": 2,
+    "continuations": 0,
+    "roundabout_edges": 0,
+    "layer_split_nodes": 0
+  },
+  "road_network": {
+
+    "edges": 1,
+    "pieces": 1,
+    "vertices": 72,
+    "triangles": 66,
+    "skipped_edges": 0,
+    "elevated_edges": 0,
+    "junction_pieces": 0,
+    "trimmed_edges": 0,
+    "trimmed_away_edges": 0,
+    "markings_pieces": 0,
+    "crossings": 0,
+    "dropped_kerb_spans": 0,
+    "bridges": 0,
+    "tunnels": 0,
+    "deduped_sidewalks": 0,
+    "vertices_welded": 0,
+    "vertices_dropped": 0,
+    "triangles_before_lod": 0,
+    "triangles_after_lod": 0,
+    "collision_triangles": 0,
+    "stations_before": 40,
+    "stations_after": 12,
+    "quads_merged": 0,
+    "triangles_before_tess": 66,
+    "corridor_kerb_edges": 0
+  },
+  "junction_stats": {
+
+    "junctions": 0,
+    "roundabouts": 0,
+    "tapers": 0,
+    "dead_ends": 0,
+    "degenerate": 0,
+    "merged_into_neighbour": 0,
+    "self_intersecting": 0,
+    "over_trimmed_edges": 0
+  },
+  "quadtree": {
+
+    "leaf_count": 1,
+    "total_roads": 1,
+    "total_buildings": 0,
+    "total_areas": 0,
+    "max_depth": 0
+  },
+  "meshes": {
+
+    "roads": {
+
+      "triangles": 66,
+      "vertices": 72
+    },
+    "buildings": {
+
+      "triangles": 0,
+      "vertices": 0
+    },
+    "areas": {
+
+      "triangles": 0,
+      "vertices": 0
+    }
+  }
+}
