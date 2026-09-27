@@ -246,6 +246,14 @@ private:
 
     bool m_viewport_focused = false;
     bool m_viewport_hovered = false;
+
+    /// Screen-space rect of the Viewport panel, in ImGui logical points.
+    ///
+    /// Written by draw_viewport() (zeroed first by render() so a closed panel
+    /// reads as empty), and read by render_3d() to size the 3D pass's viewport
+    /// and scissor. A member rather than a file-static because the write and the
+    /// two reads now live in different translation units.
+    ImVec4 m_viewport_rect{};
     bool m_show_demo_window = false;
     bool m_show_style_editor = false;
 
