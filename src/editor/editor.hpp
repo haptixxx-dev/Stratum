@@ -246,6 +246,14 @@ private:
 
     bool m_viewport_focused = false;
     bool m_viewport_hovered = false;
+
+    /// Screen-space rect of the Viewport panel, in ImGui logical points.
+    ///
+    /// Written by draw_viewport() (zeroed first by render() so a closed panel
+    /// reads as empty), and read by render_3d() to size the 3D pass's viewport
+    /// and scissor. A member rather than a file-static because the write and the
+    /// two reads now live in different translation units.
+    ImVec4 m_viewport_rect{};
     bool m_show_demo_window = false;
     bool m_show_style_editor = false;
 
@@ -655,6 +663,12 @@ private:
     ///                    which must leave the user's viewpoint alone.
     void begin_mesh_rebuild(std::vector<osm::road::RoadPiece>&& road_pieces = {},
                             bool recenter_camera = true);
+
+    /// Point the camera at the quadtree's current geometry. Split out of
+    /// begin_mesh_rebuild() so the framing logic can be read (and tested) on its
+    /// own. @param recenter_camera False for a road rebuild, which must leave the
+    /// user's viewpoint alone.
+    void frame_camera_on_data(bool recenter_camera);
 
     // ── Terrain-aware roads (P3) ────────────────────────────────────────────
     // Road elevation is solved GLOBALLY, over the whole graph, BEFORE any terrain
