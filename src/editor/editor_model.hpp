@@ -19,7 +19,7 @@
 
 #include <string>
 
-#include "editor/export_options.hpp"
+#include "app/export_options.hpp"
 #include "editor/render_settings.hpp"
 #include "renderer/mesh.hpp"
 

@@ -14,12 +14,13 @@ void Editor::draw_procgen_panel() {
         
         // Mode selection
         if (ImGui::Checkbox("Use Chunked Terrain", &m_use_chunked_terrain)) {
-            // The legacy path has no carve hook, so make_terrain_height_sampler()
-            // returns null while it is selected. Switching modes therefore changes
-            // the surface the roads belong on, exactly as generating terrain does,
-            // and leaves the solve stale in both directions: elevated roads over a
-            // legacy terrain nothing carved, or flat roads over carved chunks.
-            maybe_rebuild_roads_for_terrain();
+            // The legacy path has no carve hook, so ImportPipeline's height
+            // sampler returns null while it is selected. Switching modes
+            // therefore changes the surface the roads belong on, exactly as
+            // generating terrain does, and leaves the solve stale in both
+            // directions: elevated roads over a legacy terrain nothing carved,
+            // or flat roads over carved chunks.
+            request_road_rebuild(app::RebuildPolicy::IfSurfaceChanged);
         }
         ImGui::SameLine();
         ImGui::TextDisabled("(?)");
@@ -118,7 +119,7 @@ void Editor::draw_chunked_terrain_ui() {
         ImGui::SetItemTooltip("Height level for flattened OSM areas");
         
         // Show OSM data status
-        const auto& osm_data = m_osm_parser.get_data();
+        const auto& osm_data = m_import_pipeline.parser().get_data();
         if (osm_data.stats.total_nodes > 0) {
             ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "OSM data loaded: %zu roads, %zu buildings",
                 osm_data.stats.processed_roads, osm_data.stats.processed_buildings);
@@ -161,9 +162,9 @@ void Editor::draw_chunked_terrain_ui() {
             // belongs here and NOT inside clear_chunked_terrain(), which
             // generate_chunked_terrain() calls first thing: a rebuild launched
             // there would still be in flight when generate_chunked_terrain()
-            // reaches its own maybe_rebuild_roads_for_terrain(), that second call
-            // would be refused, and the roads would stay flat under new terrain.
-            maybe_rebuild_roads_for_terrain();
+            // reaches its own request_road_rebuild(IfSurfaceChanged), that second
+            // call would be deferred, and the roads would stay flat under new terrain.
+            request_road_rebuild(app::RebuildPolicy::IfSurfaceChanged);
         }
     }
 
@@ -339,12 +340,13 @@ void Editor::generate_chunked_terrain() {
     // made, so they are never carved to a profile that is about to be replaced.
     // The chunk map is empty at this point, so this costs nothing.
     if (m_terrain_tile_manager.has_road_carve_data() &&
-        terrain_surface_fingerprint(m_terrain_tile_config.terrain) != m_road_terrain_fingerprint) {
+        app::terrain_surface_fingerprint(m_terrain_tile_config.terrain) !=
+            m_import_pipeline.state().roads.terrain_fingerprint) {
         m_terrain_tile_manager.clear_road_carve_data();
     }
-    
+
     // Import OSM data for flattening if available
-    const auto& osm_data = m_osm_parser.get_data();
+    const auto& osm_data = m_import_pipeline.parser().get_data();
     if (osm_data.stats.processed_roads > 0 || osm_data.stats.processed_buildings > 0) {
         // Collect all OSM elements from quadtree leaves
         std::vector<osm::Road> all_roads;
@@ -380,7 +382,7 @@ void Editor::generate_chunked_terrain() {
     // That is a deliberate double pass: it puts terrain on screen immediately
     // instead of after the road solve, and a chunk regeneration is required
     // anyway whenever terrain already existed at import time.
-    maybe_rebuild_roads_for_terrain();
+    request_road_rebuild(app::RebuildPolicy::IfSurfaceChanged);
 }
 
 void Editor::clear_chunked_terrain() {

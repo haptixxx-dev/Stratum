@@ -63,7 +63,8 @@ because they are absent.
 ### Two-library split
 
 - **stratum_core** (static lib, `CMakeLists.txt:70`) — engine-agnostic. Contains
-  `src/osm`, `src/osm/road`, `src/geometry`, `src/procgen`, `src/scene` only.
+  `src/app`, `src/osm`, `src/osm/road`, `src/geometry`, `src/procgen`, `src/scene`
+  only.
   Links `glm`, `osmium`, `Clipper2`, `meshoptimizer`, `draco`, `stb`. Must NOT
   depend on SDL, ImGui or rendering code. `stb` is there deliberately — decision
   Q2 (#13) allows core to read and write pixel data, so heightmap import and,

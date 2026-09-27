@@ -63,7 +63,7 @@ void Editor::draw_osm_panel() {
         // The toggle changes which surface the roads belong on, so the current
         // solve is stale either way round. Re-solve now rather than waiting for
         // the next terrain generate.
-        maybe_rebuild_roads_for_terrain();
+        request_road_rebuild(app::RebuildPolicy::IfSurfaceChanged);
     }
     ImGui::SetItemTooltip(
         "Solve road heights against the terrain and carve the terrain to match.\n"
@@ -82,7 +82,7 @@ void Editor::draw_osm_panel() {
         // centerline. Nothing in the current network survives it, so re-solve now
         // rather than leaving the panel describing a network the toggle no longer
         // matches.
-        begin_road_network_rebuild();
+        request_road_rebuild(app::RebuildPolicy::Always);
     }
     ImGui::SetItemTooltip(
         "Trim each arm back from its node, fill the intersection, and fillet the corners.\n"
@@ -95,7 +95,7 @@ void Editor::draw_osm_panel() {
     // out. All three change the geometry of the pieces themselves, so each has to
     // re-solve the network rather than only redraw it.
     if (ImGui::Checkbox("Lane Markings", &m_model.m_emit_markings)) {
-        begin_road_network_rebuild();
+        request_road_rebuild(app::RebuildPolicy::Always);
     }
     ImGui::SetItemTooltip(
         "Centre lines, edge lines, stop lines, give-way triangles and turn arrows.\n"
@@ -104,7 +104,7 @@ void Editor::draw_osm_panel() {
 
     ImGui::SameLine();
     if (ImGui::Checkbox("Crossings", &m_model.m_emit_crossings)) {
-        begin_road_network_rebuild();
+        request_road_rebuild(app::RebuildPolicy::Always);
     }
     ImGui::SetItemTooltip(
         "Zebra stripes at highway=crossing nodes, and dropped kerbs in the curb ring.\n"
@@ -112,7 +112,7 @@ void Editor::draw_osm_panel() {
         "line is derived from the profile, and the two fail in different ways.");
 
     if (ImGui::Checkbox("Bridges and Tunnels", &m_model.m_emit_structures)) {
-        begin_road_network_rebuild();
+        request_road_rebuild(app::RebuildPolicy::Always);
     }
     ImGui::SetItemTooltip(
         "Bridge deck slabs, parapets and piers; tunnel portal headwalls.\n"
@@ -126,7 +126,7 @@ void Editor::draw_osm_panel() {
     // Geometry reduction. Both change what is built rather than what is drawn, so
     // both re-solve, and both are bisectable the same way the detail passes are.
     if (ImGui::Checkbox("Reduce Tessellation", &m_model.m_reduce_tessellation)) {
-        begin_road_network_rebuild();
+        request_road_rebuild(app::RebuildPolicy::Always);
     }
     ImGui::SetItemTooltip(
         "Drop stations a straight road does not need, and merge coplanar strip quads.\n"
@@ -138,7 +138,7 @@ void Editor::draw_osm_panel() {
         // Not a draw-time switch. It decides how pieces are routed into the
         // leaves -- triangle by triangle when on -- so the tree has to be
         // rebuilt, not merely redrawn.
-        begin_road_network_rebuild();
+        request_road_rebuild(app::RebuildPolicy::Always);
     }
     ImGui::SetItemTooltip(
         "Merge each leaf's road pieces and simplify the merged mesh into a level chain.\n"
@@ -157,14 +157,12 @@ void Editor::draw_osm_panel() {
     }
     ImGui::EndDisabled();
 
-    // An export re-solves the network from m_osm_parser's data on a worker, so it
-    // locks the parser for exactly the same reason an import in flight does.
-    const bool importing = (m_import_stage == ImportStage::Parsing ||
-                            m_import_stage == ImportStage::BuildingRoads ||
-                            m_import_stage == ImportStage::Indexing ||
-                            m_import_stage == ImportStage::BuildingMeshes ||
-                            m_import_stage == ImportStage::CarvingTerrain) ||
-                           export_in_flight();
+    // An export re-solves the network from the pipeline's parsed data on a
+    // worker, so it locks the parser for exactly the same reason an import in
+    // flight does. state().busy() covers both: parsing through carving, an
+    // owed-rebuild's second BuildingRoads, and an export in flight.
+    const app::PipelineState& pstate = m_import_pipeline.state();
+    const bool importing = pstate.busy();
 
     ImGui::BeginDisabled(importing);
     if (ImGui::Button("Import OSM File", ImVec2(-1, 0))) {
@@ -174,43 +172,44 @@ void Editor::draw_osm_panel() {
         } else {
             m_import_status.clear();
             m_import_error = false;
-            begin_osm_import(m_model.m_osm_filepath, config);
+            app::ImportOptions options;
+            options.parser = config;
+            options.roads = road_options();
+            m_import_pipeline.begin_import(m_model.m_osm_filepath, options);
         }
     }
     ImGui::EndDisabled();
 
-    // Progress, driven by poll_osm_import()
+    // Progress, driven by m_import_pipeline.tick() (called from Editor::render()).
     if (importing) {
         const char* stage_label =
-            m_import_stage == ImportStage::Parsing        ? "1/5 Parsing" :
-            m_import_stage == ImportStage::BuildingRoads  ? "2/5 Road network" :
-            m_import_stage == ImportStage::Indexing       ? "3/5 Spatial index" :
-            m_import_stage == ImportStage::BuildingMeshes ? "4/5 Building meshes" :
-                                                            "5/5 Terrain carve";
+            pstate.stage == app::ImportStage::Parsing        ? "1/5 Parsing" :
+            pstate.stage == app::ImportStage::BuildingRoads  ? "2/5 Road network" :
+            pstate.stage == app::ImportStage::Indexing       ? "3/5 Spatial index" :
+            pstate.stage == app::ImportStage::BuildingMeshes ? "4/5 Building meshes" :
+                                                               "5/5 Terrain carve";
 
         // The parser reports item counts only for some stages, so a zero fraction
         // means "unknown", not "nothing done" -- show an indeterminate bar rather
         // than one frozen at 0%.
-        if (m_import_fraction > 0.0f) {
-            ImGui::ProgressBar(m_import_fraction, ImVec2(-1, 0));
+        if (pstate.fraction > 0.0f) {
+            ImGui::ProgressBar(pstate.fraction, ImVec2(-1, 0));
         } else {
             const float t = fmodf((float)ImGui::GetTime() * 0.8f, 1.0f);
             ImGui::ProgressBar(-1.0f * t, ImVec2(-1, 0), "working...");
         }
         ImGui::Text("%s", stage_label);
-        if (!m_import_message.empty()) {
+        if (!pstate.message.empty()) {
             ImGui::SameLine();
-            ImGui::TextDisabled("- %s", m_import_message.c_str());
+            ImGui::TextDisabled("- %s", pstate.message.c_str());
         }
-        if (m_import_stage == ImportStage::BuildingMeshes && m_import_nodes_total > 0) {
-            ImGui::Text("Nodes: %zu / %zu",
-                        (size_t)(m_import_fraction * m_import_nodes_total + 0.5f),
-                        m_import_nodes_total);
+        if (pstate.stage == app::ImportStage::BuildingMeshes && pstate.nodes_total > 0) {
+            ImGui::Text("Nodes: %zu / %zu", pstate.nodes_done, pstate.nodes_total);
         }
-    } else if (m_import_stage == ImportStage::Failed) {
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", m_import_message.c_str());
-    } else if (m_import_stage == ImportStage::Done) {
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", m_import_message.c_str());
+    } else if (pstate.stage == app::ImportStage::Failed) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", pstate.message.c_str());
+    } else if (pstate.stage == app::ImportStage::Done) {
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", pstate.message.c_str());
     }
 
     // Show status message
@@ -231,9 +230,9 @@ void Editor::draw_osm_panel() {
     ImGui::Separator();
 
     {
-        const bool busy = export_in_flight();
+        const bool busy = pstate.export_running;
         const bool export_blocked = importing; // an import/rebuild also locks the parser
-        const bool have_roads = m_osm_parser.has_data() && !m_osm_parser.get_data().roads.empty();
+        const bool have_roads = m_import_pipeline.has_roads();
 
         ImGui::BeginDisabled(busy);
 
@@ -274,7 +273,12 @@ void Editor::draw_osm_panel() {
 
         ImGui::BeginDisabled(!have_roads || export_blocked);
         if (ImGui::Button("Export", ImVec2(-1, 0))) {
-            begin_road_export();
+            if (const app::Launch launch = m_import_pipeline.begin_export(m_model.m_export_options);
+                !launch.started) {
+                m_export_status = launch.reason;
+            } else {
+                m_export_status = "Exporting...";
+            }
         }
         ImGui::EndDisabled();
 
@@ -297,8 +301,8 @@ void Editor::draw_osm_panel() {
     ImGui::Separator();
 
     // Display loaded data statistics
-    if (m_osm_parser.has_data()) {
-        const auto& data = m_osm_parser.get_data();
+    if (m_import_pipeline.parser().has_data()) {
+        const auto& data = m_import_pipeline.parser().get_data();
 
         ImGui::Text("Loaded Data:");
         ImGui::BulletText("Nodes: %zu", data.stats.total_nodes);
@@ -325,28 +329,28 @@ void Editor::draw_osm_panel() {
         ImGui::BulletText("Parse: %.1f ms", data.stats.parse_time_ms);
         ImGui::BulletText("Process: %.1f ms", data.stats.process_time_ms);
 
-        if (m_have_road_stats) {
+        if (pstate.roads.have_stats) {
             ImGui::Spacing();
             ImGui::Text("Road Network:");
             ImGui::BulletText("Pieces: %zu (%zu triangles)",
-                              m_road_stats.pieces, m_road_stats.triangles);
-            ImGui::BulletText("Build: %.1f ms", m_road_stats.build_ms);
+                              pstate.roads.network.pieces, pstate.roads.network.triangles);
+            ImGui::BulletText("Build: %.1f ms", pstate.roads.network.build_ms);
 
             ImGui::Spacing();
-            if (m_road_built_on_terrain) {
+            if (pstate.roads.built_on_terrain) {
                 ImGui::Text("Elevation Solve:");
                 ImGui::BulletText("Edges: %zu of %zu elevated in %.1f ms",
-                                  m_road_stats.elevated_edges, m_road_stats.edges,
-                                  m_road_stats.elevation_ms);
+                                  pstate.roads.network.elevated_edges, pstate.roads.network.edges,
+                                  pstate.roads.network.elevation_ms);
                 ImGui::BulletText("Iterations: %zu (residual %.3f m)",
-                                  m_road_elevation_stats.iterations,
-                                  m_road_elevation_stats.max_residual);
+                                  pstate.roads.elevation.iterations,
+                                  pstate.roads.elevation.max_residual);
                 ImGui::BulletText("Max grade: %.1f%% (%zu edges grade-limited)",
-                                  m_road_max_grade * 100.0f,
-                                  m_road_elevation_stats.grade_limited_edges);
+                                  pstate.roads.max_grade * 100.0f,
+                                  pstate.roads.elevation.grade_limited_edges);
                 ImGui::BulletText("Bridges: %zu   Tunnels: %zu",
-                                  m_road_elevation_stats.bridges,
-                                  m_road_elevation_stats.tunnels);
+                                  pstate.roads.elevation.bridges,
+                                  pstate.roads.elevation.tunnels);
                 if (m_terrain_tile_manager.has_road_carve_data()) {
                     ImGui::BulletText("Terrain carved: yes");
                 } else {
@@ -357,37 +361,37 @@ void Editor::draw_osm_panel() {
             }
 
             ImGui::Spacing();
-            if (m_road_solved_junctions) {
+            if (pstate.roads.solved_junctions) {
                 ImGui::Text("Junctions:");
                 ImGui::BulletText("Solved: %zu   Roundabouts: %zu",
-                                  m_road_junction_stats.junctions,
-                                  m_road_junction_stats.roundabouts);
+                                  pstate.roads.junctions.junctions,
+                                  pstate.roads.junctions.roundabouts);
                 ImGui::BulletText("Tapers: %zu   Dead ends: %zu",
-                                  m_road_junction_stats.tapers,
-                                  m_road_junction_stats.dead_ends);
+                                  pstate.roads.junctions.tapers,
+                                  pstate.roads.junctions.dead_ends);
                 ImGui::BulletText("Pieces: %zu   Trimmed edges: %zu",
-                                  m_road_stats.junction_pieces,
-                                  m_road_stats.trimmed_edges);
-                ImGui::BulletText("Solve: %.1f ms", m_road_stats.junction_ms);
+                                  pstate.roads.network.junction_pieces,
+                                  pstate.roads.network.trimmed_edges);
+                ImGui::BulletText("Solve: %.1f ms", pstate.roads.network.junction_ms);
 
                 // A degenerate node fell back to a provisional disc and emitted no
                 // fill; an over-trimmed edge is one the junction polygon still
                 // overlaps. Neither is visible in the geometry without looking for
                 // it, so both are called out rather than buried in the list above.
-                if (m_road_junction_stats.degenerate > 0) {
+                if (pstate.roads.junctions.degenerate > 0) {
                     ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
                                        "  %zu degenerate: arms too wide for the node.",
-                                       m_road_junction_stats.degenerate);
+                                       pstate.roads.junctions.degenerate);
                 }
-                if (m_road_junction_stats.over_trimmed_edges > 0) {
+                if (pstate.roads.junctions.over_trimmed_edges > 0) {
                     ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
                                        "  %zu over-trimmed: the trim clamp bound.",
-                                       m_road_junction_stats.over_trimmed_edges);
+                                       pstate.roads.junctions.over_trimmed_edges);
                 }
-                if (m_road_stats.trimmed_away_edges > 0) {
+                if (pstate.roads.network.trimmed_away_edges > 0) {
                     ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
                                        "  %zu edges consumed entirely by their trims.",
-                                       m_road_stats.trimmed_away_edges);
+                                       pstate.roads.network.trimmed_away_edges);
                 }
             } else {
                 ImGui::TextDisabled("Junction solver off: ribbons overlap at every node.");
@@ -400,22 +404,22 @@ void Editor::draw_osm_panel() {
             // when the pass ran and found nothing. The two mean opposite things to
             // anyone reading the panel, so the flag decides which is shown and the
             // count is never left to imply it.
-            if (m_road_emitted_markings) {
-                ImGui::BulletText("Marking pieces: %zu", m_road_stats.markings_pieces);
+            if (pstate.roads.emitted_markings) {
+                ImGui::BulletText("Marking pieces: %zu", pstate.roads.network.markings_pieces);
             } else {
                 ImGui::BulletText("Marking pieces: off");
             }
 
-            if (m_road_emitted_crossings) {
-                ImGui::BulletText("Crossings: %zu", m_road_stats.crossings);
+            if (pstate.roads.emitted_crossings) {
+                ImGui::BulletText("Crossings: %zu", pstate.roads.network.crossings);
             } else {
                 ImGui::BulletText("Crossings: off");
             }
 
-            if (m_road_emitted_structures) {
+            if (pstate.roads.emitted_structures) {
                 ImGui::BulletText("Bridges: %zu   Tunnels: %zu (%zu portal mouths)",
-                                  m_road_stats.bridges, m_road_stats.tunnels,
-                                  m_road_portal_mouths);
+                                  pstate.roads.network.bridges, pstate.roads.network.tunnels,
+                                  pstate.roads.portal_mouths);
             } else if (!m_model.m_emit_structures) {
                 ImGui::BulletText("Bridges and tunnels: off");
             } else {
@@ -426,13 +430,13 @@ void Editor::draw_osm_panel() {
 
             // Counted per SIDE, not per edge: an edge whose sidewalk is separately
             // mapped on both sides adds two.
-            ImGui::BulletText("Sidewalk sides deduped: %zu", m_road_stats.deduped_sidewalks);
+            ImGui::BulletText("Sidewalk sides deduped: %zu", pstate.roads.network.deduped_sidewalks);
 
             ImGui::Spacing();
             ImGui::Text("Tessellation:");
             if (m_model.m_reduce_tessellation) {
-                const size_t before = m_road_stats.stations_before;
-                const size_t after = m_road_stats.stations_after;
+                const size_t before = pstate.roads.network.stations_before;
+                const size_t after = pstate.roads.network.stations_after;
                 ImGui::BulletText("Stations: %zu -> %zu (%.1f%%)", before, after,
                                   before ? 100.0 * static_cast<double>(after)
                                                  / static_cast<double>(before)
@@ -440,18 +444,18 @@ void Editor::draw_osm_panel() {
                 // A merge removes two triangles, so the pair is what the lateral
                 // pass actually contributed and the count alone is half the story.
                 ImGui::BulletText("Quads merged: %zu (%zu triangles)",
-                                  m_road_stats.quads_merged, m_road_stats.quads_merged * 2);
-                const size_t tri_before = m_road_stats.triangles_before_tess;
+                                  pstate.roads.network.quads_merged, pstate.roads.network.quads_merged * 2);
+                const size_t tri_before = pstate.roads.network.triangles_before_tess;
                 ImGui::BulletText("Triangles: %zu -> %zu (%.1f%%)", tri_before,
-                                  m_road_stats.triangles,
-                                  tri_before ? 100.0 * static_cast<double>(m_road_stats.triangles)
+                                  pstate.roads.network.triangles,
+                                  tri_before ? 100.0 * static_cast<double>(pstate.roads.network.triangles)
                                                      / static_cast<double>(tri_before)
                                              : 100.0);
                 ImGui::BulletText("Corridor kerbs dropped on %zu edges",
-                                  m_road_stats.corridor_kerb_edges);
+                                  pstate.roads.network.corridor_kerb_edges);
             } else {
                 ImGui::BulletText("Reduction: off (%zu stations, %zu triangles)",
-                                  m_road_stats.stations_before, m_road_stats.triangles);
+                                  pstate.roads.network.stations_before, pstate.roads.network.triangles);
             }
 
             draw_chunk_lod_stats();
@@ -460,20 +464,20 @@ void Editor::draw_osm_panel() {
             // stand without: the headwall frames an opening the hillside would
             // otherwise close over. Say so when portals were built and the terrain
             // never received them.
-            if (m_road_portal_mouths > 0 && !m_terrain_tile_manager.has_road_carve_data()) {
+            if (pstate.roads.portal_mouths > 0 && !m_terrain_tile_manager.has_road_carve_data()) {
                 ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
                                    "  %zu portal mouths are not carved: the terrain has no "
                                    "carve data.",
-                                   m_road_portal_mouths);
+                                   pstate.roads.portal_mouths);
             }
 
             // The surface the roads WOULD be solved against right now. It differs
             // from the one they WERE solved against whenever terrain was
             // generated or regenerated while an import was in flight, or the
             // terrain-aware toggle was flipped and the rebuild was refused.
-            const uint64_t live_surface = live_road_terrain_fingerprint();
+            const uint64_t live_surface = m_import_pipeline.live_terrain_fingerprint();
 
-            if (live_surface != m_road_terrain_fingerprint) {
+            if (live_surface != pstate.roads.terrain_fingerprint) {
                 // A live surface of zero is not "a different terrain", it is no
                 // terrain at all: the chunks were cleared, chunked mode was
                 // switched off, or terrain-aware roads were switched off. The
@@ -486,7 +490,7 @@ void Editor::draw_osm_panel() {
                 ImGui::BeginDisabled(importing);
                 if (ImGui::Button(to_flat ? "Re-solve Roads Flat" : "Re-solve Against Terrain",
                                   ImVec2(-1, 0))) {
-                    begin_road_network_rebuild();
+                    request_road_rebuild(app::RebuildPolicy::Always);
                 }
                 ImGui::EndDisabled();
             }
@@ -529,8 +533,10 @@ void Editor::draw_osm_panel() {
         }
 
         ImGui::Separator();
-        // Clearing mid-import would drop the quadtree nodes that m_import_pending_nodes
-        // still points at, and poll_osm_import() would then read freed memory.
+        // Clearing mid-import would drop quadtree nodes the pipeline's own
+        // pending-node list still points at; m_import_pipeline.clear() refuses
+        // outright while state().busy(), but disabling the button here too
+        // keeps it from ever being pressed during an import in the first place.
         ImGui::BeginDisabled(importing);
         if (ImGui::Button("Clear Data", ImVec2(-1, 0))) {
             clear_imported_data();

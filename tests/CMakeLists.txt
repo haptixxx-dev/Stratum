@@ -40,6 +40,11 @@ endif()
 set(STRATUM_TEST_SOURCES
     framework.cpp
     obj_dump.cpp
+
+    # The import/road-build/index/carve/export state machine, driven with tick()
+    # and no window or GPU. See docs/plans/import-pipeline-design.md section 6.
+    app/test_import_pipeline.cpp
+
     road/test_road_graph.cpp
     road/test_centerline.cpp
     road/test_road_profile.cpp
@@ -132,6 +137,7 @@ set(STRATUM_TEST_SOURCES
 
 # Suite names registered with ctest so each can be run and reported separately.
 set(STRATUM_TEST_SUITES
+    ImportPipeline
     AmbientOcclusion
     CommandStack
     SceneLayer
@@ -294,6 +300,10 @@ target_compile_definitions(stratum_tests PRIVATE
     # The shipped rule examples. Source tree, not build tree: they are
     # committed files the Examples suite runs so one cannot rot unnoticed.
     STRATUM_EXAMPLES_DIR="${CMAKE_SOURCE_DIR}/examples/rules"
+    # Committed stratum_golden snapshots, read back by the ImportPipeline suite
+    # so the pipeline-driven counts and the golden counts cannot quietly drift
+    # apart into two hand-maintained copies of the same numbers.
+    STRATUM_TEST_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden"
 )
 
 target_compile_features(stratum_tests PRIVATE cxx_std_20)

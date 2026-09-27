@@ -262,8 +262,8 @@ void Editor::run_rule_source() {
     m_rule_buildings_built = 0;
     m_rule_buildings_skipped = 0;
 
-    if (m_model.m_rule_seed_source == EditorModel::RuleSeedSource::ImportedBuildings && m_osm_parser.has_data()) {
-        const auto& buildings = m_osm_parser.get_data().buildings;
+    if (m_model.m_rule_seed_source == EditorModel::RuleSeedSource::ImportedBuildings && m_import_pipeline.parser().has_data()) {
+        const auto& buildings = m_import_pipeline.parser().get_data().buildings;
         const size_t limit = m_model.m_rule_building_limit > 0
                                  ? static_cast<size_t>(m_model.m_rule_building_limit)
                                  : buildings.size();
@@ -397,8 +397,8 @@ void Editor::draw_rule_source() {
     // Where the seeds come from. The imported option is disabled rather than
     // hidden when there is no import, so the feature is discoverable before
     // anyone has loaded an extract.
-    const bool have_import = m_osm_parser.has_data() &&
-                             !m_osm_parser.get_data().buildings.empty();
+    const bool have_import = m_import_pipeline.parser().has_data() &&
+                             !m_import_pipeline.parser().get_data().buildings.empty();
 
     int source = static_cast<int>(m_model.m_rule_seed_source);
     ImGui::SetNextItemWidth(200.0f);
@@ -414,7 +414,7 @@ void Editor::draw_rule_source() {
         ImGui::TextDisabled("(no OSM import loaded)");
     } else if (m_model.m_rule_seed_source == EditorModel::RuleSeedSource::ImportedBuildings) {
         ImGui::SameLine();
-        ImGui::Text("%zu available", m_osm_parser.get_data().buildings.size());
+        ImGui::Text("%zu available", m_import_pipeline.parser().get_data().buildings.size());
     }
 
     if (m_model.m_rule_seed_source == EditorModel::RuleSeedSource::ImportedBuildings) {

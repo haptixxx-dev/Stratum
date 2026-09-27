@@ -141,8 +141,9 @@ void draw_overlay_ring(const std::vector<glm::dvec2>& ring, float y, Im3d::Color
 /// One open polyline, lifted by `y` above the surface `sampler` reports.
 ///
 /// The sampler is not optional decoration. Road geometry is DRAPED: whenever
-/// terrain exists, make_road_network_config() hands the solver a height sampler
-/// and RoadElevationSolver lifts every piece onto the surface. Road::polyline is
+/// terrain exists, ImportPipeline's own road network config hands the solver a
+/// height sampler and RoadElevationSolver lifts every piece onto the surface.
+/// Road::polyline is
 /// the raw 2D input and carries no elevation at all, so drawing it at a constant
 /// world Y puts the whole overlay tens of metres under the hills -- and Im3d
 /// depth-tests, so it is not merely wrong, it is invisible. The panel then reads
@@ -250,11 +251,11 @@ void Editor::draw_attribute_overlay() {
               [](const auto& a, const auto& b) { return a.first < b.first; });
 
     // The SAME sampler the road solve was given, built once for the whole pass
-    // rather than per road: make_terrain_height_sampler() constructs a
+    // rather than per road: ImportPipeline::height_sampler() constructs a
     // TerrainGenerator, and doing that a few thousand times a frame would cost
     // more than the overlay itself. Null when there is no terrain, which the
     // strip drawer reads as a flat world.
-    const osm::road::HeightSampler overlay_height = make_terrain_height_sampler();
+    const osm::road::HeightSampler overlay_height = m_import_pipeline.height_sampler();
 
     Im3d::PushDrawState();
     Im3d::SetSize(kOverlayLineWidth);
