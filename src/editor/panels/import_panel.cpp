@@ -461,45 +461,7 @@ void Editor::draw_osm_panel() {
         // still points at, and poll_osm_import() would then read freed memory.
         ImGui::BeginDisabled(importing);
         if (ImGui::Button("Clear Data", ImVec2(-1, 0))) {
-            m_import_stage = ImportStage::Idle;
-            m_import_pending_nodes.clear();
-            m_import_nodes_total = 0;
-            m_import_message.clear();
-            m_osm_parser.clear();
-
-            // Every leaf about to be destroyed may still own GPU meshes, and
-            // m_mesh_owners holds a raw pointer to each of them. Dropping the tree
-            // without this leaks the geometry AND leaves entries naming freed
-            // nodes, which the next eviction would follow.
-            if (m_gpu_renderer) {
-                for (auto* leaf : m_quadtree.get_all_leaves()) {
-                    if (leaf) release_node_from_gpu(*leaf, *m_gpu_renderer);
-                }
-            }
-            m_quadtree.clear();
-            m_building_meshes.clear();
-            m_road_meshes.clear();
-            m_area_meshes.clear();
-
-            // The carve describes a road network that no longer exists, so leaving
-            // it installed would keep cutting trenches for roads the user just
-            // deleted. Dropping it regenerates the affected chunks.
-            m_pending_carve.reset();
-            m_carve_apply_pending = false;
-            m_terrain_tile_manager.clear_road_carve_data();
-
-            m_have_road_stats = false;
-            m_road_built_on_terrain = false;
-            m_road_terrain_fingerprint = 0;
-            m_road_stats = {};
-            m_road_elevation_stats = {};
-            m_road_max_grade = 0.0f;
-            m_road_solved_junctions = false;
-            m_road_junction_stats = {};
-            m_road_emitted_markings = false;
-            m_road_emitted_crossings = false;
-            m_road_emitted_structures = false;
-            m_road_portal_mouths = 0;
+            clear_imported_data();
         }
         ImGui::EndDisabled();
     }

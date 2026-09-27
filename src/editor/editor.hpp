@@ -706,6 +706,12 @@ private:
 
     void begin_osm_import(const std::string& filepath, const osm::ParserConfig& config);
     void poll_osm_import();
+
+    /// Tear down all imported OSM data: the quadtree (releasing its GPU meshes
+    /// first), the road carve, and every import/road stat field. Called from the
+    /// import panel's "Clear Data" button, which disables itself while an import
+    /// is in flight so this never runs concurrently with poll_osm_import().
+    void clear_imported_data();
     /// @param road_pieces Prebuilt road geometry, handed to the quadtree once its
     ///                    leaves exist and before any node mesh build is queued.
     /// @param recenter_camera Frame the imported data. False for a road rebuild,
