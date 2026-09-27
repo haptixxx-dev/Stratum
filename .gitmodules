@@ -3,7 +3,7 @@
 	url = https://github.com/libsdl-org/SDL.git
 [submodule "external/imgui"]
 	path = external/imgui
-	url = https://github.com/ocornut/imgui.git
+	url = https://github.com/Synaesthesia-Group/chroma.git
 [submodule "external/libosmium"]
 	path = external/libosmium
 	url = https://github.com/osmcode/libosmium.git
