@@ -314,6 +314,7 @@ add_library(stratum_editor_lib STATIC
     src/editor/panels/memory_panel.cpp
     src/editor/ui/layout.cpp
     src/editor/window_chrome.cpp
+    src/editor/viewport_renderer.cpp
     src/editor/viewport_overlay.cpp
 )
 
