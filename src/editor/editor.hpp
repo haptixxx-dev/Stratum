@@ -140,6 +140,17 @@ private:
     /// Drop the preview mesh and its GPU handle. Safe to call with none.
     void clear_rule_preview();
 
+    /// Read `path` into m_rule_source, update m_rule_path/m_rule_status and
+    /// re-run it. Returns false (with m_rule_status set) if the file could not
+    /// be opened. Called from poll_file_dialog() on FilePickTarget::RuleFileLoad.
+    bool load_rule_source(const std::string& path);
+
+    /// Write m_rule_source to `path` and update m_rule_path/m_rule_status.
+    /// Returns false (with m_rule_status set, and logged on a write failure) if
+    /// the file could not be opened or the write failed. Called from
+    /// poll_file_dialog() on FilePickTarget::RuleFileSave.
+    bool save_rule_source(const std::string& path);
+
     // ------------------------------------------------------------------------
     // Colour-by-attribute viewport mode
     //

@@ -6,9 +6,7 @@
 #include <spdlog/spdlog.h>
 #include <SDL3/SDL.h>
 #include <cstdio>
-#include <fstream>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <utility>
 
@@ -214,42 +212,13 @@ void Editor::poll_file_dialog() {
             break;
         }
 
-        case FilePickTarget::RuleFileLoad: {
-            std::ifstream in(path, std::ios::binary);
-            if (!in) {
-                m_rule_status = "could not open " + path;
-                break;
-            }
-            std::ostringstream buffer;
-            buffer << in.rdbuf();
-            m_rule_source = buffer.str();
-            m_rule_path = path;
-            m_rule_status = "loaded " + path;
-            // A loaded file is a different program, so nothing from the last one
-            // still describes it. Clearing rather than leaving it stale is the
-            // point: a diagnostic pointing at line 40 of a file that is now 12
-            // lines long is worse than no diagnostic.
-            m_rule_dirty = true;
-            run_rule_source();
+        case FilePickTarget::RuleFileLoad:
+            load_rule_source(path);
             break;
-        }
 
-        case FilePickTarget::RuleFileSave: {
-            std::ofstream out(path, std::ios::binary);
-            if (!out) {
-                m_rule_status = "could not write " + path;
-                break;
-            }
-            out << m_rule_source;
-            if (!out) {
-                m_rule_status = "write failed - see console";
-                spdlog::error("Rule file write failed: {}", path);
-                break;
-            }
-            m_rule_path = path;
-            m_rule_status = "saved to " + path;
+        case FilePickTarget::RuleFileSave:
+            save_rule_source(path);
             break;
-        }
     }
 }
 

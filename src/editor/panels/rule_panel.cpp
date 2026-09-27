@@ -68,6 +68,8 @@
 #include <spdlog/spdlog.h>
 
 #include <cstdint>
+#include <fstream>
+#include <sstream>
 #include <string>
 
 namespace stratum {
@@ -181,6 +183,43 @@ void Editor::clear_rule_preview() {
         m_rule_preview_gpu_id = 0;
     }
     m_rule_preview_mesh = Mesh{};
+}
+
+bool Editor::load_rule_source(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        m_rule_status = "could not open " + path;
+        return false;
+    }
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    m_rule_source = buffer.str();
+    m_rule_path = path;
+    m_rule_status = "loaded " + path;
+    // A loaded file is a different program, so nothing from the last one
+    // still describes it. Clearing rather than leaving it stale is the
+    // point: a diagnostic pointing at line 40 of a file that is now 12
+    // lines long is worse than no diagnostic.
+    m_rule_dirty = true;
+    run_rule_source();
+    return true;
+}
+
+bool Editor::save_rule_source(const std::string& path) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        m_rule_status = "could not write " + path;
+        return false;
+    }
+    out << m_rule_source;
+    if (!out) {
+        m_rule_status = "write failed - see console";
+        spdlog::error("Rule file write failed: {}", path);
+        return false;
+    }
+    m_rule_path = path;
+    m_rule_status = "saved to " + path;
+    return true;
 }
 
 void Editor::run_rule_source() {
