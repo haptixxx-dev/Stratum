@@ -303,6 +303,29 @@ if(NOT MSVC)
 endif()
 
 # ───────────────────────────────────────────────────────────────────
+# stratum_golden
+# ───────────────────────────────────────────────────────────────────
+# A second executable, next to stratum_tests and under the same
+# STRATUM_BUILD_TESTS gate, linking stratum_core and nothing else. It is not a
+# test binary: it is a deterministic snapshot tool (tools/golden/README-free
+# purpose documented in the .cpp's own header) that runs the core OSM import
+# pipeline -- parse, road network, quadtree, per-leaf mesh build -- with no GPU
+# and no window, and prints one JSON object. `ctest --preset tests` invokes it
+# through the "golden" label registered below; it can also be run by hand:
+#
+#     ./build/tests/bin/stratum_golden --osm tests/data/roundabout.osm
+add_executable(stratum_golden ${CMAKE_CURRENT_SOURCE_DIR}/../tools/golden/stratum_golden.cpp)
+stratum_msvc_options(stratum_golden)
+
+target_link_libraries(stratum_golden PRIVATE stratum_core Threads::Threads)
+
+target_compile_features(stratum_golden PRIVATE cxx_std_20)
+
+if(NOT MSVC)
+    target_compile_options(stratum_golden PRIVATE -Wall -Wextra)
+endif()
+
+# ───────────────────────────────────────────────────────────────────
 # GPU suites
 # ───────────────────────────────────────────────────────────────────
 # GPUBufferPool is the one piece of P7 that touches SDL_GPU, so it cannot be
@@ -475,5 +498,38 @@ foreach(suite IN LISTS STRATUM_TEST_SUITES)
     set_tests_properties(${suite} PROPERTIES
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         LABELS "unit"
+    )
+endforeach()
+
+# ───────────────────────────────────────────────────────────────────
+# Golden fixtures
+# ───────────────────────────────────────────────────────────────────
+# One ctest per tests/data/*.osm fixture, each running stratum_golden on that
+# fixture and diffing its stdout against the committed tests/golden/<name>.json
+# (compare_golden.cmake). Globbed at configure time rather than listed by hand,
+# so a fixture added to tests/data/ without a matching golden file fails loudly
+# here instead of silently going untested; regenerate the missing file with
+# `stratum_golden --osm tests/data/<name>.osm > tests/golden/<name>.json`.
+#
+# lucan.osm is deliberately absent from this loop: it is a large real-world
+# extract kept out of the repository (see tests/golden/lucan.json, which
+# records only its sha256 and the pipeline's counts against it), so there is
+# no fixture file here for a CI checkout to run stratum_golden against.
+file(GLOB STRATUM_GOLDEN_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/*.osm)
+
+foreach(fixture IN LISTS STRATUM_GOLDEN_FIXTURES)
+    get_filename_component(fixture_name ${fixture} NAME_WE)
+    set(golden_json ${CMAKE_CURRENT_SOURCE_DIR}/golden/${fixture_name}.json)
+
+    add_test(NAME Golden_${fixture_name}
+        COMMAND ${CMAKE_COMMAND}
+            -DGOLDEN_EXE=$<TARGET_FILE:stratum_golden>
+            -DOSM_FILE=${fixture}
+            -DEXPECTED_JSON=${golden_json}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/golden/compare_golden.cmake
+    )
+    set_tests_properties(Golden_${fixture_name} PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        LABELS "golden"
     )
 endforeach()

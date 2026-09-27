@@ -203,6 +203,9 @@ class JsonWriter {
 public:
     explicit JsonWriter(std::ostream& out) : m_out(out) {}
 
+    // The bare (no-key) form is only ever used once, for the document's own
+    // outermost object, so it is the only caller that needs the "am I the
+    // very first thing written" comma check open() used to do.
     void begin_object() { open('{'); }
     void end_object() { close('}'); }
 
@@ -219,14 +222,22 @@ public:
         write_string(value);
     }
     void begin_object(const std::string& key) {
+        // prefix() already wrote the comma-if-needed, the newline, the indent
+        // and "key": -- the brace just continues that same line. Routing this
+        // through open() as well used to run the comma check a second time and
+        // print a stray "," between the colon and the "{".
         prefix(key);
-        open('{');
+        m_out << "{\n";
+        ++m_depth;
+        m_needs_comma = false;
     }
 
 private:
     void open(char c) {
-        if (m_needs_comma) m_out << ",\n"; else m_out << "\n";
-        m_out << indent() << c << "\n";
+        // Only the top-level, no-key object reaches here, and nothing can have
+        // been written before it, so there is never a comma to add -- just the
+        // brace that begins the whole document.
+        m_out << c << "\n";
         ++m_depth;
         m_needs_comma = false;
     }
