@@ -194,6 +194,9 @@ add_library(stratum_core STATIC
     src/scene/document.cpp
     src/scene/map_layer.cpp
 
+    # Application pipeline: the import state machine, no SDL, no ImGui, no renderer
+    src/app/import_pipeline.cpp
+
     # Procedural Generation
     src/procgen/noise.cpp
     src/procgen/building_lod.cpp
