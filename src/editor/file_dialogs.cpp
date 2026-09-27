@@ -274,7 +274,7 @@ void Editor::poll_export_dir_dialog() {
     }
 
     if (!path.empty()) {
-        std::snprintf(m_export_dir, sizeof(m_export_dir), "%s", path.c_str());
+        std::snprintf(m_export_options.dir, sizeof(m_export_options.dir), "%s", path.c_str());
         spdlog::info("Export directory: {}", path);
     }
 }

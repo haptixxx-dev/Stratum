@@ -222,6 +222,78 @@ void Editor::draw_osm_panel() {
         }
     }
 
+    // ── Export ──────────────────────────────────────────────────────────────
+    // The only export section: it used to be duplicated in the GPU Memory panel,
+    // which drew the same controls bound to the same Editor state.
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Text("Export road network");
+    ImGui::Separator();
+
+    {
+        const bool busy = export_in_flight();
+        const bool export_blocked = importing; // an import/rebuild also locks the parser
+        const bool have_roads = m_osm_parser.has_data() && !m_osm_parser.get_data().roads.empty();
+
+        ImGui::BeginDisabled(busy);
+
+        ImGui::SetNextItemWidth(-90.0f);
+        ImGui::InputText("##ExportDir", m_export_options.dir, sizeof(m_export_options.dir));
+        ImGui::SameLine();
+        if (ImGui::Button("Browse##Export", ImVec2(-1, 0))) {
+            open_export_dir_dialog();
+        }
+
+        int format = static_cast<int>(m_export_options.config.format);
+        const char* formats[] = { "OBJ + MTL", "glTF 2.0 + .bin" };
+        if (ImGui::Combo("Format", &format, formats, 2)) {
+            m_export_options.config.format = static_cast<osm::road::ExportFormat>(format);
+        }
+
+        ImGui::SliderFloat("Chunk size", &m_export_options.config.chunk_size, 0.0f, 2000.0f,
+                           "%.0f m");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("0 writes the whole network as one file. The grid is anchored at "
+                              "the\nworld origin, so two overlapping exports line up.");
+        }
+
+        ImGui::Checkbox("Collision mesh", &m_export_options.build_collision);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Derives a flat collision variant per piece during the re-solve.\n"
+                              "Costs roughly a third of the render mesh again.");
+        }
+
+        ImGui::Checkbox("LOD chain", &m_export_options.build_lods);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Simplifies once per material range per level. The most expensive\n"
+                              "option by a wide margin on a city extract.");
+        }
+        if (m_export_options.build_lods) {
+            ImGui::SliderInt("LOD levels", &m_export_options.config.lod_levels, 2, 4);
+        }
+
+        ImGui::BeginDisabled(!have_roads || export_blocked);
+        if (ImGui::Button("Export", ImVec2(-1, 0))) {
+            begin_road_export();
+        }
+        ImGui::EndDisabled();
+
+        ImGui::EndDisabled();
+
+        if (busy) {
+            // Indeterminate: the exporter reports nothing until it returns, and a bar
+            // that sat at 0% would read as a hang.
+            ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), ImVec2(-1, 0),
+                               "Re-solving and writing...");
+        } else if (!have_roads) {
+            ImGui::TextDisabled("Import an OSM file with roads first");
+        }
+
+        if (!m_export_status.empty()) {
+            ImGui::TextWrapped("%s", m_export_status.c_str());
+        }
+    }
+
     ImGui::Separator();
 
     // Display loaded data statistics

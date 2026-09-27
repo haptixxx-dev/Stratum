@@ -31,7 +31,7 @@ void Editor::begin_road_export() {
         m_export_status = "No road data to export";
         return;
     }
-    if (m_export_dir[0] == '\0') {
+    if (m_export_options.dir[0] == '\0') {
         m_export_status = "Choose an output directory first";
         return;
     }
@@ -47,18 +47,18 @@ void Editor::begin_road_export() {
     // asks to export them. Solving again is a second of worker time; holding a
     // second copy of a city's geometry is permanent.
     osm::road::RoadNetworkConfig cfg = make_road_network_config();
-    cfg.build_collision = m_export_build_collision;
-    cfg.build_lods = m_export_build_lods;
+    cfg.build_collision = m_export_options.build_collision;
+    cfg.build_lods = m_export_options.build_lods;
 
     auto job = std::make_unique<RoadExportJob>();
-    job->directory = m_export_dir;
-    job->config = m_export_config;
+    job->directory = m_export_options.dir;
+    job->config = m_export_options.config;
     // The exporter only writes what the build produced, so the two pairs of flags
     // are one decision and are stamped together.
-    job->config.export_collision = m_export_build_collision;
-    job->config.export_lods = m_export_build_lods;
-    job->build_collision = m_export_build_collision;
-    job->build_lods = m_export_build_lods;
+    job->config.export_collision = m_export_options.build_collision;
+    job->config.export_lods = m_export_options.build_lods;
+    job->build_collision = m_export_options.build_collision;
+    job->build_lods = m_export_options.build_lods;
 
     const std::string dir = job->directory;
     const osm::road::ExportConfig export_cfg = job->config;
@@ -74,7 +74,7 @@ void Editor::begin_road_export() {
 
     m_export_job = std::move(job);
     m_export_status = "Exporting...";
-    spdlog::info("Exporting the road network to {}", m_export_dir);
+    spdlog::info("Exporting the road network to {}", m_export_options.dir);
 }
 
 void Editor::poll_road_export() {

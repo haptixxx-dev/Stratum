@@ -23,6 +23,7 @@
 #include "procgen/terrain_tile_manager.hpp"
 #include "renderer/mesh.hpp"
 #include "editor/camera.hpp"
+#include "editor/export_options.hpp"
 #include "editor/render_settings.hpp"
 
 namespace stratum {
@@ -685,17 +686,9 @@ private:
 
     std::unique_ptr<RoadExportJob> m_export_job;
 
-    /// Format, chunk size and naming, edited by the memory panel
-    osm::road::ExportConfig m_export_config;
-
-    /// Fill RoadPiece::collision during the export re-solve
-    bool m_export_build_collision = false;
-
-    /// Fill RoadPiece::lods during the export re-solve
-    bool m_export_build_lods = false;
-
-    /// Destination directory, typed or chosen. Empty until one is picked.
-    char m_export_dir[512] = "";
+    /// Destination, format/chunking and collision/LOD flags, edited by the OSM
+    /// import panel's export section.
+    ExportOptions m_export_options;
 
     /// Last export outcome, shown under the button
     std::string m_export_status;
