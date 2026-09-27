@@ -665,6 +665,12 @@ private:
     void begin_mesh_rebuild(std::vector<osm::road::RoadPiece>&& road_pieces = {},
                             bool recenter_camera = true);
 
+    /// Point the camera at the quadtree's current geometry. Split out of
+    /// begin_mesh_rebuild() so the framing logic can be read (and tested) on its
+    /// own. @param recenter_camera False for a road rebuild, which must leave the
+    /// user's viewpoint alone.
+    void frame_camera_on_data(bool recenter_camera);
+
     // ── Terrain-aware roads (P3) ────────────────────────────────────────────
     // Road elevation is solved GLOBALLY, over the whole graph, BEFORE any terrain
     // chunk is carved. That is only possible because the procedural height field
