@@ -304,6 +304,7 @@ add_library(stratum_editor_lib STATIC
     src/editor/panels/viewport_panel.cpp
     src/editor/ui/layout.cpp
     src/editor/window_chrome.cpp
+    src/editor/viewport_overlay.cpp
 )
 
 target_include_directories(stratum_editor_lib PUBLIC
