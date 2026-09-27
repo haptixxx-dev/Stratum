@@ -302,6 +302,7 @@ add_library(stratum_editor_lib STATIC
     src/editor/panels/rule_panel.cpp
     src/editor/panels/menu_bar.cpp
     src/editor/ui/layout.cpp
+    src/editor/window_chrome.cpp
 )
 
 target_include_directories(stratum_editor_lib PUBLIC

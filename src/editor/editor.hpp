@@ -347,6 +347,7 @@ private:
 
     bool m_fullscreen = false;
 
+    void handle_window_drag();
     void handle_window_resize();
     void toggle_fullscreen();
 

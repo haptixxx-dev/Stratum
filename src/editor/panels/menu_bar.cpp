@@ -9,6 +9,7 @@ namespace stratum {
 
 void Editor::draw_menu_bar() {
     if (ImGui::BeginMenuBar()) {
+        handle_window_drag();
 
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("New Scene", "Ctrl+N")) {
