@@ -25,6 +25,7 @@
 #include "editor/camera.hpp"
 #include "editor/export_options.hpp"
 #include "editor/render_settings.hpp"
+#include "editor/viewport_input.hpp"
 
 namespace stratum {
 
@@ -95,8 +96,8 @@ public:
     void im3d_end_frame_and_upload(GPURenderer& renderer);
     void set_msaa_change_callback(std::function<void(int)> callback) { m_msaa_change_callback = callback; }
 
-    bool is_viewport_focused() const { return m_viewport_focused; }
-    bool is_viewport_hovered() const { return m_viewport_hovered; }
+    bool is_viewport_focused() const { return m_viewport_input.focused; }
+    bool is_viewport_hovered() const { return m_viewport_input.hovered; }
 
 private:
     void setup_dockspace();
@@ -258,8 +259,10 @@ private:
     void draw_chunked_terrain_ui();
     void draw_legacy_terrain_ui();
 
-    bool m_viewport_focused = false;
-    bool m_viewport_hovered = false;
+    /// This frame's viewport input (focus, hover, size, mouse delta, wheel, dt),
+    /// filled from ImGui by draw_viewport() and consumed by Camera::handle_input()
+    /// and Im3D_NewFrame() so neither has to query ImGui itself.
+    ViewportInput m_viewport_input;
 
     /// Screen-space rect of the Viewport panel, in ImGui logical points.
     ///

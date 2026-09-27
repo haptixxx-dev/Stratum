@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "editor/viewport_input.hpp"
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <array>
@@ -68,7 +69,17 @@ public:
     Camera();
 
     void update(float aspect_ratio);
-    void handle_input(float dt);
+
+    /**
+     * @brief Move/rotate the camera and adjust its speed for this frame
+     *
+     * Consumes a ViewportInput filled by the Viewport panel instead of querying
+     * ImGui itself: camera.cpp must stay free of imgui.h. Gating (only
+     * move/rotate while @p input.focused; only adjust speed while
+     * @p input.hovered or @p input.focused) is done internally here, so the
+     * caller no longer needs to guard the call with its own focus check.
+     */
+    void handle_input(const ViewportInput& input);
 
     const glm::mat4& get_view() const { return m_view; }
     const glm::mat4& get_projection() const { return m_projection; }

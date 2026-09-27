@@ -73,25 +73,40 @@ void Camera::adjust_speed(float scroll_delta) {
     m_speed_multiplier = std::clamp(m_speed_multiplier, 0.1f, 100.0f);
 }
 
-void Camera::handle_input(float dt) {
-    // Only move if right mouse button is held (standard editor cam)
+void Camera::handle_input(const ViewportInput& input) {
+    // Right mouse button gates both movement/rotation and the scroll-wheel speed
+    // adjustment below, same as before. RMB state is not part of ViewportInput
+    // (the struct carries only what the wheel/rotation math needs), so it is
+    // still polled from SDL directly -- that is not ImGui and stays allowed here.
     auto mouse_state = SDL_GetMouseState(nullptr, nullptr);
-    bool is_rotating = mouse_state & SDL_BUTTON_RMASK;
+    const bool is_rotating = (mouse_state & SDL_BUTTON_RMASK) != 0;
 
-    if (!is_rotating) {
+    // Scroll wheel camera-speed adjustment while right-click is held. Available
+    // whenever the viewport is hovered OR focused -- matching the panel's old
+    // gate -- independent of whether the block below actually moves the camera.
+    if ((input.hovered || input.focused) && is_rotating && input.wheel != 0.0f) {
+        adjust_speed(input.wheel);
+    }
+
+    // Only move if right mouse button is held (standard editor cam) AND the
+    // viewport has focus. The panel used to gate the whole call on focus; now
+    // handle_input() is called unconditionally and checks it itself.
+    if (!input.focused || !is_rotating) {
         m_was_rotating = false;
         return;
     }
 
-    // First frame of right-click: flush relative mouse state to avoid jump
-    if (!m_was_rotating) {
-        SDL_GetRelativeMouseState(nullptr, nullptr);
-        m_was_rotating = true;
-    }
+    // First frame of right-click: ignore this frame's mouse delta so a stale
+    // sample cannot snap the view. ViewportInput::mouse_dx/dy come from ImGui's
+    // own per-frame delta (io.MouseDelta), computed every frame regardless of
+    // any button state, so unlike SDL_GetRelativeMouseState there is no pent-up
+    // backlog to flush -- just this one frame to skip.
+    const bool first_frame = !m_was_rotating;
+    m_was_rotating = true;
 
     const bool* state = SDL_GetKeyboardState(nullptr);
-    float speed = m_base_speed * m_speed_multiplier * dt;
-    
+    float speed = m_base_speed * m_speed_multiplier * input.dt;
+
     // Boost speed with Shift
     if (state[SDL_SCANCODE_LSHIFT]) {
         speed *= 2.0f;
@@ -112,22 +127,19 @@ void Camera::handle_input(float dt) {
     }
 
     // Mouse Rotation
-    float xrel, yrel;
-    SDL_GetRelativeMouseState(&xrel, &yrel);
-
-    if (xrel != 0 || yrel != 0) {
-
+    if (!first_frame && (input.mouse_dx != 0.0f || input.mouse_dy != 0.0f)) {
         // update current yaw/pitch using difference from last frame and current movement
-        m_yaw = m_yaw_old + xrel * m_sensitivity;
-        m_pitch = m_pitch_old - yrel * m_sensitivity;
+        m_yaw = m_yaw_old + input.mouse_dx * m_sensitivity;
+        m_pitch = m_pitch_old - input.mouse_dy * m_sensitivity;
 
         update_orientation_from_angles();
-
-        // Store the clamped pitch, so dragging past the pole does not build up
-        // an invisible offset that has to be dragged back off.
-        m_yaw_old = m_yaw;
-        m_pitch_old = m_pitch;
     }
+
+    // Store the clamped pitch, so dragging past the pole does not build up
+    // an invisible offset that has to be dragged back off. A no-op when the
+    // block above did not run, since m_yaw/m_pitch are already unchanged.
+    m_yaw_old = m_yaw;
+    m_pitch_old = m_pitch;
 }
 
 void Camera::recalculate_view() {

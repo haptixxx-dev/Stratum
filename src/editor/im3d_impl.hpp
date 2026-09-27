@@ -4,6 +4,7 @@
 #pragma once
 
 #include "editor/camera.hpp"
+#include "editor/viewport_input.hpp"
 #include <SDL3/SDL.h>
 #include <glm/glm.hpp>
 
@@ -13,7 +14,13 @@ class GPURenderer;
 
 void Im3D_Init();
 void Im3D_Shutdown();
-void Im3D_NewFrame(float dt, const Camera& cam, float window_width, float window_height, bool has_focus);
+
+/**
+ * @brief Start the Im3d frame: feed it the camera and this frame's viewport input
+ * @note Consumes a ViewportInput (focus, size, dt) filled by the Viewport panel
+ *       instead of querying ImGui itself, so im3d_impl.cpp stays free of imgui.h.
+ */
+void Im3D_NewFrame(const ViewportInput& input, const Camera& cam);
 void Im3D_ProcessEvent(const SDL_Event* event);
 
 /**

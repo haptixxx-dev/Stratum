@@ -15,38 +15,41 @@ void Editor::draw_viewport() {
     // NoBackground: the 3D pass has already drawn the scene into the swapchain
     ImGui::Begin("Viewport", nullptr, ImGuiWindowFlags_NoBackground);
 
-    m_viewport_focused = ImGui::IsWindowFocused();
-    m_viewport_hovered = ImGui::IsWindowHovered();
+    ImGuiIO& io = ImGui::GetIO();
+
+    m_viewport_input.focused = ImGui::IsWindowFocused();
+    m_viewport_input.hovered = ImGui::IsWindowHovered();
 
     ImVec2 viewport_size = ImGui::GetContentRegionAvail();
     ImVec2 pos = ImGui::GetCursorScreenPos();
-    
+
     // Save rect for callback
     m_viewport_rect = ImVec4(pos.x, pos.y, viewport_size.x, viewport_size.y);
 
     // Update Camera
     float aspect = viewport_size.x / viewport_size.y;
     if (aspect <= 0.001f) aspect = 1.0f;
-    
+
     // Calculate dt (this is a hack, usually passed in update)
     if (m_last_time == 0.0f) m_last_time = SDL_GetTicks() / 1000.0f;
     float current_time = SDL_GetTicks() / 1000.0f;
     float dt = current_time - m_last_time;
     m_last_time = current_time;
 
-    m_camera.update(aspect);
-    if (m_viewport_focused) {
-        m_camera.handle_input(dt);
-    }
+    // Fill this frame's ViewportInput from ImGui. This is the one place that is
+    // allowed to do so: Camera::handle_input() and Im3D_NewFrame() below consume
+    // the struct instead of querying ImGui themselves.
+    m_viewport_input.width = viewport_size.x;
+    m_viewport_input.height = viewport_size.y;
+    m_viewport_input.mouse_dx = io.MouseDelta.x;
+    m_viewport_input.mouse_dy = io.MouseDelta.y;
+    m_viewport_input.wheel = io.MouseWheel;
+    m_viewport_input.dt = dt;
 
-    // Handle scroll wheel for camera speed adjustment while right-click is held
-    if (m_viewport_hovered || m_viewport_focused) {
-        ImGuiIO& io = ImGui::GetIO();
-        bool right_mouse_held = io.MouseDown[1];  // Right mouse button
-        if (right_mouse_held && io.MouseWheel != 0.0f) {
-            m_camera.adjust_speed(io.MouseWheel);
-        }
-    }
+    m_camera.update(aspect);
+    // Gating (only move/rotate while focused; only adjust wheel speed while
+    // hovered or focused) now happens inside handle_input() itself.
+    m_camera.handle_input(m_viewport_input);
 
     // Poll for completed async quadtree node builds
     if (m_quadtree.leaf_count() > 0) {
@@ -56,7 +59,7 @@ void Editor::draw_viewport() {
     // traversal render_3d already performs, so there is no second traversal here.
 
     // Im3D Frame
-    Im3D_NewFrame(dt, m_camera, viewport_size.x, viewport_size.y, m_viewport_focused);
+    Im3D_NewFrame(m_viewport_input, m_camera);
 
     // Draw Content
     // Grid
