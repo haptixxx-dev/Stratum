@@ -739,6 +739,31 @@ public:
     glm::vec3 get_fog_color() const { return glm::vec3(m_scene_uniforms.fog_color); }
 
     /**
+     * @brief Mark the sun/sky/ambient/fog block as already established
+     *
+     * update_scene_uniforms() seeds that whole block with hardcoded literal
+     * defaults exactly once, on the first render pass of the run, guarded by
+     * m_scene_lighting_seeded -- so a scene never draws with a zeroed light
+     * before anything has called the setters above. A caller that pushes real
+     * values BEFORE that first render pass (Editor applying a loaded-or-default
+     * RenderSettings from set_renderer(), which runs before the render loop
+     * starts) must call this too, or that first pass's seeding silently
+     * overwrites what was just pushed with ITS OWN defaults instead of leaving
+     * it alone.
+     *
+     * Exposure shares that same one-time guard but is set directly here rather
+     * than left for the caller to also seed, since it is orthogonal to the sky
+     * and lighting values the caller is pushing.
+     *
+     * @param exposure Value to seed camera_position.w with, matching the
+     *                 default update_scene_uniforms() would otherwise apply.
+     */
+    void mark_scene_lighting_initialized(float exposure = 1.0f) {
+        m_scene_lighting_seeded = true;
+        m_scene_uniforms.camera_position.w = exposure;
+    }
+
+    /**
      * @brief Bind the mesh rendering pipeline
      * @note Call before draw_mesh() calls
      */

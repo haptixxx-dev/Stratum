@@ -35,6 +35,24 @@ Editor::~Editor() = default;
 void Editor::init() {
     spdlog::info("Editor initialized");
     Im3D_Init();
+
+    // Computed once here rather than per save/load: SDL_GetPrefPath allocates,
+    // and the path does not change during a run. "Haptixxx" is a placeholder
+    // organisation string -- flagged in the PR description as Sarah's call, not
+    // fixed anywhere else in the tree.
+    if (char* pref = SDL_GetPrefPath("Haptixxx", "Stratum")) {
+        m_render_settings_path = std::filesystem::path(pref) / "render_settings.json";
+        SDL_free(pref);
+    } else {
+        spdlog::warn("SDL_GetPrefPath failed ({}); render settings will not persist",
+                     SDL_GetError());
+    }
+
+    if (m_render_settings.load(m_render_settings_path)) {
+        spdlog::info("Loaded render settings from '{}'", m_render_settings_path.string());
+    }
+    // No else: RenderSettings::load() leaves m_render_settings at its compiled-in
+    // defaults on any failure, which is exactly what a first run should see.
 }
 
 void Editor::set_renderer(GPURenderer* renderer) {
@@ -52,6 +70,13 @@ void Editor::set_renderer(GPURenderer* renderer) {
         renderer->set_mesh_evicted_fn([this](uint32_t id) { on_mesh_evicted(id); });
 
         init_materials(*renderer);
+
+        // Apply the loaded-or-default render settings now, before the render loop
+        // starts. This is what used to happen implicitly, one frame late and only
+        // if the panel was open, via the sun_pushed/sky_pushed/fog_pushed statics
+        // in draw_render_settings(); see RenderSettings::push_to() for why the
+        // renderer also needs telling that this already happened.
+        m_render_settings.push_to(*renderer);
     }
 }
 

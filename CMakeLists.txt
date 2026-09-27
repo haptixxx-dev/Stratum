@@ -295,6 +295,7 @@ add_library(stratum_editor_lib STATIC
 
     # Editor
     src/editor/editor.cpp
+    src/editor/render_settings.cpp
     src/editor/import_pipeline.cpp
     src/editor/scene_gpu_sync.cpp
     src/editor/camera_framing.cpp

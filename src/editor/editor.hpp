@@ -4,6 +4,7 @@
 #pragma once
 
 #include <imgui.h>
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <memory>
@@ -22,6 +23,7 @@
 #include "procgen/terrain_tile_manager.hpp"
 #include "renderer/mesh.hpp"
 #include "editor/camera.hpp"
+#include "editor/render_settings.hpp"
 
 namespace stratum {
 
@@ -324,6 +326,27 @@ private:
     int m_drag_start_window_y = 0;
 
     GPURenderer* m_gpu_renderer = nullptr;
+
+    /**
+     * @brief Every lighting, sky, fog and shadow value the panel edits
+     *
+     * Loaded from m_render_settings_path in init() if that file exists (kept at
+     * its compiled-in defaults otherwise), and pushed to the renderer once in
+     * set_renderer() -- before the first frame ever renders, so the persisted
+     * look is what is on screen from frame one rather than a hardcoded default
+     * the panel would only correct once opened.
+     */
+    RenderSettings m_render_settings;
+
+    /**
+     * @brief Where m_render_settings is loaded from and saved to
+     *
+     * `<SDL pref path>/render_settings.json`, computed once in init() (SDL_GetPrefPath
+     * allocates). Left empty if SDL_GetPrefPath fails, in which case
+     * RenderSettings::load()/save() are both no-ops and the settings simply do
+     * not persist across a restart.
+     */
+    std::filesystem::path m_render_settings_path;
 
     /**
      * @brief The texture set and the material set, owned here
