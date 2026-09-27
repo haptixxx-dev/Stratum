@@ -106,17 +106,19 @@ void Editor::poll_road_export() {
     char msg[512];
     if (!failure.empty()) {
         m_export_status = "Export failed: " + failure;
-        snprintf(msg, sizeof(msg), "[Export] Failed: %s\n", failure.c_str());
+        snprintf(msg, sizeof(msg), "[Export] Failed: %s", failure.c_str());
+        spdlog::error("{}", msg);
     } else if (stats.files == 0) {
         // Not an exception: every file was refused, or the network held no
         // triangles. Either way nothing reached the disk, and saying "done" would
         // be a lie the user only discovers in the file manager.
         m_export_status = "Export wrote no files - check the destination is writable";
-        snprintf(msg, sizeof(msg), "[Export] Wrote no files to %s\n", directory.c_str());
+        snprintf(msg, sizeof(msg), "[Export] Wrote no files to %s", directory.c_str());
+        spdlog::warn("{}", msg);
     } else {
         snprintf(msg, sizeof(msg),
                  "[Export] %zu chunk(s), %zu meshes, %zu triangles, %zu vertices, %zu file(s) "
-                 "in %.0f ms -> %s%s%s\n",
+                 "in %.0f ms -> %s%s%s",
                  stats.chunks, stats.meshes, stats.triangles, stats.vertices, stats.files,
                  stats.export_ms, directory.c_str(),
                  wrote_collision ? " (+collision)" : "",
@@ -125,11 +127,10 @@ void Editor::poll_road_export() {
         snprintf(status, sizeof(status), "Wrote %zu file(s), %zu triangles in %.0f ms",
                  stats.files, stats.triangles, stats.export_ms);
         m_export_status = status;
+        spdlog::info("{}", msg);
     }
 
-    m_console_buffer.append(msg);
     m_console_scroll_to_bottom = true;
-    spdlog::info("{}", msg);
 }
 
 // ============================================================================
@@ -403,11 +404,8 @@ void Editor::poll_osm_import() {
             m_import_stage = ImportStage::Failed;
             m_import_message = err;
 
-            char msg[512];
-            snprintf(msg, sizeof(msg), "[OSM] Error: %s\n", err.c_str());
-            m_console_buffer.append(msg);
+            spdlog::error("[OSM] Error: {}", err);
             m_console_scroll_to_bottom = true;
-            spdlog::error("OSM import failed: {}", err);
             return;
         }
 
@@ -481,28 +479,28 @@ void Editor::poll_osm_import() {
 
         char road_msg[320];
         snprintf(road_msg, sizeof(road_msg),
-                 "[OSM] Road network: %zu pieces, %zu triangles from %zu edges in %.0f ms\n",
+                 "[OSM] Road network: %zu pieces, %zu triangles from %zu edges in %.0f ms",
                  network.stats.pieces, network.stats.triangles, network.stats.edges,
                  network.stats.build_ms);
-        m_console_buffer.append(road_msg);
+        spdlog::info("{}", road_msg);
 
         if (result.elevated) {
             snprintf(road_msg, sizeof(road_msg),
                      "[OSM] Elevation: %zu edges solved in %.0f ms, %zu iterations, "
-                     "max grade %.1f%%, %zu bridges, %zu tunnels\n",
+                     "max grade %.1f%%, %zu bridges, %zu tunnels",
                      network.stats.elevated_edges, network.stats.elevation_ms,
                      result.elevation.iterations, result.max_grade * 100.0f,
                      result.elevation.bridges, result.elevation.tunnels);
         } else {
             snprintf(road_msg, sizeof(road_msg),
-                     "[OSM] Elevation: skipped, roads are flat (no terrain to follow)\n");
+                     "[OSM] Elevation: skipped, roads are flat (no terrain to follow)");
         }
-        m_console_buffer.append(road_msg);
+        spdlog::info("{}", road_msg);
 
         if (result.solved_junctions) {
             snprintf(road_msg, sizeof(road_msg),
                      "[OSM] Junctions: %zu solved, %zu roundabouts, %zu tapers, "
-                     "%zu dead ends, %zu degenerate, %zu over-trimmed edges in %.0f ms\n",
+                     "%zu dead ends, %zu degenerate, %zu over-trimmed edges in %.0f ms",
                      network.junction_stats.junctions, network.junction_stats.roundabouts,
                      network.junction_stats.tapers, network.junction_stats.dead_ends,
                      network.junction_stats.degenerate,
@@ -510,17 +508,17 @@ void Editor::poll_osm_import() {
                      network.stats.junction_ms);
         } else {
             snprintf(road_msg, sizeof(road_msg),
-                     "[OSM] Junctions: solver off, ribbons run through every node\n");
+                     "[OSM] Junctions: solver off, ribbons run through every node");
         }
-        m_console_buffer.append(road_msg);
+        spdlog::info("{}", road_msg);
 
         snprintf(road_msg, sizeof(road_msg),
                  "[OSM] Detail: %zu marking pieces, %zu crossings, %zu bridges, "
-                 "%zu tunnels (%zu portal mouths), %zu sidewalk sides deduped\n",
+                 "%zu tunnels (%zu portal mouths), %zu sidewalk sides deduped",
                  network.stats.markings_pieces, network.stats.crossings,
                  network.stats.bridges, network.stats.tunnels,
                  network.carve_portals.size(), network.stats.deduped_sidewalks);
-        m_console_buffer.append(road_msg);
+        spdlog::info("{}", road_msg);
         m_console_scroll_to_bottom = true;
 
         // The corridors outlive the network: they are indexed and carved once the
@@ -579,9 +577,9 @@ void Editor::poll_osm_import() {
 
     const auto& data = m_osm_parser.get_data();
     char msg[256];
-    snprintf(msg, sizeof(msg), "[OSM] Loaded: %zu roads, %zu buildings, %zu areas\n",
+    snprintf(msg, sizeof(msg), "[OSM] Loaded: %zu roads, %zu buildings, %zu areas",
              data.roads.size(), data.buildings.size(), data.areas.size());
-    m_console_buffer.append(msg);
+    spdlog::info("{}", msg);
     m_console_scroll_to_bottom = true;
 
     m_import_stage = ImportStage::CarvingTerrain;
@@ -659,17 +657,17 @@ void Editor::install_road_carve_data() {
     if (!m_pending_carve) {
         if (m_terrain_tile_manager.has_road_carve_data()) {
             m_terrain_tile_manager.clear_road_carve_data();
-            m_console_buffer.append("[Terrain] Road carve cleared; terrain returned to procedural\n");
+            spdlog::info("[Terrain] Road carve cleared; terrain returned to procedural");
             m_console_scroll_to_bottom = true;
         }
         return;
     }
 
     char msg[256];
-    snprintf(msg, sizeof(msg), "[Terrain] Carving %zu corridors and %zu junctions into %zu chunks\n",
+    snprintf(msg, sizeof(msg), "[Terrain] Carving %zu corridors and %zu junctions into %zu chunks",
              m_pending_carve->ribbons.size(), m_pending_carve->discs.size(),
              m_terrain_tile_manager.chunk_count());
-    m_console_buffer.append(msg);
+    spdlog::info("{}", msg);
     m_console_scroll_to_bottom = true;
 
     // Regenerates every already-generated chunk, which is why this is on the main

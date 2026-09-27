@@ -24,6 +24,7 @@
 #include "renderer/mesh.hpp"
 #include "editor/camera.hpp"
 #include "editor/export_options.hpp"
+#include "editor/log_sink.hpp"
 #include "editor/render_settings.hpp"
 #include "editor/viewport_input.hpp"
 
@@ -337,8 +338,12 @@ private:
     // so enabling this double-draws the whole scene.
     bool m_im3d_debug_geometry = false;
 
-    // Console log
-    ImGuiTextBuffer m_console_buffer;
+    // Console log. m_log_ring is the single source of truth -- everything that
+    // used to go straight to an ImGuiTextBuffer now goes through spdlog, and
+    // m_log_sink (registered on the default logger in init()) mirrors every
+    // record into the ring for draw_console() to display.
+    LogRing m_log_ring{2000};
+    std::shared_ptr<RingSinkMt> m_log_sink;
     bool m_console_scroll_to_bottom = true;
 
     // Core systems

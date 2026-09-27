@@ -302,6 +302,7 @@ add_library(stratum_editor_lib STATIC
     src/editor/camera.cpp
     src/editor/file_dialogs.cpp
     src/editor/im3d_impl.cpp
+    src/editor/log_sink.cpp
     src/editor/panels/procgen_panel.cpp
     src/editor/panels/material_panel.cpp
     src/editor/panels/rule_panel.cpp

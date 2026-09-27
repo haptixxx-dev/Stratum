@@ -5,6 +5,7 @@
 #include "renderer/gpu_renderer.hpp"
 #include "renderer/texture.hpp"
 #include <imgui.h>
+#include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cstdio>
 
@@ -81,9 +82,7 @@ void Editor::draw_memory_panel() {
     ImGui::SameLine();
     if (ImGui::Button("Evict Now")) {
         const size_t evicted = renderer.evict_to_budget();
-        char msg[128];
-        snprintf(msg, sizeof(msg), "[GPU] Evicted %zu mesh(es) to budget\n", evicted);
-        m_console_buffer.append(msg);
+        spdlog::info("[GPU] Evicted {} mesh(es) to budget", evicted);
         m_console_scroll_to_bottom = true;
     }
 

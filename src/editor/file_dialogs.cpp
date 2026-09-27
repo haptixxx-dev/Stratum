@@ -131,12 +131,7 @@ void Editor::poll_file_dialog() {
         // The OSM path field is still there to type into, so this is not fatal
         // there; for the material targets it means the button simply does nothing,
         // which is why the reason is put on the console rather than only in the log.
-        spdlog::error("File dialog unavailable: {}", error);
-        char msg[512];
-        snprintf(msg, sizeof(msg),
-                 "[Editor] File dialog unavailable (%s) - type a path instead\n",
-                 error.c_str());
-        m_console_buffer.append(msg);
+        spdlog::error("[Editor] File dialog unavailable ({}) - type a path instead", error);
         m_console_scroll_to_bottom = true;
         // Report into the panel that opened the dialog. Before the rule targets
         // existed this was "anything but OSM means the material panel", which

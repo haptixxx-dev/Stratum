@@ -36,6 +36,13 @@ void Editor::init() {
     spdlog::info("Editor initialized");
     Im3D_Init();
 
+    // Mirror every logged record into the console panel's ring. Registered on
+    // the default logger (not a dedicated one) so the console shows exactly
+    // what every subsystem already logs -- nothing needs to know the editor
+    // exists to show up there.
+    m_log_sink = std::make_shared<RingSinkMt>(m_log_ring);
+    spdlog::default_logger()->sinks().push_back(m_log_sink);
+
     // Computed once here rather than per save/load: SDL_GetPrefPath allocates,
     // and the path does not change during a run. "Haptixxx" is a placeholder
     // organisation string -- flagged in the PR description as Sarah's call, not
@@ -160,6 +167,16 @@ void Editor::im3d_end_frame_and_upload(GPURenderer& renderer) {
 
 void Editor::shutdown() {
     Im3D_Shutdown();
+
+    // Unregister before the ring it writes into goes away. Application logs a
+    // few more lines after this call returns (ImGui/SDL teardown); those are
+    // fine to lose from the console since the panel is gone with the editor.
+    if (m_log_sink) {
+        auto logger = spdlog::default_logger();
+        auto& sinks = logger->sinks();
+        sinks.erase(std::remove(sinks.begin(), sinks.end(), m_log_sink), sinks.end());
+        m_log_sink.reset();
+    }
 
     // Before GPURenderer::shutdown() destroys the device these textures and
     // samplers belong to. Application calls us first, which is what makes this
