@@ -45,7 +45,7 @@ free; 62 GB RAM.
 |---|---|---|
 | `Synaesthesia-Group/chroma` | `/home/sarah/Coding/Synesthesia/chroma` | `main` starts at upstream tag `v1.92.9b-docking`. `upstream-docking` mirrors upstream. One topic branch per core feature. Tags `1.92.9b-chroma.n`. |
 | `Synaesthesia-Group/chroma-kit` | `/home/sarah/Coding/Synesthesia/chroma-kit` | `main`. Tags `0.1.0`, `0.2.0`, `0.3.0`. No copy of ImGui inside. |
-| `haptixxx-dev/Stratum` | `/home/sarah/Coding/Haptixxx/Stratum` | `master`. One branch and one PR per restructure phase. |
+| `haptixxx-dev/Stratum` | `/home/sarah/Coding/Haptixxx/Stratum` | `master`. One branch and one PR per restructure phase. `external/imgui` points at `Synaesthesia-Group/chroma` tag `1.92.9b-chroma.1` (gate S2). |
 
 Upstream facts on 2026-09-26: docking HEAD is `3bae66c73`, version
 1.93.0 WIP. The latest docking release tag is `v1.92.9b-docking`. Stratum

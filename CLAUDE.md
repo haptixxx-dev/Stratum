@@ -21,6 +21,8 @@ Stratum is a C++20 desktop application that converts OpenStreetMap data into
 optimized, textured 3D maps for video games. SDL3 + SDL_GPU (Vulkan backend)
 for rendering, Dear ImGui for the editor UI, and a handle-based scene model in
 `src/scene` (not an ECS — see Key patterns).
+`external/imgui` is Chroma, the `Synaesthesia-Group/chroma` fork of Dear ImGui,
+pinned at tag `1.92.9b-chroma.1`.
 `VERSION` is `0.3.0`; it is read from the `VERSION` file at configure time, and
 the release workflow refuses a tag that disagrees with it.
 
