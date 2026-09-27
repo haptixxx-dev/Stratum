@@ -1,0 +1,89 @@
+{
+
+  "file": "lucan.osm",
+  "sha256": "15d513c64e435a57abeaae73c1294c9e8a3407a0d695097f4b97ce8a144a465d",
+  "parser": {
+
+    "nodes": 234040,
+    "ways": 51200,
+    "relations": 496,
+    "buildings": 24576,
+    "roads": 10326,
+    "areas": 2122
+  },
+  "road_graph": {
+
+    "nodes": 18443,
+    "edges": 24906,
+    "junctions": 12543,
+    "dead_ends": 3569,
+    "continuations": 2331,
+    "roundabout_edges": 232,
+    "layer_split_nodes": 9
+  },
+  "road_network": {
+
+    "edges": 24906,
+    "pieces": 31503,
+    "vertices": 2492889,
+    "triangles": 1969234,
+    "skipped_edges": 3916,
+    "elevated_edges": 0,
+    "junction_pieces": 10513,
+    "trimmed_edges": 13217,
+    "trimmed_away_edges": 0,
+    "markings_pieces": 11211,
+    "crossings": 3422,
+    "dropped_kerb_spans": 9546,
+    "bridges": 0,
+    "tunnels": 0,
+    "deduped_sidewalks": 2750,
+    "vertices_welded": 65386,
+    "vertices_dropped": 358188,
+    "triangles_before_lod": 0,
+    "triangles_after_lod": 0,
+    "collision_triangles": 0,
+    "stations_before": 311940,
+    "stations_after": 180323,
+    "quads_merged": 188598,
+    "triangles_before_tess": 2346430,
+    "corridor_kerb_edges": 1569
+  },
+  "junction_stats": {
+
+    "junctions": 7081,
+    "roundabouts": 46,
+    "tapers": 460,
+    "dead_ends": 2926,
+    "degenerate": 0,
+    "merged_into_neighbour": 512,
+    "self_intersecting": 20,
+    "over_trimmed_edges": 7069
+  },
+  "quadtree": {
+
+    "leaf_count": 1516,
+    "total_roads": 10326,
+    "total_buildings": 24576,
+    "total_areas": 2122,
+    "max_depth": 8
+  },
+  "meshes": {
+
+    "roads": {
+
+      "triangles": 1969234,
+      "vertices": 2541446
+    },
+    "buildings": {
+
+      "triangles": 302821,
+      "vertices": 645958
+    },
+    "areas": {
+
+      "triangles": 23648,
+      "vertices": 30014
+    }
+  }
+}
