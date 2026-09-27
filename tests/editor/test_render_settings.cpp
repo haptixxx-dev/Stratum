@@ -27,6 +27,7 @@
 #include "framework.hpp"
 
 #include "editor/render_settings.hpp"
+#include "renderer/gpu_renderer.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -34,6 +35,7 @@
 #include <filesystem>
 #include <system_error>
 
+using stratum::GPURenderer;
 using stratum::RenderSettings;
 
 namespace {
@@ -332,4 +334,67 @@ TEST(RenderSettings, empty_path_fails_both_load_and_save) {
     RenderSettings s;
     CHECK_FALSE(s.load(std::filesystem::path{}));
     CHECK_FALSE(s.save(std::filesystem::path{}));
+}
+
+// ============================================================================
+// push_to() and the exposure seed
+// ============================================================================
+//
+// A default-constructed GPURenderer never calls init(), so m_device stays
+// null: set_shadow_config()'s reallocation branch is guarded on m_shadow_pipeline
+// (also null), and every other setter push_to() calls just writes plain
+// m_scene_uniforms fields. That makes the whole exposure regression below
+// reproducible with no SDL_GPUDevice, window or Vulkan driver.
+
+/// GPURenderer::mark_scene_lighting_initialized() seeds camera_position.w
+/// (exposure) with its argument only on the FIRST call. A later call -- what
+/// happens every time push_to() runs, i.e. every render-settings edit -- must
+/// leave whatever set_exposure() last wrote alone. Before the fix, the second
+/// call unconditionally rewrote camera_position.w to its default-argument
+/// value of 1.0f, so changing Exposure and then dragging any other slider
+/// snapped Exposure back to 1.0.
+TEST(RenderSettings, mark_scene_lighting_initialized_seeds_exposure_once_only) {
+    GPURenderer renderer;
+
+    // First call: the Editor::set_renderer() startup seed. No exposure has
+    // been set yet, so this establishes the default.
+    renderer.mark_scene_lighting_initialized();
+    CHECK_EQ(renderer.get_exposure(), 1.0f);
+
+    // The user drags the Exposure slider.
+    renderer.set_exposure(2.0f);
+    CHECK_EQ(renderer.get_exposure(), 2.0f);
+
+    // A second call -- what push_to() makes on every other slider edit --
+    // must not reset exposure back to the default.
+    renderer.mark_scene_lighting_initialized();
+    CHECK_EQ(renderer.get_exposure(), 2.0f);
+
+    // Nor does a third call, or one with an explicit non-default argument:
+    // once seeded, the argument is ignored entirely.
+    renderer.mark_scene_lighting_initialized(4.5f);
+    CHECK_EQ(renderer.get_exposure(), 2.0f);
+}
+
+/// The same regression, exercised through push_to() itself rather than
+/// calling mark_scene_lighting_initialized() directly -- the exact repro from
+/// the bug report: set Exposure, then push unrelated render settings (a Sun
+/// Azimuth drag) and confirm Exposure is kept.
+TEST(RenderSettings, push_to_does_not_reset_exposure_on_a_later_call) {
+    GPURenderer renderer;
+    RenderSettings settings;
+
+    // Editor::set_renderer()'s startup push, before the first render pass.
+    settings.push_to(renderer);
+    CHECK_EQ(renderer.get_exposure(), 1.0f);
+
+    // User sets Exposure to 2.0 via the panel's own slider (push_to() has no
+    // exposure field of its own -- see render_settings.hpp's file comment).
+    renderer.set_exposure(2.0f);
+
+    // User drags Sun Azimuth; the panel calls push_to() again.
+    settings.sun_azimuth_deg = 123.0f;
+    settings.push_to(renderer);
+
+    CHECK_EQ(renderer.get_exposure(), 2.0f);
 }

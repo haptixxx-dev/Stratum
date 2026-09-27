@@ -753,14 +753,21 @@ public:
      *
      * Exposure shares that same one-time guard but is set directly here rather
      * than left for the caller to also seed, since it is orthogonal to the sky
-     * and lighting values the caller is pushing.
+     * and lighting values the caller is pushing. The seed happens only on the
+     * FIRST call: this function is also called from RenderSettings::push_to(),
+     * which runs on every sun/sky/fog change, and a later call must not stomp
+     * whatever set_exposure() has done since -- that reset exposure back to
+     * the default the instant any other slider was touched.
      *
-     * @param exposure Value to seed camera_position.w with, matching the
-     *                 default update_scene_uniforms() would otherwise apply.
+     * @param exposure Value to seed camera_position.w with on the first call,
+     *                 matching the default update_scene_uniforms() would
+     *                 otherwise apply. Ignored on later calls.
      */
     void mark_scene_lighting_initialized(float exposure = 1.0f) {
+        if (!m_scene_lighting_seeded) {
+            m_scene_uniforms.camera_position.w = exposure;
+        }
         m_scene_lighting_seeded = true;
-        m_scene_uniforms.camera_position.w = exposure;
     }
 
     /**
