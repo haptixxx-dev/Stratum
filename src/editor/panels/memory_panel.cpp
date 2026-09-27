@@ -202,7 +202,7 @@ void Editor::draw_memory_panel() {
 
     // Export road network controls used to be duplicated here; they now live
     // solely in the OSM import panel (draw_osm_panel(), export_options.hpp),
-    // still wired to the same begin_road_export().
+    // still wired to the same m_import_pipeline.begin_export().
 
     ImGui::End();
 }

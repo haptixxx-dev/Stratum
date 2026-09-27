@@ -248,6 +248,20 @@ public:
     [[nodiscard]] bool has_roads() const;
     [[nodiscard]] uint64_t live_terrain_fingerprint() const;
 
+    /**
+     * @brief The height sampler a road build launched right now would use
+     *
+     * Exposed (unlike the rest of make_road_network_config()'s pieces) so a
+     * host's own viewport overlay can drape non-road geometry -- an
+     * attribute-mode outline, say -- against the exact surface roads are
+     * elevated onto, using one TerrainGenerator per call rather than
+     * reconstructing the same logic against the terrain manager directly.
+     * Null under exactly the conditions RoadNetworkConfig::height_sampler
+     * would be: terrain-aware roads off, legacy terrain mode, or no terrain
+     * chunk generated yet.
+     */
+    [[nodiscard]] osm::road::HeightSampler height_sampler() const { return make_height_sampler(); }
+
 private:
     // ------------------------------------------------------------------
     // Worker payloads

@@ -36,6 +36,12 @@ void Editor::init() {
     spdlog::info("Editor initialized");
     Im3D_Init();
 
+    // Registered once, here: every ImportPipeline callback for the rest of the
+    // run reaches SceneGpuSync, camera framing, the console and the export
+    // status line through this one adapter. See PipelineListener in editor.hpp
+    // and docs/plans/import-pipeline-design.md section 2.
+    m_import_pipeline.set_listener(&m_pipeline_listener);
+
     // Mirror every logged record into the console panel's ring. Registered on
     // the default logger (not a dedicated one) so the console shows exactly
     // what every subsystem already logs -- nothing needs to know the editor
@@ -249,17 +255,17 @@ void Editor::render() {
     // Handle window resizing from edges
     handle_window_resize();
 
-    // Advance any in-flight OSM import. Must run before the panels draw so the
-    // progress bar reflects this frame's state.
-    poll_osm_import();
+    // Advance any in-flight import, road rebuild, terrain carve or export. Must
+    // run before the panels draw so the progress bar reflects this frame's
+    // state. set_road_options() first, so a toggle flipped this frame is what
+    // any road build launched by this same tick() solves against.
+    m_import_pipeline.set_road_options(road_options());
+    m_import_pipeline.tick();
 
     // Apply a native file-dialog result on the main thread; the SDL callback that
     // produced it may have run on another one.
     poll_file_dialog();
     poll_export_dir_dialog();
-
-    // Advance an in-flight export. Same rule as the import: before the panels draw.
-    poll_road_export();
 
     setup_dockspace();
 
