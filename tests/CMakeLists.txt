@@ -404,6 +404,18 @@ if(TARGET stratum_editor_lib AND EXISTS ${CMAKE_SOURCE_DIR}/src/renderer/gpu_buf
     list(APPEND STRATUM_GPU_TEST_SOURCES renderer/test_material_binding.cpp)
     list(APPEND STRATUM_GPU_TEST_SUITES MaterialBinding)
 
+    # RenderSettings is the plain-data lighting/sky/fog/shadow struct the Render
+    # Settings panel edits (src/editor/render_settings.*). It needs no SDL_GPUDevice
+    # -- only its to_json/from_json/save/load round trip is exercised here -- but
+    # its .cpp includes renderer/gpu_renderer.hpp for push_to() and ShadowConfig,
+    # which is only linkable from this executable (stratum_editor_lib), not from
+    # stratum_tests. Guarded on the implementation existing, same reason as the
+    # blocks above.
+    if(EXISTS ${CMAKE_SOURCE_DIR}/src/editor/render_settings.cpp)
+        list(APPEND STRATUM_GPU_TEST_SOURCES editor/test_render_settings.cpp)
+        list(APPEND STRATUM_GPU_TEST_SUITES RenderSettings)
+    endif()
+
     # TextureUpload and PbrShader DO need a real SDL_GPU device, and both skip
     # themselves with a line on stderr when there is no backend, exactly as
     # GPUBufferPool does. They are labelled "gpu" below for that reason.

@@ -6,9 +6,7 @@
 #include <spdlog/spdlog.h>
 #include <SDL3/SDL.h>
 #include <cstdio>
-#include <fstream>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <utility>
 
@@ -100,7 +98,7 @@ void Editor::open_file_dialog(FilePickTarget target) {
         // Same argument as the material set below: start where the file came
         // from, so a re-save lands beside the rule file rather than in $HOME.
         SDL_ShowSaveFileDialog(callback, this, parent, filters, filter_count,
-                               m_rule_path.empty() ? nullptr : m_rule_path.c_str());
+                               m_model.m_rule_path.empty() ? nullptr : m_model.m_rule_path.c_str());
     } else if (target == FilePickTarget::MaterialSetSave) {
         // Start in the directory the set was last saved to or loaded from, so a
         // re-save lands beside its textures rather than in the home directory --
@@ -133,12 +131,7 @@ void Editor::poll_file_dialog() {
         // The OSM path field is still there to type into, so this is not fatal
         // there; for the material targets it means the button simply does nothing,
         // which is why the reason is put on the console rather than only in the log.
-        spdlog::error("File dialog unavailable: {}", error);
-        char msg[512];
-        snprintf(msg, sizeof(msg),
-                 "[Editor] File dialog unavailable (%s) - type a path instead\n",
-                 error.c_str());
-        m_console_buffer.append(msg);
+        spdlog::error("[Editor] File dialog unavailable ({}) - type a path instead", error);
         m_console_scroll_to_bottom = true;
         // Report into the panel that opened the dialog. Before the rule targets
         // existed this was "anything but OSM means the material panel", which
@@ -163,7 +156,7 @@ void Editor::poll_file_dialog() {
 
     switch (m_file_pick_target) {
         case FilePickTarget::OsmFile:
-            std::snprintf(m_osm_filepath, sizeof(m_osm_filepath), "%s", path.c_str());
+            std::snprintf(m_model.m_osm_filepath, sizeof(m_model.m_osm_filepath), "%s", path.c_str());
             spdlog::info("Selected OSM file: {}", path);
             break;
 
@@ -180,7 +173,7 @@ void Editor::poll_file_dialog() {
             // Goes through the library, not through GPUTextureManager directly, so
             // the source path is recorded and survives the next save. See
             // MaterialLibrary::load_map_from_file().
-            if (m_material_library->load_map_from_file(m_material_pick_key, map, path)) {
+            if (m_material_library->load_map_from_file(m_model.m_material_pick_key, map, path)) {
                 m_material_set_status = "loaded " + path;
             } else {
                 m_material_set_status = "failed to load " + path;
@@ -214,42 +207,13 @@ void Editor::poll_file_dialog() {
             break;
         }
 
-        case FilePickTarget::RuleFileLoad: {
-            std::ifstream in(path, std::ios::binary);
-            if (!in) {
-                m_rule_status = "could not open " + path;
-                break;
-            }
-            std::ostringstream buffer;
-            buffer << in.rdbuf();
-            m_rule_source = buffer.str();
-            m_rule_path = path;
-            m_rule_status = "loaded " + path;
-            // A loaded file is a different program, so nothing from the last one
-            // still describes it. Clearing rather than leaving it stale is the
-            // point: a diagnostic pointing at line 40 of a file that is now 12
-            // lines long is worse than no diagnostic.
-            m_rule_dirty = true;
-            run_rule_source();
+        case FilePickTarget::RuleFileLoad:
+            load_rule_source(path);
             break;
-        }
 
-        case FilePickTarget::RuleFileSave: {
-            std::ofstream out(path, std::ios::binary);
-            if (!out) {
-                m_rule_status = "could not write " + path;
-                break;
-            }
-            out << m_rule_source;
-            if (!out) {
-                m_rule_status = "write failed - see console";
-                spdlog::error("Rule file write failed: {}", path);
-                break;
-            }
-            m_rule_path = path;
-            m_rule_status = "saved to " + path;
+        case FilePickTarget::RuleFileSave:
+            save_rule_source(path);
             break;
-        }
     }
 }
 
@@ -305,7 +269,7 @@ void Editor::poll_export_dir_dialog() {
     }
 
     if (!path.empty()) {
-        std::snprintf(m_export_dir, sizeof(m_export_dir), "%s", path.c_str());
+        std::snprintf(m_model.m_export_options.dir, sizeof(m_model.m_export_options.dir), "%s", path.c_str());
         spdlog::info("Export directory: {}", path);
     }
 }

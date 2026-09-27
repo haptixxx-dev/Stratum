@@ -293,11 +293,11 @@ void Im3D_ProcessEvent(const SDL_Event* event) {
     // Input is polled in Im3D_NewFrame() rather than handled event-wise.
 }
 
-void Im3D_NewFrame(float dt, const Camera& cam, float window_width, float window_height, bool has_focus) {
+void Im3D_NewFrame(const ViewportInput& input, const Camera& cam) {
     Im3d::AppData& ad = Im3d::GetAppData();
 
-    ad.m_deltaTime = dt;
-    ad.m_viewportSize = Im3d::Vec2(window_width, window_height);
+    ad.m_deltaTime = input.dt;
+    ad.m_viewportSize = Im3d::Vec2(input.width, input.height);
     ad.m_viewOrigin = Im3d::Vec3(cam.get_position().x, cam.get_position().y, cam.get_position().z);
     ad.m_viewDirection = Im3d::Vec3(cam.get_forward().x, cam.get_forward().y, cam.get_forward().z);
     ad.m_worldUp = Im3d::Vec3(cam.get_up().x, cam.get_up().y, cam.get_up().z);
@@ -313,7 +313,7 @@ void Im3D_NewFrame(float dt, const Camera& cam, float window_width, float window
 
     // Input handling
     // We only capture input if the viewport has focus to avoid stealing from ImGui
-    if (has_focus) {
+    if (input.focused) {
         auto mouse_state = SDL_GetMouseState(nullptr, nullptr);
 
         ad.m_keyDown[Im3d::Mouse_Left] = (mouse_state & SDL_BUTTON_LMASK) != 0;

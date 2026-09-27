@@ -35,6 +35,46 @@ Editor::~Editor() = default;
 void Editor::init() {
     spdlog::info("Editor initialized");
     Im3D_Init();
+
+    // Mirror every logged record into the console panel's ring. Registered on
+    // the default logger (not a dedicated one) so the console shows exactly
+    // what every subsystem already logs -- nothing needs to know the editor
+    // exists to show up there.
+    //
+    // Routed through a dist_sink_mt rather than pushed straight onto
+    // default_logger()->sinks(): that vector is unprotected, so mutating it
+    // while another thread is inside the logger's own sink_it_() loop is a
+    // data race, and shutdown() must be able to unregister m_log_sink while a
+    // road-build, export, carve-index or quadtree std::async worker is still
+    // logging (quitting during an import). dist_sink_mt::add_sink() and
+    // remove_sink() take their own mutex against dist_sink_mt::sink_it_(), so
+    // that unregister is safe no matter what else is logging concurrently.
+    // The logger's original sink(s) become children of the dist_sink so
+    // nothing already logging to them loses that destination.
+    auto logger = spdlog::default_logger();
+    m_log_dist_sink = std::make_shared<spdlog::sinks::dist_sink_mt>(logger->sinks());
+    logger->sinks() = {m_log_dist_sink};
+
+    m_log_sink = std::make_shared<RingSinkMt>(m_log_ring);
+    m_log_dist_sink->add_sink(m_log_sink);
+
+    // Computed once here rather than per save/load: SDL_GetPrefPath allocates,
+    // and the path does not change during a run. "Haptixxx" is a placeholder
+    // organisation string -- flagged in the PR description as Sarah's call, not
+    // fixed anywhere else in the tree.
+    if (char* pref = SDL_GetPrefPath("Haptixxx", "Stratum")) {
+        m_render_settings_path = std::filesystem::path(pref) / "render_settings.json";
+        SDL_free(pref);
+    } else {
+        spdlog::warn("SDL_GetPrefPath failed ({}); render settings will not persist",
+                     SDL_GetError());
+    }
+
+    if (m_model.m_render_settings.load(m_render_settings_path)) {
+        spdlog::info("Loaded render settings from '{}'", m_render_settings_path.string());
+    }
+    // No else: RenderSettings::load() leaves m_model.m_render_settings at its compiled-in
+    // defaults on any failure, which is exactly what a first run should see.
 }
 
 void Editor::set_renderer(GPURenderer* renderer) {
@@ -52,6 +92,13 @@ void Editor::set_renderer(GPURenderer* renderer) {
         renderer->set_mesh_evicted_fn([this](uint32_t id) { on_mesh_evicted(id); });
 
         init_materials(*renderer);
+
+        // Apply the loaded-or-default render settings now, before the render loop
+        // starts. This is what used to happen implicitly, one frame late and only
+        // if the panel was open, via the sun_pushed/sky_pushed/fog_pushed statics
+        // in draw_render_settings(); see RenderSettings::push_to() for why the
+        // renderer also needs telling that this already happened.
+        m_model.m_render_settings.push_to(*renderer);
     }
 }
 
@@ -135,6 +182,22 @@ void Editor::im3d_end_frame_and_upload(GPURenderer& renderer) {
 
 void Editor::shutdown() {
     Im3D_Shutdown();
+
+    // Unregister before the ring it writes into goes away. Going through
+    // dist_sink_mt::remove_sink() rather than mutating
+    // spdlog::default_logger()->sinks() directly: remove_sink() takes the
+    // same mutex dist_sink_mt::sink_it_() does, so this blocks until any
+    // in-flight log through m_log_sink on another thread has finished,
+    // instead of racing it. Application logs a few more lines after this
+    // call returns (ImGui/SDL teardown); those still reach the logger's
+    // original sink(s), still registered on m_log_dist_sink, and are only
+    // lost from the console since the panel is gone with the editor.
+    if (m_log_sink) {
+        if (m_log_dist_sink) {
+            m_log_dist_sink->remove_sink(m_log_sink);
+        }
+        m_log_sink.reset();
+    }
 
     // Before GPURenderer::shutdown() destroys the device these textures and
     // samplers belong to. Application calls us first, which is what makes this

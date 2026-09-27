@@ -4,6 +4,8 @@
 #pragma once
 
 #include <imgui.h>
+#include <spdlog/sinks/dist_sink.h>
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <memory>
@@ -22,6 +24,9 @@
 #include "procgen/terrain_tile_manager.hpp"
 #include "renderer/mesh.hpp"
 #include "editor/camera.hpp"
+#include "editor/editor_model.hpp"
+#include "editor/log_sink.hpp"
+#include "editor/viewport_input.hpp"
 
 namespace stratum {
 
@@ -92,8 +97,8 @@ public:
     void im3d_end_frame_and_upload(GPURenderer& renderer);
     void set_msaa_change_callback(std::function<void(int)> callback) { m_msaa_change_callback = callback; }
 
-    bool is_viewport_focused() const { return m_viewport_focused; }
-    bool is_viewport_hovered() const { return m_viewport_hovered; }
+    bool is_viewport_focused() const { return m_viewport_input.focused; }
+    bool is_viewport_hovered() const { return m_viewport_input.hovered; }
 
 private:
     void setup_dockspace();
@@ -131,12 +136,23 @@ private:
      * @brief Parse the source, and run it when the parse allows
      *
      * Cheap enough to call on every edit for the parse; the RUN is what this
-     * guards. See m_rule_auto_run.
+     * guards. See m_model.m_rule_auto_run.
      */
     void run_rule_source();
 
     /// Drop the preview mesh and its GPU handle. Safe to call with none.
     void clear_rule_preview();
+
+    /// Read `path` into m_model.m_rule_source, update m_model.m_rule_path/m_rule_status and
+    /// re-run it. Returns false (with m_rule_status set) if the file could not
+    /// be opened. Called from poll_file_dialog() on FilePickTarget::RuleFileLoad.
+    bool load_rule_source(const std::string& path);
+
+    /// Write m_model.m_rule_source to `path` and update m_model.m_rule_path/m_rule_status.
+    /// Returns false (with m_rule_status set, and logged on a write failure) if
+    /// the file could not be opened or the write failed. Called from
+    /// poll_file_dialog() on FilePickTarget::RuleFileSave.
+    bool save_rule_source(const std::string& path);
 
     // ------------------------------------------------------------------------
     // Colour-by-attribute viewport mode
@@ -244,8 +260,10 @@ private:
     void draw_chunked_terrain_ui();
     void draw_legacy_terrain_ui();
 
-    bool m_viewport_focused = false;
-    bool m_viewport_hovered = false;
+    /// This frame's viewport input (focus, hover, size, mouse delta, wheel, dt),
+    /// filled from ImGui by draw_viewport() and consumed by Camera::handle_input()
+    /// and Im3D_NewFrame() so neither has to query ImGui itself.
+    ViewportInput m_viewport_input;
 
     /// Screen-space rect of the Viewport panel, in ImGui logical points.
     ///
@@ -254,8 +272,30 @@ private:
     /// and scissor. A member rather than a file-static because the write and the
     /// two reads now live in different translation units.
     ImVec4 m_viewport_rect{};
+
+    /**
+     * @brief Application/session state: import options, paths, export and
+     *        render settings, and the rule editor's authoring fields
+     *
+     * See editor_model.hpp for exactly what lives here versus on Editor
+     * itself. Every member that used to be `Editor::m_foo` for one of those
+     * groups is now `m_model.m_foo`.
+     */
+    EditorModel m_model;
+
     bool m_show_demo_window = false;
     bool m_show_style_editor = false;
+
+    /**
+     * @brief The dockspace's default layout has been built for this run
+     *
+     * setup_dockspace() (src/editor/ui/layout.cpp) checks this alongside
+     * DockBuilderGetNode() so the default split only runs once per process,
+     * never re-splitting a layout the user has since rearranged. A member
+     * rather than a function-local static because it is editor state like any
+     * other, not a one-off first-call latch.
+     */
+    bool m_dock_initialized = false;
 
     // Panel visibility
     bool m_show_viewport = true;
@@ -268,6 +308,11 @@ private:
     bool m_show_memory_panel = false;
     bool m_show_material_panel = false;
     bool m_show_rule_panel = false;
+
+    /// Scene Hierarchy search field's typed text. Not yet wired to filter the
+    /// tree; kept as editor state rather than a function-local static so the
+    /// panel's own .cpp is not the only place that could read it later.
+    char m_scene_search_buffer[256] = "";
 
     // Render toggles
     bool m_render_areas = true;
@@ -304,8 +349,22 @@ private:
     // so enabling this double-draws the whole scene.
     bool m_im3d_debug_geometry = false;
 
-    // Console log
-    ImGuiTextBuffer m_console_buffer;
+    // Console log. m_log_ring is the single source of truth -- everything that
+    // used to go straight to an ImGuiTextBuffer now goes through spdlog, and
+    // m_log_sink (registered on the default logger in init()) mirrors every
+    // record into the ring for draw_console() to display.
+    //
+    // m_log_sink is registered through m_log_dist_sink rather than pushed
+    // directly onto spdlog::default_logger()->sinks(): that vector has no
+    // lock of its own, so add/remove there would race the logger's own
+    // sink_it_() loop on whatever thread is mid-log (road build, export,
+    // carve-index and quadtree work all log from std::async workers).
+    // dist_sink_mt::add_sink()/remove_sink() take its own mutex against its
+    // sink_it_(), so shutdown() can unregister m_log_sink while a worker is
+    // still logging with no race.
+    LogRing m_log_ring{2000};
+    std::shared_ptr<RingSinkMt> m_log_sink;
+    std::shared_ptr<spdlog::sinks::dist_sink_mt> m_log_dist_sink;
     bool m_console_scroll_to_bottom = true;
 
     // Core systems
@@ -324,6 +383,16 @@ private:
     int m_drag_start_window_y = 0;
 
     GPURenderer* m_gpu_renderer = nullptr;
+
+    /**
+     * @brief Where m_model.m_render_settings is loaded from and saved to
+     *
+     * `<SDL pref path>/render_settings.json`, computed once in init() (SDL_GetPrefPath
+     * allocates). Left empty if SDL_GetPrefPath fails, in which case
+     * RenderSettings::load()/save() are both no-ops and the settings simply do
+     * not persist across a restart.
+     */
+    std::filesystem::path m_render_settings_path;
 
     /**
      * @brief The texture set and the material set, owned here
@@ -361,12 +430,6 @@ private:
     // OSM Parser and QuadTree
     osm::OSMParser m_osm_parser;
     osm::QuadTree m_quadtree;
-    std::string m_osm_import_path;
-    bool m_use_tile_culling = true;
-    bool m_use_distance_culling = true;
-    bool m_use_contribution_culling = true;
-    float m_view_radius = 2000.0f;
-    float m_contribution_threshold = 4.0f;
 
     // Cached meshes for rendering (legacy - the live path is m_quadtree)
     std::vector<Mesh> m_building_meshes;
@@ -499,6 +562,16 @@ private:
     std::vector<osm::QuadTreeNode*> m_import_pending_nodes;
     size_t m_import_nodes_total = 0;
 
+    /**
+     * @brief The "Import OSM File" button's own local status line
+     *
+     * Distinct from m_import_message, which mirrors ImportStage as the worker
+     * runs: this pair is set synchronously by the button itself (e.g. an empty
+     * file path) before any job exists, and cleared when a job is launched.
+     */
+    std::string m_import_status;
+    bool m_import_error = false;
+
     // ── Native file picker ──────────────────────────────────────────────────
     // SDL_ShowOpenFileDialog is asynchronous and its callback may run on another
     // thread, so the result is parked here under a mutex and picked up by the UI
@@ -511,7 +584,6 @@ private:
         bool pending = false;    ///< A dialog is currently open
     };
     FilePickResult m_file_pick;
-    char m_osm_filepath[512] = "";
 
     /**
      * @brief What the in-flight file dialog is FOR
@@ -530,26 +602,15 @@ private:
      */
     enum class FilePickTarget {
         OsmFile = 0,     ///< The OSM/PBF extract to import
-        MaterialAlbedo,  ///< Albedo map for m_material_pick_key
-        MaterialNormal,  ///< Normal map for m_material_pick_key
-        MaterialOrm,     ///< ORM map for m_material_pick_key
+        MaterialAlbedo,  ///< Albedo map for m_model.m_material_pick_key
+        MaterialNormal,  ///< Normal map for m_model.m_material_pick_key
+        MaterialOrm,     ///< ORM map for m_model.m_material_pick_key
         MaterialSetLoad, ///< A material set JSON to replace the whole library
         MaterialSetSave, ///< Destination to write the whole library to
         RuleFileLoad,    ///< A .rule file to load into the rule editor
         RuleFileSave,    ///< Destination to write the rule editor's source to
     };
     FilePickTarget m_file_pick_target = FilePickTarget::OsmFile;
-
-    /**
-     * @brief The material a texture-load dialog was opened for
-     *
-     * Captured at open time rather than read at poll time. A native dialog is
-     * modal to the window but the editor keeps running behind it on some
-     * platforms, and applying a texture to whatever happens to be selected when
-     * the user finally clicks Open is a way to quietly overwrite the wrong
-     * material.
-     */
-    MaterialKey m_material_pick_key{};
 
     /**
      * @brief Open the ONE native file dialog, for @p target
@@ -569,15 +630,6 @@ private:
     void poll_file_dialog();
 
     // ── Material library ────────────────────────────────────────────────────
-
-    /**
-     * @brief The material draw_material_panel() is editing
-     *
-     * A key, not an index or a pointer: MaterialLibrary::set() rehashes and
-     * MaterialDef references are invalidated by it, so the panel re-resolves the
-     * key every frame rather than holding anything across one.
-     */
-    MaterialKey m_selected_material{};
 
     /// Last path a material set was saved to or loaded from. Shown in the panel
     /// and used as the save dialog's starting location.
@@ -625,18 +677,6 @@ private:
 
     std::unique_ptr<RoadExportJob> m_export_job;
 
-    /// Format, chunk size and naming, edited by the memory panel
-    osm::road::ExportConfig m_export_config;
-
-    /// Fill RoadPiece::collision during the export re-solve
-    bool m_export_build_collision = false;
-
-    /// Fill RoadPiece::lods during the export re-solve
-    bool m_export_build_lods = false;
-
-    /// Destination directory, typed or chosen. Empty until one is picked.
-    char m_export_dir[512] = "";
-
     /// Last export outcome, shown under the button
     std::string m_export_status;
 
@@ -657,6 +697,12 @@ private:
 
     void begin_osm_import(const std::string& filepath, const osm::ParserConfig& config);
     void poll_osm_import();
+
+    /// Tear down all imported OSM data: the quadtree (releasing its GPU meshes
+    /// first), the road carve, and every import/road stat field. Called from the
+    /// import panel's "Clear Data" button, which disables itself while an import
+    /// is in flight so this never runs concurrently with poll_osm_import().
+    void clear_imported_data();
     /// @param road_pieces Prebuilt road geometry, handed to the quadtree once its
     ///                    leaves exist and before any node mesh build is queued.
     /// @param recenter_camera Frame the imported data. False for a road rebuild,
@@ -676,91 +722,13 @@ private:
     // is a pure function of (TerrainConfig, x, z) and needs no generated chunk to
     // be sampled, so the solver reaches the terrain through a callback and the
     // carve happens later, per chunk, at chunk generation time.
-
-    /**
-     * @brief Solve road heights against the terrain surface, and carve it to match
-     *
-     * When off, roads come out flat at the corridor base height -- the P2
-     * behaviour -- and any installed carve data is dropped so the terrain returns
-     * to its procedural surface.
-     */
-    bool m_terrain_aware_roads = true;
-
-    /**
-     * @brief Run the P4 junction solve
-     *
-     * Maps straight onto RoadNetworkConfig::solve_junctions. When off, every edge
-     * is extruded over its full length and ribbons overlap at every junction --
-     * the P2 output, and the reference the junction work is diffed against.
-     *
-     * Exposed because a junction defect that only shows on one extract is
-     * bisectable by flipping this and re-solving, which takes a second, rather
-     * than by rebuilding with the solver compiled out.
-     */
-    bool m_solve_junctions = true;
-
-    /**
-     * @brief Emit painted lane markings
-     *
-     * RoadNetworkConfig::emit_markings. Off restores the P4 surfaces exactly:
-     * no centre lines, edge lines, stop lines or turn arrows.
-     */
-    bool m_emit_markings = true;
-
-    /**
-     * @brief Emit pedestrian crossings
-     *
-     * RoadNetworkConfig::emit_crossings. Independent of m_emit_markings even
-     * though a zebra is Markings geometry too: a crossing is located from OSM
-     * topology and a lane line is derived from the profile, so they fail in
-     * different ways and are bisected separately.
-     */
-    bool m_emit_crossings = true;
-
-    /**
-     * @brief Emit bridge decks and tunnel portals
-     *
-     * RoadNetworkConfig::emit_structures. Both need a terrain height under the
-     * road, so both are skipped whatever this says when terrain-aware roads are
-     * off -- the panel says so rather than leaving the toggle looking broken.
-     */
-    bool m_emit_structures = true;
-
-    /**
-     * @brief Run the tessellation reduction passes
-     *
-     * RoadNetworkConfig::reduce_tessellation. Off restores the pre-reduction
-     * geometry exactly, which is what the golden tests diff against, so a
-     * geometry defect can be attributed to the decimator by flipping this and
-     * re-solving.
-     */
-    bool m_reduce_tessellation = true;
-
-    /**
-     * @brief Build a chunk-level LOD chain per quadtree leaf
-     *
-     * QuadTree::set_chunk_lod(). Read at ASSIGNMENT, not at draw time, because it
-     * also decides how road geometry is routed into the tree -- triangle by
-     * triangle when on, whole pieces when off -- so flipping it re-solves the
-     * network rather than only changing what is drawn.
-     */
-    bool m_chunk_lod = true;
-
-    /**
-     * @brief Multiplier on every ChunkLod::switch_distances entry
-     *
-     * 1 is the chain's own suggestion. Larger holds full detail further out and
-     * costs memory; smaller drops to a coarse level sooner.
-     */
-    float m_road_lod_distance_scale = 1.0f;
-
-    /**
-     * @brief Force every chunk to one LOD level, or -1 to select by distance
-     *
-     * An inspection control. A level forced beyond a chunk's chain is clamped to
-     * that chunk's coarsest, so a leaf with a short chain still draws.
-     */
-    int m_road_lod_override = -1;
+    //
+    // The toggles themselves (m_model.m_terrain_aware_roads,
+    // m_model.m_solve_junctions, m_model.m_emit_markings,
+    // m_model.m_emit_crossings, m_model.m_emit_structures,
+    // m_model.m_reduce_tessellation) and the chunk LOD fields
+    // (m_model.m_chunk_lod, m_model.m_road_lod_distance_scale,
+    // m_model.m_road_lod_override) live on EditorModel; see editor_model.hpp.
 
     /**
      * @brief What one completed traversal actually had resident, per LOD level
@@ -1128,69 +1096,20 @@ private:
     // follows with MaterialLibrary.
     // ------------------------------------------------------------------------
 
-    /// The rule text being edited. ImGui resizes it through a callback.
-    std::string m_rule_source;
-
-    /// Last path loaded or saved, shown in the header and used as the save default
-    std::string m_rule_path;
+    // The source text, load/save path, auto-run and dirty flags, the seed
+    // source/size/value and the imported-building cap are authoring state and
+    // live on EditorModel (m_model.m_rule_source, m_model.m_rule_path,
+    // m_model.m_rule_auto_run, m_model.m_rule_dirty, m_model.m_rule_seed_source
+    // of type EditorModel::RuleSeedSource, m_model.m_rule_building_limit,
+    // m_model.m_rule_seed_width, m_model.m_rule_seed_depth,
+    // m_model.m_rule_seed); see editor_model.hpp.
 
     /// One line under the load/save row: what the last file action did
     std::string m_rule_status;
 
-    /**
-     * @brief Re-run on every edit
-     *
-     * Off by default, and that is not timidity. A rule file is a program, and an
-     * author halfway through typing a recursive rule has written a program that
-     * does not terminate. The depth and shape caps bound it -- see
-     * InterpreterLimits -- so the worst case is a stall rather than a hang, but a
-     * stall on every keystroke makes the editor unusable. The PARSE runs on every
-     * edit regardless: it is cheap, it cannot loop, and it is what puts a caret
-     * under a typo while the author is still looking at it.
-     */
-    bool m_rule_auto_run = false;
-
-    /// Source changed since the last run. Drives the "stale" marker on the output.
-    bool m_rule_dirty = false;
-
-    /**
-     * @brief Where the rule gets its seed shapes from
-     *
-     * TestRectangle is a single rectangle on the ground plane, which is what
-     * the panel opens with and what every example in examples/rules/ is
-     * written against.
-     *
-     * ImportedBuildings runs the rule once per building in the OSM import,
-     * seeded from the real footprint with the feature's tags as shape
-     * attributes -- so a rule can read `attrs.get("osm.levels")` and build the
-     * height the survey recorded. That is the workflow the whole project is
-     * for, and until this existed the rule engine could only ever be pointed
-     * at a test rectangle.
-     */
-    enum class RuleSeedSource { TestRectangle = 0, ImportedBuildings };
-    RuleSeedSource m_rule_seed_source = RuleSeedSource::TestRectangle;
-
-    /**
-     * @brief Cap on how many imported buildings one run generates
-     *
-     * A city extract holds tens of thousands of footprints, and a rule that
-     * makes a few hundred triangles each would produce a mesh no preview can
-     * hold and take long enough that the editor looks hung. The cap is
-     * REPORTED when it bites, the same way InterpreterLimits reports its own,
-     * because a partial city that looks finished is the thing to avoid.
-     */
-    int m_rule_building_limit = 250;
-
     /// Buildings the last run actually generated, and how many it skipped
     uint32_t m_rule_buildings_built = 0;
     uint32_t m_rule_buildings_skipped = 0;
-
-    /// The seed shape: a rectangle of this size on the ground plane, in metres
-    float m_rule_seed_width = 12.0f;
-    float m_rule_seed_depth = 10.0f;
-
-    /// GenerationOptions::seed. An int because ImGui has no uint64 scalar widget.
-    int m_rule_seed = 0;
 
     /**
      * @brief Diagnostics from the last parse or run, already rendered

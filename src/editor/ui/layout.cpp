@@ -35,9 +35,8 @@ void Editor::setup_dockspace() {
     ImGuiID dockspace_id = ImGui::GetID("StratumDockSpace");
 
     // First time setup - create default layout (only once)
-    static bool dock_initialized = false;
-    if (!dock_initialized && ImGui::DockBuilderGetNode(dockspace_id) == nullptr) {
-        dock_initialized = true;
+    if (!m_dock_initialized && ImGui::DockBuilderGetNode(dockspace_id) == nullptr) {
+        m_dock_initialized = true;
         ImGui::DockBuilderRemoveNode(dockspace_id);
         ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
         ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);

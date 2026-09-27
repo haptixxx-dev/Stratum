@@ -10,9 +10,8 @@ void Editor::draw_scene_hierarchy() {
     ImGui::Begin("Scene Hierarchy");
 
     // Search bar
-    static char search_buffer[256] = "";
     ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint("##search", "Search...", search_buffer, sizeof(search_buffer));
+    ImGui::InputTextWithHint("##search", "Search...", m_scene_search_buffer, sizeof(m_scene_search_buffer));
 
     ImGui::Separator();
 

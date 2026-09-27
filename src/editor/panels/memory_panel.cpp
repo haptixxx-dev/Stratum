@@ -5,6 +5,7 @@
 #include "renderer/gpu_renderer.hpp"
 #include "renderer/texture.hpp"
 #include <imgui.h>
+#include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cstdio>
 
@@ -81,9 +82,7 @@ void Editor::draw_memory_panel() {
     ImGui::SameLine();
     if (ImGui::Button("Evict Now")) {
         const size_t evicted = renderer.evict_to_budget();
-        char msg[128];
-        snprintf(msg, sizeof(msg), "[GPU] Evicted %zu mesh(es) to budget\n", evicted);
-        m_console_buffer.append(msg);
+        spdlog::info("[GPU] Evicted {} mesh(es) to budget", evicted);
         m_console_scroll_to_bottom = true;
     }
 
@@ -201,72 +200,9 @@ void Editor::draw_memory_panel() {
         m_show_material_panel = true;
     }
 
-    // ── Export ──────────────────────────────────────────────────────────────
-    ImGui::Spacing();
-    ImGui::Text("Export road network");
-    ImGui::Separator();
-
-    const bool busy = export_in_flight();
-    const bool importing = m_import_job || m_road_build_future.valid() ||
-                           m_carve_index_future.valid();
-    const bool have_roads = m_osm_parser.has_data() && !m_osm_parser.get_data().roads.empty();
-
-    ImGui::BeginDisabled(busy);
-
-    ImGui::SetNextItemWidth(-90.0f);
-    ImGui::InputText("##ExportDir", m_export_dir, sizeof(m_export_dir));
-    ImGui::SameLine();
-    if (ImGui::Button("Browse##Export", ImVec2(-1, 0))) {
-        open_export_dir_dialog();
-    }
-
-    int format = static_cast<int>(m_export_config.format);
-    const char* formats[] = { "OBJ + MTL", "glTF 2.0 + .bin" };
-    if (ImGui::Combo("Format", &format, formats, 2)) {
-        m_export_config.format = static_cast<osm::road::ExportFormat>(format);
-    }
-
-    ImGui::SliderFloat("Chunk size", &m_export_config.chunk_size, 0.0f, 2000.0f, "%.0f m");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("0 writes the whole network as one file. The grid is anchored at the\n"
-                          "world origin, so two overlapping exports line up.");
-    }
-
-    ImGui::Checkbox("Collision mesh", &m_export_build_collision);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Derives a flat collision variant per piece during the re-solve.\n"
-                          "Costs roughly a third of the render mesh again.");
-    }
-
-    ImGui::Checkbox("LOD chain", &m_export_build_lods);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Simplifies once per material range per level. The most expensive\n"
-                          "option by a wide margin on a city extract.");
-    }
-    if (m_export_build_lods) {
-        ImGui::SliderInt("LOD levels", &m_export_config.lod_levels, 2, 4);
-    }
-
-    ImGui::BeginDisabled(!have_roads || importing);
-    if (ImGui::Button("Export", ImVec2(-1, 0))) {
-        begin_road_export();
-    }
-    ImGui::EndDisabled();
-
-    ImGui::EndDisabled();
-
-    if (busy) {
-        // Indeterminate: the exporter reports nothing until it returns, and a bar
-        // that sat at 0% would read as a hang.
-        ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), ImVec2(-1, 0),
-                           "Re-solving and writing...");
-    } else if (!have_roads) {
-        ImGui::TextDisabled("Import an OSM file with roads first");
-    }
-
-    if (!m_export_status.empty()) {
-        ImGui::TextWrapped("%s", m_export_status.c_str());
-    }
+    // Export road network controls used to be duplicated here; they now live
+    // solely in the OSM import panel (draw_osm_panel(), export_options.hpp),
+    // still wired to the same begin_road_export().
 
     ImGui::End();
 }

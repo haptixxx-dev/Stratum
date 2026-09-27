@@ -107,13 +107,13 @@ void Editor::render_3d(GPURenderer& renderer) {
     m_quadtree.traverse_visible(
         frustum.planes,
         cam_pos,
-        m_view_radius,
+        m_model.m_view_radius,
         viewport.h,
         m_camera.m_fov,
-        m_contribution_threshold,
-        m_use_tile_culling,
-        m_use_distance_culling,
-        m_use_contribution_culling,
+        m_model.m_contribution_threshold,
+        m_model.m_use_tile_culling,
+        m_model.m_use_distance_culling,
+        m_model.m_use_contribution_culling,
         [&](osm::QuadTreeNode* node, float dist_sq) {
             // Stream: a node that just became visible gets its mesh build queued
             // here. This traversal is the only one per frame, so it has to do the
@@ -173,7 +173,7 @@ void Editor::render_3d(GPURenderer& renderer) {
     m_road_lod_frame = m_road_lod_frame_build;
 
     // Render procedural terrain
-    float radius_sq = m_view_radius * m_view_radius;
+    float radius_sq = m_model.m_view_radius * m_model.m_view_radius;
     if (m_use_chunked_terrain) {
         // Render chunked terrain
         if (m_render_terrain) {
@@ -186,12 +186,12 @@ void Editor::render_3d(GPURenderer& renderer) {
                 // wasteful when nothing was ever unloaded; with an eviction budget
                 // it is a thrash loop, because a chunk evicted for being far away
                 // would re-upload on the very next frame.
-                if (m_use_tile_culling && !frustum.intersects_aabb(chunk->bounds_min, chunk->bounds_max)) {
+                if (m_model.m_use_tile_culling && !frustum.intersects_aabb(chunk->bounds_min, chunk->bounds_max)) {
                     continue;
                 }
 
                 // Distance culling
-                if (m_use_distance_culling) {
+                if (m_model.m_use_distance_culling) {
                     glm::vec3 chunk_center = (chunk->bounds_min + chunk->bounds_max) * 0.5f;
                     float dist_sq = glm::dot(chunk_center - cam_pos, chunk_center - cam_pos);
                     if (dist_sq > radius_sq) continue;

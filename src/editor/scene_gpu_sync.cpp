@@ -208,11 +208,11 @@ void Editor::sync_node_road_lod(osm::QuadTreeNode& node, GPURenderer& renderer,
     // a chunk of seven pieces gives up after one level where a dense one gets
     // four -- so an override of 3 has to mean "the coarsest you have" rather than
     // "draw nothing".
-    const int desired = (m_road_lod_override >= 0)
-                      ? std::min(m_road_lod_override, levels - 1)
+    const int desired = (m_model.m_road_lod_override >= 0)
+                      ? std::min(m_model.m_road_lod_override, levels - 1)
                       : osm::select_road_lod_level(node.road_lod, distance,
                                                    node.road_lod_resident,
-                                                   m_road_lod_distance_scale);
+                                                   m_model.m_road_lod_distance_scale);
 
     if (desired == node.road_lod_resident && !node.road_gpu_ids.empty()) {
         return;
