@@ -303,6 +303,7 @@ add_library(stratum_editor_lib STATIC
     src/editor/panels/menu_bar.cpp
     src/editor/panels/viewport_panel.cpp
     src/editor/panels/scene_panel.cpp
+    src/editor/panels/inspector_panel.cpp
     src/editor/ui/layout.cpp
     src/editor/window_chrome.cpp
     src/editor/viewport_overlay.cpp
