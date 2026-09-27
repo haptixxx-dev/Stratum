@@ -4,6 +4,7 @@
 #pragma once
 
 #include <imgui.h>
+#include <spdlog/sinks/dist_sink.h>
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -352,8 +353,18 @@ private:
     // used to go straight to an ImGuiTextBuffer now goes through spdlog, and
     // m_log_sink (registered on the default logger in init()) mirrors every
     // record into the ring for draw_console() to display.
+    //
+    // m_log_sink is registered through m_log_dist_sink rather than pushed
+    // directly onto spdlog::default_logger()->sinks(): that vector has no
+    // lock of its own, so add/remove there would race the logger's own
+    // sink_it_() loop on whatever thread is mid-log (road build, export,
+    // carve-index and quadtree work all log from std::async workers).
+    // dist_sink_mt::add_sink()/remove_sink() take its own mutex against its
+    // sink_it_(), so shutdown() can unregister m_log_sink while a worker is
+    // still logging with no race.
     LogRing m_log_ring{2000};
     std::shared_ptr<RingSinkMt> m_log_sink;
+    std::shared_ptr<spdlog::sinks::dist_sink_mt> m_log_dist_sink;
     bool m_console_scroll_to_bottom = true;
 
     // Core systems

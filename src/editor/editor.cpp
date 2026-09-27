@@ -40,8 +40,23 @@ void Editor::init() {
     // the default logger (not a dedicated one) so the console shows exactly
     // what every subsystem already logs -- nothing needs to know the editor
     // exists to show up there.
+    //
+    // Routed through a dist_sink_mt rather than pushed straight onto
+    // default_logger()->sinks(): that vector is unprotected, so mutating it
+    // while another thread is inside the logger's own sink_it_() loop is a
+    // data race, and shutdown() must be able to unregister m_log_sink while a
+    // road-build, export, carve-index or quadtree std::async worker is still
+    // logging (quitting during an import). dist_sink_mt::add_sink() and
+    // remove_sink() take their own mutex against dist_sink_mt::sink_it_(), so
+    // that unregister is safe no matter what else is logging concurrently.
+    // The logger's original sink(s) become children of the dist_sink so
+    // nothing already logging to them loses that destination.
+    auto logger = spdlog::default_logger();
+    m_log_dist_sink = std::make_shared<spdlog::sinks::dist_sink_mt>(logger->sinks());
+    logger->sinks() = {m_log_dist_sink};
+
     m_log_sink = std::make_shared<RingSinkMt>(m_log_ring);
-    spdlog::default_logger()->sinks().push_back(m_log_sink);
+    m_log_dist_sink->add_sink(m_log_sink);
 
     // Computed once here rather than per save/load: SDL_GetPrefPath allocates,
     // and the path does not change during a run. "Haptixxx" is a placeholder
@@ -168,13 +183,19 @@ void Editor::im3d_end_frame_and_upload(GPURenderer& renderer) {
 void Editor::shutdown() {
     Im3D_Shutdown();
 
-    // Unregister before the ring it writes into goes away. Application logs a
-    // few more lines after this call returns (ImGui/SDL teardown); those are
-    // fine to lose from the console since the panel is gone with the editor.
+    // Unregister before the ring it writes into goes away. Going through
+    // dist_sink_mt::remove_sink() rather than mutating
+    // spdlog::default_logger()->sinks() directly: remove_sink() takes the
+    // same mutex dist_sink_mt::sink_it_() does, so this blocks until any
+    // in-flight log through m_log_sink on another thread has finished,
+    // instead of racing it. Application logs a few more lines after this
+    // call returns (ImGui/SDL teardown); those still reach the logger's
+    // original sink(s), still registered on m_log_dist_sink, and are only
+    // lost from the console since the panel is gone with the editor.
     if (m_log_sink) {
-        auto logger = spdlog::default_logger();
-        auto& sinks = logger->sinks();
-        sinks.erase(std::remove(sinks.begin(), sinks.end(), m_log_sink), sinks.end());
+        if (m_log_dist_sink) {
+            m_log_dist_sink->remove_sink(m_log_sink);
+        }
         m_log_sink.reset();
     }
 
