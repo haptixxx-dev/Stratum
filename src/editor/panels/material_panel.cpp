@@ -424,7 +424,7 @@ void Editor::draw_material_fallback_list() {
             // missing any more.
             lib.reset_resolve_stats();
 
-            m_selected_material = key;
+            m_model.m_selected_material = key;
         }
         ImGui::SetItemTooltip("Add a real entry for this key, seeded from what it "
                               "currently falls back to.");
@@ -480,7 +480,7 @@ void Editor::draw_material_slot_tree() {
         ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth;
         // Open the slot the selection is in, so a selection made from the
         // fallback list is visible without hunting for it.
-        if (m_selected_material.material == slot) {
+        if (m_model.m_selected_material.material == slot) {
             ImGui::SetNextItemOpen(true, ImGuiCond_Once);
         }
 
@@ -498,8 +498,8 @@ void Editor::draw_material_slot_tree() {
                 }
 
                 ImGui::PushID(static_cast<int>(key.packed()));
-                if (ImGui::Selectable(label, m_selected_material == key)) {
-                    m_selected_material = key;
+                if (ImGui::Selectable(label, m_model.m_selected_material == key)) {
+                    m_model.m_selected_material = key;
                 }
                 ImGui::PopID();
             }
@@ -517,16 +517,16 @@ void Editor::draw_material_editor() {
     // The selection must name an EXACT entry. Anything else would mean resolving a
     // possibly-unknown key every frame, which would invent fallback counts out of
     // UI activity -- see the file note. Recover to the first real key instead.
-    if (!lib.has(m_selected_material)) {
+    if (!lib.has(m_model.m_selected_material)) {
         const std::vector<MaterialKey> keys = lib.keys();
         if (keys.empty()) {
             ImGui::TextDisabled("The library is empty. Press Restore defaults.");
             return;
         }
-        m_selected_material = keys.front();
+        m_model.m_selected_material = keys.front();
     }
 
-    const MaterialKey key = m_selected_material;
+    const MaterialKey key = m_model.m_selected_material;
 
     // A COPY, not the reference resolve() returns: set() below rehashes the map and
     // invalidates it. Nothing in this function may hold a MaterialDef& across a
@@ -817,7 +817,7 @@ bool Editor::draw_material_map_row(const char* label, MaterialDef& def,
         // can move while it is open; applying the texture to whatever happens to be
         // selected when the user finally clicks Open is a quiet way to overwrite
         // the wrong material.
-        m_material_pick_key = key;
+        m_model.m_material_pick_key = key;
         open_file_dialog(target);
     }
     ImGui::EndDisabled();

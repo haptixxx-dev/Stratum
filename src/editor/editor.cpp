@@ -55,10 +55,10 @@ void Editor::init() {
                      SDL_GetError());
     }
 
-    if (m_render_settings.load(m_render_settings_path)) {
+    if (m_model.m_render_settings.load(m_render_settings_path)) {
         spdlog::info("Loaded render settings from '{}'", m_render_settings_path.string());
     }
-    // No else: RenderSettings::load() leaves m_render_settings at its compiled-in
+    // No else: RenderSettings::load() leaves m_model.m_render_settings at its compiled-in
     // defaults on any failure, which is exactly what a first run should see.
 }
 
@@ -83,7 +83,7 @@ void Editor::set_renderer(GPURenderer* renderer) {
         // if the panel was open, via the sun_pushed/sky_pushed/fog_pushed statics
         // in draw_render_settings(); see RenderSettings::push_to() for why the
         // renderer also needs telling that this already happened.
-        m_render_settings.push_to(*renderer);
+        m_model.m_render_settings.push_to(*renderer);
     }
 }
 

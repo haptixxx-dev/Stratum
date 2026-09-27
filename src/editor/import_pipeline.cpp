@@ -31,7 +31,7 @@ void Editor::begin_road_export() {
         m_export_status = "No road data to export";
         return;
     }
-    if (m_export_options.dir[0] == '\0') {
+    if (m_model.m_export_options.dir[0] == '\0') {
         m_export_status = "Choose an output directory first";
         return;
     }
@@ -47,18 +47,18 @@ void Editor::begin_road_export() {
     // asks to export them. Solving again is a second of worker time; holding a
     // second copy of a city's geometry is permanent.
     osm::road::RoadNetworkConfig cfg = make_road_network_config();
-    cfg.build_collision = m_export_options.build_collision;
-    cfg.build_lods = m_export_options.build_lods;
+    cfg.build_collision = m_model.m_export_options.build_collision;
+    cfg.build_lods = m_model.m_export_options.build_lods;
 
     auto job = std::make_unique<RoadExportJob>();
-    job->directory = m_export_options.dir;
-    job->config = m_export_options.config;
+    job->directory = m_model.m_export_options.dir;
+    job->config = m_model.m_export_options.config;
     // The exporter only writes what the build produced, so the two pairs of flags
     // are one decision and are stamped together.
-    job->config.export_collision = m_export_options.build_collision;
-    job->config.export_lods = m_export_options.build_lods;
-    job->build_collision = m_export_options.build_collision;
-    job->build_lods = m_export_options.build_lods;
+    job->config.export_collision = m_model.m_export_options.build_collision;
+    job->config.export_lods = m_model.m_export_options.build_lods;
+    job->build_collision = m_model.m_export_options.build_collision;
+    job->build_lods = m_model.m_export_options.build_lods;
 
     const std::string dir = job->directory;
     const osm::road::ExportConfig export_cfg = job->config;
@@ -74,7 +74,7 @@ void Editor::begin_road_export() {
 
     m_export_job = std::move(job);
     m_export_status = "Exporting...";
-    spdlog::info("Exporting the road network to {}", m_export_options.dir);
+    spdlog::info("Exporting the road network to {}", m_model.m_export_options.dir);
 }
 
 void Editor::poll_road_export() {
@@ -184,13 +184,13 @@ bool Editor::has_generated_terrain() const {
 }
 
 uint64_t Editor::live_road_terrain_fingerprint() const {
-    return (m_terrain_aware_roads && m_use_chunked_terrain && has_generated_terrain())
+    return (m_model.m_terrain_aware_roads && m_use_chunked_terrain && has_generated_terrain())
                ? terrain_surface_fingerprint(m_terrain_tile_manager.get_config().terrain)
                : 0;
 }
 
 osm::road::HeightSampler Editor::make_terrain_height_sampler() const {
-    if (!m_terrain_aware_roads) return nullptr;
+    if (!m_model.m_terrain_aware_roads) return nullptr;
 
     // The legacy single-terrain path has no carve hook, so elevating roads
     // against it would leave them following a surface nothing ever cuts. Flat
@@ -233,11 +233,11 @@ osm::road::HeightSampler Editor::make_terrain_height_sampler() const {
 osm::road::RoadNetworkConfig Editor::make_road_network_config() const {
     osm::road::RoadNetworkConfig cfg;
     cfg.height_sampler = make_terrain_height_sampler();
-    cfg.solve_junctions = m_solve_junctions;
-    cfg.emit_markings = m_emit_markings;
-    cfg.emit_crossings = m_emit_crossings;
-    cfg.emit_structures = m_emit_structures;
-    cfg.reduce_tessellation = m_reduce_tessellation;
+    cfg.solve_junctions = m_model.m_solve_junctions;
+    cfg.emit_markings = m_model.m_emit_markings;
+    cfg.emit_crossings = m_model.m_emit_crossings;
+    cfg.emit_structures = m_model.m_emit_structures;
+    cfg.reduce_tessellation = m_model.m_reduce_tessellation;
     return cfg;
 }
 
@@ -770,7 +770,7 @@ void Editor::begin_mesh_rebuild(std::vector<osm::road::RoadPiece>&& road_pieces,
     // Set BEFORE the hand-off: the flag decides how pieces are routed into the
     // leaves as well as whether a chain is built afterwards, and both happen
     // inside assign_road_pieces().
-    m_quadtree.set_chunk_lod(m_chunk_lod, osm::road::ChunkLodConfig{});
+    m_quadtree.set_chunk_lod(m_model.m_chunk_lod, osm::road::ChunkLodConfig{});
     m_quadtree.assign_road_pieces(std::move(road_pieces));
 
     spdlog::info("QuadTree: {} leaves, {} roads, {} buildings, {} areas, max depth {}",
@@ -783,9 +783,9 @@ void Editor::begin_mesh_rebuild(std::vector<osm::road::RoadPiece>&& road_pieces,
     frame_camera_on_data(recenter_camera);
 
     // Enable culling for performance
-    m_use_tile_culling = true;
-    m_use_distance_culling = true;
-    m_use_contribution_culling = false; // disable initially — camera is far, nodes appear small
+    m_model.m_use_tile_culling = true;
+    m_model.m_use_distance_culling = true;
+    m_model.m_use_contribution_culling = false; // disable initially — camera is far, nodes appear small
 
     // Queue the initially-visible leaves. These builds are already asynchronous;
     // poll_osm_import() drains them across frames and reports progress. Blocking
@@ -796,8 +796,8 @@ void Editor::begin_mesh_rebuild(std::vector<osm::road::RoadPiece>&& road_pieces,
     glm::vec3 cam_pos = m_camera.get_position();
 
     m_quadtree.traverse_visible(
-        frustum.planes, cam_pos, m_view_radius,
-        600.0f, m_camera.m_fov, m_contribution_threshold,
+        frustum.planes, cam_pos, m_model.m_view_radius,
+        600.0f, m_camera.m_fov, m_model.m_contribution_threshold,
         true, true, false, // frustum + distance, no contribution cull
         [&](osm::QuadTreeNode* node, float /*dist_sq*/) {
             if (!node->meshes_built && !node->meshes_pending) {

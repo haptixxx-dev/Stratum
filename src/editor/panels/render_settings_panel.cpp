@@ -43,7 +43,7 @@ void Editor::draw_render_settings() {
                 m_gpu_renderer->set_exposure(exposure);
             }
 
-            // Everything below edits m_render_settings directly. It is the single
+            // Everything below edits m_model.m_render_settings directly. It is the single
             // source of truth for the sun, sky, fog and shadow values: it was
             // already loaded (or left at its defaults) in Editor::init() and
             // already pushed to the renderer in Editor::set_renderer(), before
@@ -52,7 +52,7 @@ void Editor::draw_render_settings() {
             // which is what actually pushes and persists -- one dirty flag
             // standing in for the three separate sun_pushed/sky_pushed/fog_pushed
             // first-frame statics this function used to carry.
-            RenderSettings& rs = m_render_settings;
+            RenderSettings& rs = m_model.m_render_settings;
             bool changed = false;
 
             // Sun direction (simplified - azimuth angle)
@@ -227,19 +227,19 @@ void Editor::draw_render_settings() {
     ImGui::Separator();
     ImGui::Text("Culling");
 
-    ImGui::Checkbox("Frustum Culling", &m_use_tile_culling);
-    ImGui::Checkbox("Distance Culling", &m_use_distance_culling);
+    ImGui::Checkbox("Frustum Culling", &m_model.m_use_tile_culling);
+    ImGui::Checkbox("Distance Culling", &m_model.m_use_distance_culling);
 
-    if (m_use_distance_culling) {
+    if (m_model.m_use_distance_culling) {
         ImGui::SetNextItemWidth(150);
-        ImGui::SliderFloat("View Radius", &m_view_radius, 500.0f, 20000.0f, "%.0f m");
+        ImGui::SliderFloat("View Radius", &m_model.m_view_radius, 500.0f, 20000.0f, "%.0f m");
     }
 
     // Contribution culling
-    ImGui::Checkbox("Contribution Culling", &m_use_contribution_culling);
-    if (m_use_contribution_culling) {
+    ImGui::Checkbox("Contribution Culling", &m_model.m_use_contribution_culling);
+    if (m_model.m_use_contribution_culling) {
         ImGui::SetNextItemWidth(150);
-        ImGui::SliderFloat("Threshold (px)", &m_contribution_threshold, 1.0f, 20.0f, "%.1f");
+        ImGui::SliderFloat("Threshold (px)", &m_model.m_contribution_threshold, 1.0f, 20.0f, "%.1f");
     }
 
     // Stats

@@ -52,13 +52,13 @@ void Editor::frame_camera_on_data(bool recenter_camera) {
         // culling rejects everything before it can be built. Bounded so a huge
         // import does not try to mesh the whole dataset at once -- the remainder
         // streams in as the camera moves.
-        m_view_radius = std::clamp(view_distance * 3.0f, 5000.0f, 30000.0f);
+        m_model.m_view_radius = std::clamp(view_distance * 3.0f, 5000.0f, 30000.0f);
 
         spdlog::info("Camera at ({:.0f}, {:.0f}, {:.0f}) looking at ({:.0f}, {:.0f}, {:.0f}), "
                      "focus radius {:.0f}m, view radius {:.0f}m",
                      cam_pos.x, cam_pos.y, cam_pos.z,
                      data_center.x, data_center.y, data_center.z,
-                     focus_radius, m_view_radius);
+                     focus_radius, m_model.m_view_radius);
     } else if (have_focus) {
         // A road rebuild after terrain generation. The geometry is the same data
         // in the same place, so re-framing it would only throw away wherever the

@@ -226,7 +226,7 @@ void Editor::draw_attribute_overlay() {
 
     const Frustum frustum = m_camera.get_frustum();
     const glm::vec3 cam_pos = m_camera.get_position();
-    const float radius_sq = m_view_radius * m_view_radius;
+    const float radius_sq = m_model.m_view_radius * m_model.m_view_radius;
 
     // Gathered and sorted front to back before anything is emitted, so that when
     // the budget runs out it runs out on the far side of the scene. Sorting a few
@@ -234,14 +234,14 @@ void Editor::draw_attribute_overlay() {
     std::vector<std::pair<float, osm::QuadTreeNode*>> visible;
     for (auto* leaf : m_quadtree.get_all_leaves()) {
         if (!leaf || !leaf->has_valid_bounds()) continue;
-        if (m_use_tile_culling && !frustum.intersects_aabb(leaf->bounds_min, leaf->bounds_max)) {
+        if (m_model.m_use_tile_culling && !frustum.intersects_aabb(leaf->bounds_min, leaf->bounds_max)) {
             continue;
         }
 
         const glm::vec3 centre = (leaf->bounds_min + leaf->bounds_max) * 0.5f;
         const glm::vec3 to_cam = centre - cam_pos;
         const float dist_sq = glm::dot(to_cam, to_cam);
-        if (m_use_distance_culling && dist_sq > radius_sq) continue;
+        if (m_model.m_use_distance_culling && dist_sq > radius_sq) continue;
 
         visible.emplace_back(dist_sq, leaf);
     }

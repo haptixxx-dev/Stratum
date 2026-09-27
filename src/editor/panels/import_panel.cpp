@@ -27,13 +27,13 @@ void Editor::draw_osm_panel() {
     draw_attribute_mode_selector();
 
     // Culling controls
-    ImGui::Checkbox("Frustum Culling", &m_use_tile_culling);
+    ImGui::Checkbox("Frustum Culling", &m_model.m_use_tile_culling);
     ImGui::SameLine();
     ImGui::Checkbox("Node Grid", &m_show_tile_grid);
-    ImGui::Checkbox("Contribution Culling", &m_use_contribution_culling);
-    if (m_use_contribution_culling) {
+    ImGui::Checkbox("Contribution Culling", &m_model.m_use_contribution_culling);
+    if (m_model.m_use_contribution_culling) {
         ImGui::SetNextItemWidth(120);
-        ImGui::SliderFloat("Threshold (px)", &m_contribution_threshold, 1.0f, 20.0f, "%.1f");
+        ImGui::SliderFloat("Threshold (px)", &m_model.m_contribution_threshold, 1.0f, 20.0f, "%.1f");
     }
     if (m_quadtree.leaf_count() > 0) {
         ImGui::Text("Leaves: %zu, Max Depth: %d", m_quadtree.leaf_count(), m_quadtree.max_depth());
@@ -59,7 +59,7 @@ void Editor::draw_osm_panel() {
     ImGui::DragFloat("Meters/Level", &config.meters_per_level, 0.1f, 2.0f, 5.0f);
 
     ImGui::Spacing();
-    if (ImGui::Checkbox("Terrain-Aware Roads", &m_terrain_aware_roads)) {
+    if (ImGui::Checkbox("Terrain-Aware Roads", &m_model.m_terrain_aware_roads)) {
         // The toggle changes which surface the roads belong on, so the current
         // solve is stale either way round. Re-solve now rather than waiting for
         // the next terrain generate.
@@ -70,13 +70,13 @@ void Editor::draw_osm_panel() {
         "Off: roads stay flat and the terrain keeps its procedural surface.\n"
         "Requires chunked terrain to have been generated.");
 
-    if (m_terrain_aware_roads && !has_generated_terrain()) {
+    if (m_model.m_terrain_aware_roads && !has_generated_terrain()) {
         ImGui::TextDisabled("No terrain generated: roads will be flat.");
-    } else if (m_terrain_aware_roads && !m_use_chunked_terrain) {
+    } else if (m_model.m_terrain_aware_roads && !m_use_chunked_terrain) {
         ImGui::TextDisabled("Legacy terrain mode has no carve: roads will be flat.");
     }
 
-    if (ImGui::Checkbox("Solve Junctions", &m_solve_junctions)) {
+    if (ImGui::Checkbox("Solve Junctions", &m_model.m_solve_junctions)) {
         // The toggle changes the geometry of every edge that meets another, not
         // only the junction fills: the arms are extruded from a trimmed
         // centerline. Nothing in the current network survives it, so re-solve now
@@ -94,7 +94,7 @@ void Editor::draw_osm_panel() {
     // re-solving, which is a second, rather than by rebuilding with it compiled
     // out. All three change the geometry of the pieces themselves, so each has to
     // re-solve the network rather than only redraw it.
-    if (ImGui::Checkbox("Lane Markings", &m_emit_markings)) {
+    if (ImGui::Checkbox("Lane Markings", &m_model.m_emit_markings)) {
         begin_road_network_rebuild();
     }
     ImGui::SetItemTooltip(
@@ -103,7 +103,7 @@ void Editor::draw_osm_panel() {
         "Off: the carriageway keeps its surfaces and carries no paint.");
 
     ImGui::SameLine();
-    if (ImGui::Checkbox("Crossings", &m_emit_crossings)) {
+    if (ImGui::Checkbox("Crossings", &m_model.m_emit_crossings)) {
         begin_road_network_rebuild();
     }
     ImGui::SetItemTooltip(
@@ -111,7 +111,7 @@ void Editor::draw_osm_panel() {
         "Independent of Lane Markings: a crossing is found from OSM topology, a lane\n"
         "line is derived from the profile, and the two fail in different ways.");
 
-    if (ImGui::Checkbox("Bridges and Tunnels", &m_emit_structures)) {
+    if (ImGui::Checkbox("Bridges and Tunnels", &m_model.m_emit_structures)) {
         begin_road_network_rebuild();
     }
     ImGui::SetItemTooltip(
@@ -119,13 +119,13 @@ void Editor::draw_osm_panel() {
         "Both are cut against the ground under the road, so both need terrain-aware\n"
         "roads. Off: a bridge is a bare ribbon and a tunnel has no mouth.");
 
-    if (m_emit_structures && !m_terrain_aware_roads) {
+    if (m_model.m_emit_structures && !m_model.m_terrain_aware_roads) {
         ImGui::TextDisabled("Structures need terrain-aware roads: none will be emitted.");
     }
 
     // Geometry reduction. Both change what is built rather than what is drawn, so
     // both re-solve, and both are bisectable the same way the detail passes are.
-    if (ImGui::Checkbox("Reduce Tessellation", &m_reduce_tessellation)) {
+    if (ImGui::Checkbox("Reduce Tessellation", &m_model.m_reduce_tessellation)) {
         begin_road_network_rebuild();
     }
     ImGui::SetItemTooltip(
@@ -134,7 +134,7 @@ void Editor::draw_osm_panel() {
         "Off: the pre-reduction geometry, which the golden tests diff against.");
 
     ImGui::SameLine();
-    if (ImGui::Checkbox("Chunk LOD", &m_chunk_lod)) {
+    if (ImGui::Checkbox("Chunk LOD", &m_model.m_chunk_lod)) {
         // Not a draw-time switch. It decides how pieces are routed into the
         // leaves -- triangle by triangle when on -- so the tree has to be
         // rebuilt, not merely redrawn.
@@ -149,7 +149,7 @@ void Editor::draw_osm_panel() {
 
     // File path input. Kept alongside the picker so a path can still be pasted or
     // typed, which is also the fallback if the platform has no dialog available.
-    ImGui::InputText("File Path", m_osm_filepath, sizeof(m_osm_filepath));
+    ImGui::InputText("File Path", m_model.m_osm_filepath, sizeof(m_model.m_osm_filepath));
     ImGui::SameLine();
     ImGui::BeginDisabled(m_file_pick.pending);
     if (ImGui::Button(m_file_pick.pending ? "Browsing..." : "Browse...")) {
@@ -168,13 +168,13 @@ void Editor::draw_osm_panel() {
 
     ImGui::BeginDisabled(importing);
     if (ImGui::Button("Import OSM File", ImVec2(-1, 0))) {
-        if (strlen(m_osm_filepath) == 0) {
+        if (strlen(m_model.m_osm_filepath) == 0) {
             m_import_status = "Please enter a file path first";
             m_import_error = true;
         } else {
             m_import_status.clear();
             m_import_error = false;
-            begin_osm_import(m_osm_filepath, config);
+            begin_osm_import(m_model.m_osm_filepath, config);
         }
     }
     ImGui::EndDisabled();
@@ -238,38 +238,38 @@ void Editor::draw_osm_panel() {
         ImGui::BeginDisabled(busy);
 
         ImGui::SetNextItemWidth(-90.0f);
-        ImGui::InputText("##ExportDir", m_export_options.dir, sizeof(m_export_options.dir));
+        ImGui::InputText("##ExportDir", m_model.m_export_options.dir, sizeof(m_model.m_export_options.dir));
         ImGui::SameLine();
         if (ImGui::Button("Browse##Export", ImVec2(-1, 0))) {
             open_export_dir_dialog();
         }
 
-        int format = static_cast<int>(m_export_options.config.format);
+        int format = static_cast<int>(m_model.m_export_options.config.format);
         const char* formats[] = { "OBJ + MTL", "glTF 2.0 + .bin" };
         if (ImGui::Combo("Format", &format, formats, 2)) {
-            m_export_options.config.format = static_cast<osm::road::ExportFormat>(format);
+            m_model.m_export_options.config.format = static_cast<osm::road::ExportFormat>(format);
         }
 
-        ImGui::SliderFloat("Chunk size", &m_export_options.config.chunk_size, 0.0f, 2000.0f,
+        ImGui::SliderFloat("Chunk size", &m_model.m_export_options.config.chunk_size, 0.0f, 2000.0f,
                            "%.0f m");
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("0 writes the whole network as one file. The grid is anchored at "
                               "the\nworld origin, so two overlapping exports line up.");
         }
 
-        ImGui::Checkbox("Collision mesh", &m_export_options.build_collision);
+        ImGui::Checkbox("Collision mesh", &m_model.m_export_options.build_collision);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Derives a flat collision variant per piece during the re-solve.\n"
                               "Costs roughly a third of the render mesh again.");
         }
 
-        ImGui::Checkbox("LOD chain", &m_export_options.build_lods);
+        ImGui::Checkbox("LOD chain", &m_model.m_export_options.build_lods);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Simplifies once per material range per level. The most expensive\n"
                               "option by a wide margin on a city extract.");
         }
-        if (m_export_options.build_lods) {
-            ImGui::SliderInt("LOD levels", &m_export_options.config.lod_levels, 2, 4);
+        if (m_model.m_export_options.build_lods) {
+            ImGui::SliderInt("LOD levels", &m_model.m_export_options.config.lod_levels, 2, 4);
         }
 
         ImGui::BeginDisabled(!have_roads || export_blocked);
@@ -416,7 +416,7 @@ void Editor::draw_osm_panel() {
                 ImGui::BulletText("Bridges: %zu   Tunnels: %zu (%zu portal mouths)",
                                   m_road_stats.bridges, m_road_stats.tunnels,
                                   m_road_portal_mouths);
-            } else if (!m_emit_structures) {
+            } else if (!m_model.m_emit_structures) {
                 ImGui::BulletText("Bridges and tunnels: off");
             } else {
                 // The flag was on but the builder skipped the pass, which it does
@@ -430,7 +430,7 @@ void Editor::draw_osm_panel() {
 
             ImGui::Spacing();
             ImGui::Text("Tessellation:");
-            if (m_reduce_tessellation) {
+            if (m_model.m_reduce_tessellation) {
                 const size_t before = m_road_stats.stations_before;
                 const size_t after = m_road_stats.stations_after;
                 ImGui::BulletText("Stations: %zu -> %zu (%.1f%%)", before, after,

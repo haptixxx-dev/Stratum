@@ -193,14 +193,14 @@ bool Editor::load_rule_source(const std::string& path) {
     }
     std::ostringstream buffer;
     buffer << in.rdbuf();
-    m_rule_source = buffer.str();
-    m_rule_path = path;
+    m_model.m_rule_source = buffer.str();
+    m_model.m_rule_path = path;
     m_rule_status = "loaded " + path;
     // A loaded file is a different program, so nothing from the last one
     // still describes it. Clearing rather than leaving it stale is the
     // point: a diagnostic pointing at line 40 of a file that is now 12
     // lines long is worse than no diagnostic.
-    m_rule_dirty = true;
+    m_model.m_rule_dirty = true;
     run_rule_source();
     return true;
 }
@@ -211,13 +211,13 @@ bool Editor::save_rule_source(const std::string& path) {
         m_rule_status = "could not write " + path;
         return false;
     }
-    out << m_rule_source;
+    out << m_model.m_rule_source;
     if (!out) {
         m_rule_status = "write failed - see console";
         spdlog::error("Rule file write failed: {}", path);
         return false;
     }
-    m_rule_path = path;
+    m_model.m_rule_path = path;
     m_rule_status = "saved to " + path;
     return true;
 }
@@ -227,9 +227,9 @@ void Editor::run_rule_source() {
     m_rule_log.clear();
     m_rule_has_error = false;
 
-    const ParseResult parsed = parse(m_rule_source, m_rule_path.empty() ? "<editor>" : m_rule_path);
+    const ParseResult parsed = parse(m_model.m_rule_source, m_model.m_rule_path.empty() ? "<editor>" : m_model.m_rule_path);
     for (const Diagnostic& diagnostic : parsed.diagnostics) {
-        m_rule_diagnostics.push_back(render_diagnostic(diagnostic, m_rule_source, parsed.filename));
+        m_rule_diagnostics.push_back(render_diagnostic(diagnostic, m_model.m_rule_source, parsed.filename));
         if (diagnostic.severity == Severity::Error) m_rule_has_error = true;
     }
 
@@ -248,12 +248,12 @@ void Editor::run_rule_source() {
         m_rule_depth_capped = false;
         m_rule_shape_capped = false;
         m_rule_has_run = true;
-        m_rule_dirty = false;
+        m_model.m_rule_dirty = false;
         return;
     }
 
     GenerationOptions options;
-    options.seed = static_cast<uint64_t>(static_cast<uint32_t>(m_rule_seed));
+    options.seed = static_cast<uint64_t>(static_cast<uint32_t>(m_model.m_rule_seed));
 
     // Every seed the run will use. One rectangle, or one per imported
     // building -- the loop below is the same either way, which is what keeps
@@ -262,10 +262,10 @@ void Editor::run_rule_source() {
     m_rule_buildings_built = 0;
     m_rule_buildings_skipped = 0;
 
-    if (m_rule_seed_source == RuleSeedSource::ImportedBuildings && m_osm_parser.has_data()) {
+    if (m_model.m_rule_seed_source == EditorModel::RuleSeedSource::ImportedBuildings && m_osm_parser.has_data()) {
         const auto& buildings = m_osm_parser.get_data().buildings;
-        const size_t limit = m_rule_building_limit > 0
-                                 ? static_cast<size_t>(m_rule_building_limit)
+        const size_t limit = m_model.m_rule_building_limit > 0
+                                 ? static_cast<size_t>(m_model.m_rule_building_limit)
                                  : buildings.size();
         for (const osm::Building& building : buildings) {
             if (seeds.size() >= limit) {
@@ -283,8 +283,8 @@ void Editor::run_rule_source() {
             seeds.push_back(std::move(seed));
         }
     } else {
-        seeds.push_back(shape_from_rect(static_cast<double>(m_rule_seed_width),
-                                        static_cast<double>(m_rule_seed_depth)));
+        seeds.push_back(shape_from_rect(static_cast<double>(m_model.m_rule_seed_width),
+                                        static_cast<double>(m_model.m_rule_seed_depth)));
     }
 
     GenerationStats totals{};
@@ -302,7 +302,7 @@ void Editor::run_rule_source() {
         for (const Diagnostic& diagnostic : result.diagnostics) {
             if (diagnostics_shown < kMaxRunDiagnostics) {
                 m_rule_diagnostics.push_back(
-                    render_diagnostic(diagnostic, m_rule_source, parsed.filename));
+                    render_diagnostic(diagnostic, m_model.m_rule_source, parsed.filename));
                 ++diagnostics_shown;
             }
             if (diagnostic.severity == Severity::Error) m_rule_has_error = true;
@@ -338,7 +338,7 @@ void Editor::run_rule_source() {
     m_rule_depth_capped = totals.depth_limit_hit;
     m_rule_shape_capped = totals.shape_limit_hit;
     m_rule_has_run = true;
-    m_rule_dirty = false;
+    m_model.m_rule_dirty = false;
 
     // The old preview goes whatever happens next. A run that produced nothing
     // must leave an empty viewport, not the previous building -- otherwise a
@@ -378,7 +378,7 @@ void Editor::draw_rule_source() {
     ImGui::SameLine();
     if (ImGui::Button("Save As...")) open_file_dialog(FilePickTarget::RuleFileSave);
     ImGui::SameLine();
-    ImGui::BeginDisabled(m_rule_path.empty());
+    ImGui::BeginDisabled(m_model.m_rule_path.empty());
     if (ImGui::Button("Revert")) {
         // Re-open the dialog rather than re-reading the path directly: the file
         // may have moved, and the one place a path turns into bytes is
@@ -387,7 +387,7 @@ void Editor::draw_rule_source() {
     }
     ImGui::EndDisabled();
 
-    ImGui::TextUnformatted(m_rule_path.empty() ? "(unsaved)" : m_rule_path.c_str());
+    ImGui::TextUnformatted(m_model.m_rule_path.empty() ? "(unsaved)" : m_model.m_rule_path.c_str());
     if (!m_rule_status.empty()) {
         ImGui::TextDisabled("%s", m_rule_status.c_str());
     }
@@ -400,27 +400,27 @@ void Editor::draw_rule_source() {
     const bool have_import = m_osm_parser.has_data() &&
                              !m_osm_parser.get_data().buildings.empty();
 
-    int source = static_cast<int>(m_rule_seed_source);
+    int source = static_cast<int>(m_model.m_rule_seed_source);
     ImGui::SetNextItemWidth(200.0f);
     if (ImGui::Combo("Seed from", &source, "Test rectangle\0Imported buildings\0")) {
         if (source == 1 && !have_import) {
             source = 0;
         }
-        m_rule_seed_source = static_cast<RuleSeedSource>(source);
-        m_rule_dirty = true;
+        m_model.m_rule_seed_source = static_cast<EditorModel::RuleSeedSource>(source);
+        m_model.m_rule_dirty = true;
     }
     if (!have_import) {
         ImGui::SameLine();
         ImGui::TextDisabled("(no OSM import loaded)");
-    } else if (m_rule_seed_source == RuleSeedSource::ImportedBuildings) {
+    } else if (m_model.m_rule_seed_source == EditorModel::RuleSeedSource::ImportedBuildings) {
         ImGui::SameLine();
         ImGui::Text("%zu available", m_osm_parser.get_data().buildings.size());
     }
 
-    if (m_rule_seed_source == RuleSeedSource::ImportedBuildings) {
+    if (m_model.m_rule_seed_source == EditorModel::RuleSeedSource::ImportedBuildings) {
         ImGui::SetNextItemWidth(160.0f);
-        ImGui::InputInt("Max buildings", &m_rule_building_limit);
-        if (m_rule_building_limit < 1) m_rule_building_limit = 1;
+        ImGui::InputInt("Max buildings", &m_model.m_rule_building_limit);
+        if (m_model.m_rule_building_limit < 1) m_model.m_rule_building_limit = 1;
         ImGui::SetItemTooltip(
             "A city extract holds tens of thousands of footprints. Generating "
             "all of them makes a mesh no preview can hold and an editor that "
@@ -429,20 +429,20 @@ void Editor::draw_rule_source() {
         // control that does nothing is worse than a missing one.
     } else {
         ImGui::SetNextItemWidth(120.0f);
-        ImGui::DragFloat("Width (m)", &m_rule_seed_width, 0.1f, 0.5f, 500.0f, "%.2f");
+        ImGui::DragFloat("Width (m)", &m_model.m_rule_seed_width, 0.1f, 0.5f, 500.0f, "%.2f");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(120.0f);
-        ImGui::DragFloat("Depth (m)", &m_rule_seed_depth, 0.1f, 0.5f, 500.0f, "%.2f");
+        ImGui::DragFloat("Depth (m)", &m_model.m_rule_seed_depth, 0.1f, 0.5f, 500.0f, "%.2f");
     }
     ImGui::SetNextItemWidth(160.0f);
-    ImGui::InputInt("Seed", &m_rule_seed);
+    ImGui::InputInt("Seed", &m_model.m_rule_seed);
     ImGui::SetItemTooltip(
         "GenerationOptions::seed. Mixed with the shape's own key, so the same "
         "seed reproduces the same building exactly.");
 
     if (ImGui::Button("Generate")) run_rule_source();
     ImGui::SameLine();
-    ImGui::Checkbox("Run on edit", &m_rule_auto_run);
+    ImGui::Checkbox("Run on edit", &m_model.m_rule_auto_run);
     ImGui::SetItemTooltip(
         "Off by default. The parse runs on every edit regardless; only the "
         "generation waits, because a half-typed recursive rule is a program "
@@ -450,7 +450,7 @@ void Editor::draw_rule_source() {
     ImGui::SameLine();
     ImGui::Checkbox("Show preview", &m_render_rule_preview);
 
-    if (m_rule_dirty && m_rule_has_run) {
+    if (m_model.m_rule_dirty && m_rule_has_run) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "stale");
         ImGui::SetItemTooltip("The source changed since this output was produced.");
@@ -462,14 +462,14 @@ void Editor::draw_rule_source() {
     const ImGuiInputTextFlags flags =
         ImGuiInputTextFlags_AllowTabInput | ImGuiInputTextFlags_CallbackResize;
 
-    // data() rather than &m_rule_source[0] so an empty string is still a valid
+    // data() rather than &m_model.m_rule_source[0] so an empty string is still a valid
     // pointer; capacity+1 because ImGui writes its own terminator.
-    if (ImGui::InputTextMultiline("##rule_source", m_rule_source.data(),
-                                  m_rule_source.capacity() + 1,
+    if (ImGui::InputTextMultiline("##rule_source", m_model.m_rule_source.data(),
+                                  m_model.m_rule_source.capacity() + 1,
                                   ImVec2(-FLT_MIN, height > 80.0f ? height : 80.0f),
-                                  flags, rule_source_resize, &m_rule_source)) {
-        m_rule_dirty = true;
-        if (m_rule_auto_run) {
+                                  flags, rule_source_resize, &m_model.m_rule_source)) {
+        m_model.m_rule_dirty = true;
+        if (m_model.m_rule_auto_run) {
             run_rule_source();
         } else {
             // Parse only. Cheap, cannot loop, and it is what puts the caret
@@ -478,10 +478,10 @@ void Editor::draw_rule_source() {
             m_rule_diagnostics.clear();
             m_rule_has_error = false;
             const ParseResult parsed =
-                parse(m_rule_source, m_rule_path.empty() ? "<editor>" : m_rule_path);
+                parse(m_model.m_rule_source, m_model.m_rule_path.empty() ? "<editor>" : m_model.m_rule_path);
             for (const Diagnostic& diagnostic : parsed.diagnostics) {
                 m_rule_diagnostics.push_back(
-                    render_diagnostic(diagnostic, m_rule_source, parsed.filename));
+                    render_diagnostic(diagnostic, m_model.m_rule_source, parsed.filename));
                 if (diagnostic.severity == Severity::Error) m_rule_has_error = true;
             }
         }
@@ -539,7 +539,7 @@ void Editor::draw_rule_stats() {
                            "Shape cap hit - output is truncated.");
     }
 
-    if (m_rule_seed_source == RuleSeedSource::ImportedBuildings) {
+    if (m_model.m_rule_seed_source == EditorModel::RuleSeedSource::ImportedBuildings) {
         ImGui::Text("Buildings: %u generated", m_rule_buildings_built);
         if (m_rule_buildings_skipped > 0) {
             // Said, not swallowed. A city that is missing a third of itself
@@ -584,11 +584,11 @@ void Editor::draw_rule_panel() {
     // Seeded on first draw rather than in the constructor so that a session
     // which never opens the panel never pays for the string, and RUN once so
     // the panel demonstrates itself. Running arbitrary source on open would be
-    // the wrong default -- see m_rule_auto_run -- but this particular source is
+    // the wrong default -- see m_model.m_rule_auto_run -- but this particular source is
     // known, small and bounded, and a panel that opens showing an empty
     // viewport next to a rule file teaches nothing.
-    if (m_rule_source.empty() && !m_rule_has_run) {
-        m_rule_source = kDefaultRuleSource;
+    if (m_model.m_rule_source.empty() && !m_rule_has_run) {
+        m_model.m_rule_source = kDefaultRuleSource;
         run_rule_source();
     }
 

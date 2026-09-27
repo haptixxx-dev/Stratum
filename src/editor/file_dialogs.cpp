@@ -98,7 +98,7 @@ void Editor::open_file_dialog(FilePickTarget target) {
         // Same argument as the material set below: start where the file came
         // from, so a re-save lands beside the rule file rather than in $HOME.
         SDL_ShowSaveFileDialog(callback, this, parent, filters, filter_count,
-                               m_rule_path.empty() ? nullptr : m_rule_path.c_str());
+                               m_model.m_rule_path.empty() ? nullptr : m_model.m_rule_path.c_str());
     } else if (target == FilePickTarget::MaterialSetSave) {
         // Start in the directory the set was last saved to or loaded from, so a
         // re-save lands beside its textures rather than in the home directory --
@@ -156,7 +156,7 @@ void Editor::poll_file_dialog() {
 
     switch (m_file_pick_target) {
         case FilePickTarget::OsmFile:
-            std::snprintf(m_osm_filepath, sizeof(m_osm_filepath), "%s", path.c_str());
+            std::snprintf(m_model.m_osm_filepath, sizeof(m_model.m_osm_filepath), "%s", path.c_str());
             spdlog::info("Selected OSM file: {}", path);
             break;
 
@@ -173,7 +173,7 @@ void Editor::poll_file_dialog() {
             // Goes through the library, not through GPUTextureManager directly, so
             // the source path is recorded and survives the next save. See
             // MaterialLibrary::load_map_from_file().
-            if (m_material_library->load_map_from_file(m_material_pick_key, map, path)) {
+            if (m_material_library->load_map_from_file(m_model.m_material_pick_key, map, path)) {
                 m_material_set_status = "loaded " + path;
             } else {
                 m_material_set_status = "failed to load " + path;
@@ -269,7 +269,7 @@ void Editor::poll_export_dir_dialog() {
     }
 
     if (!path.empty()) {
-        std::snprintf(m_export_options.dir, sizeof(m_export_options.dir), "%s", path.c_str());
+        std::snprintf(m_model.m_export_options.dir, sizeof(m_model.m_export_options.dir), "%s", path.c_str());
         spdlog::info("Export directory: {}", path);
     }
 }

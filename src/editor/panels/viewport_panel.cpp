@@ -185,7 +185,7 @@ void Editor::draw_chunk_lod_stats() {
     ImGui::Spacing();
     ImGui::Text("Chunk LOD:");
 
-    if (!m_chunk_lod) {
+    if (!m_model.m_chunk_lod) {
         // Not "no levels were built": the chain is not built at all, and the
         // leaves hold whole pieces routed by anchor. Say which of the two it is.
         ImGui::BulletText("Off: every leaf keeps one full-detail mesh");
@@ -258,14 +258,14 @@ void Editor::draw_chunk_lod_stats() {
     // Inspection controls. Neither re-solves: the chain is already built and both
     // only change which level of it is asked for on the next frame.
     ImGui::SetNextItemWidth(160.0f);
-    ImGui::SliderFloat("LOD Distance", &m_road_lod_distance_scale, 0.25f, 4.0f, "%.2fx");
+    ImGui::SliderFloat("LOD Distance", &m_model.m_road_lod_distance_scale, 0.25f, 4.0f, "%.2fx");
     ImGui::SetItemTooltip(
         "Multiplier on every switch distance the chain suggests.\n"
         "Larger holds full detail further out and costs resident memory.");
 
-    bool forced = (m_road_lod_override >= 0);
+    bool forced = (m_model.m_road_lod_override >= 0);
     if (ImGui::Checkbox("Force Level", &forced)) {
-        m_road_lod_override = forced ? 0 : -1;
+        m_model.m_road_lod_override = forced ? 0 : -1;
     }
     ImGui::SetItemTooltip(
         "Pin every chunk to one level regardless of distance, for inspection.\n"
@@ -278,7 +278,7 @@ void Editor::draw_chunk_lod_stats() {
                 ? 0
                 : static_cast<int>(built.triangles_per_level.size()) - 1;
         ImGui::SetNextItemWidth(120.0f);
-        ImGui::SliderInt("##road_lod_level", &m_road_lod_override, 0, max_level, "Level %d");
+        ImGui::SliderInt("##road_lod_level", &m_model.m_road_lod_override, 0, max_level, "Level %d");
     }
 }
 
