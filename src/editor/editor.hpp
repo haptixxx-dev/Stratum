@@ -259,6 +259,17 @@ private:
     bool m_show_demo_window = false;
     bool m_show_style_editor = false;
 
+    /**
+     * @brief The dockspace's default layout has been built for this run
+     *
+     * setup_dockspace() (src/editor/ui/layout.cpp) checks this alongside
+     * DockBuilderGetNode() so the default split only runs once per process,
+     * never re-splitting a layout the user has since rearranged. A member
+     * rather than a function-local static because it is editor state like any
+     * other, not a one-off first-call latch.
+     */
+    bool m_dock_initialized = false;
+
     // Panel visibility
     bool m_show_viewport = true;
     bool m_show_scene_hierarchy = true;
@@ -270,6 +281,11 @@ private:
     bool m_show_memory_panel = false;
     bool m_show_material_panel = false;
     bool m_show_rule_panel = false;
+
+    /// Scene Hierarchy search field's typed text. Not yet wired to filter the
+    /// tree; kept as editor state rather than a function-local static so the
+    /// panel's own .cpp is not the only place that could read it later.
+    char m_scene_search_buffer[256] = "";
 
     // Render toggles
     bool m_render_areas = true;
@@ -521,6 +537,16 @@ private:
     float m_import_fraction = 0.0f;
     std::vector<osm::QuadTreeNode*> m_import_pending_nodes;
     size_t m_import_nodes_total = 0;
+
+    /**
+     * @brief The "Import OSM File" button's own local status line
+     *
+     * Distinct from m_import_message, which mirrors ImportStage as the worker
+     * runs: this pair is set synchronously by the button itself (e.g. an empty
+     * file path) before any job exists, and cleared when a job is launched.
+     */
+    std::string m_import_status;
+    bool m_import_error = false;
 
     // ── Native file picker ──────────────────────────────────────────────────
     // SDL_ShowOpenFileDialog is asynchronous and its callback may run on another

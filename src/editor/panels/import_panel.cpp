@@ -157,10 +157,6 @@ void Editor::draw_osm_panel() {
     }
     ImGui::EndDisabled();
 
-    // Import button with status feedback
-    static std::string import_status;
-    static bool import_error = false;
-
     // An export re-solves the network from m_osm_parser's data on a worker, so it
     // locks the parser for exactly the same reason an import in flight does.
     const bool importing = (m_import_stage == ImportStage::Parsing ||
@@ -173,11 +169,11 @@ void Editor::draw_osm_panel() {
     ImGui::BeginDisabled(importing);
     if (ImGui::Button("Import OSM File", ImVec2(-1, 0))) {
         if (strlen(m_osm_filepath) == 0) {
-            import_status = "Please enter a file path first";
-            import_error = true;
+            m_import_status = "Please enter a file path first";
+            m_import_error = true;
         } else {
-            import_status.clear();
-            import_error = false;
+            m_import_status.clear();
+            m_import_error = false;
             begin_osm_import(m_osm_filepath, config);
         }
     }
@@ -218,11 +214,11 @@ void Editor::draw_osm_panel() {
     }
 
     // Show status message
-    if (!import_status.empty()) {
-        if (import_error) {
-            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", import_status.c_str());
+    if (!m_import_status.empty()) {
+        if (m_import_error) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", m_import_status.c_str());
         } else {
-            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", import_status.c_str());
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", m_import_status.c_str());
         }
     }
 
