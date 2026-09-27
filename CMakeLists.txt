@@ -300,6 +300,7 @@ add_library(stratum_editor_lib STATIC
     src/editor/panels/procgen_panel.cpp
     src/editor/panels/material_panel.cpp
     src/editor/panels/rule_panel.cpp
+    src/editor/panels/menu_bar.cpp
     src/editor/ui/layout.cpp
 )
 
